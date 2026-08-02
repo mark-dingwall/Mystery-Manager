@@ -206,7 +206,9 @@ Tests across 16 modules covering models, config, categorizer, scoring, desirabil
 
 Benchmark of the canonical strategy (`ilp-optimal`) against the baselines across 45 Tier A offers (2026-08-02). `ilp-optimal` leads and is the production choice; the rest are regression baselines. Refresh by running `python3 compare.py --all-strategies`.
 
-Rank order: ilp-optimal > local-search > discard-worst > round-robin > manual > greedy-best-fit > deal-topup > minmax-deficit.
+Rank order: ilp-optimal > local-search > discard-worst > round-robin >
+greedy-best-fit ≈ manual > deal-topup > minmax-deficit. (`greedy-best-fit` and
+`manual` sit within noise of each other — treat as tied, not ranked.)
 
 Baseline and `manual` rankings currently carry a value-dimension distortion: the
 value sweet-spot band was recentred but `BOX_TARGET_PCT` was not, so strategies
