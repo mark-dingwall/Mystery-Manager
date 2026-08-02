@@ -36,7 +36,7 @@ class ComparisonService:
     def strategy_count() -> int:
         """Return the number of strategies (including 'manual')."""
         from allocator.strategies import list_strategies
-        return len(list_strategies()) + 1  # +1 for "manual"
+        return len(list_strategies(include_baselines=True)) + 1  # +1 for "manual"
 
     def run_all_strategies(
         self,
@@ -86,7 +86,7 @@ class ComparisonService:
         )
 
         # Build strategy list with discard-worst before local-search
-        raw_strategies = list_strategies()
+        raw_strategies = list_strategies(include_baselines=True)
         ordered: list[str] = []
         deferred_local_search = False
         for s in raw_strategies:

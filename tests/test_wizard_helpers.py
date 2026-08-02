@@ -68,3 +68,13 @@ class TestWizardStateDefaults:
         assert state.offer_id is None
         assert state.boxes == []
         assert state.result is None
+
+
+def test_strategy_step_sources_from_canonical_list():
+    import inspect
+
+    from allocator.screens.early_steps import StrategyStep
+
+    src = inspect.getsource(StrategyStep.compose)
+    assert "list_strategies()" in src           # reads the filtered (canonical-only) list
+    assert "include_baselines" not in src        # wizard must never opt baselines back in

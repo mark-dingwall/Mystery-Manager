@@ -174,7 +174,7 @@ def main():
     offer_id = int(sys.argv[1])
     xlsx_path = Path(sys.argv[2])
 
-    strategies = list_strategies()
+    strategies = list_strategies(include_baselines=True)
 
     # Run strategies in order (discard-worst before local-search for bootstrap)
     ordered = [s for s in strategies if s != "local-search"]

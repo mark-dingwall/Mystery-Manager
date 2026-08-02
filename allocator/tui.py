@@ -1,3 +1,4 @@
+# STATUS: superseded by the Textual UI (allocator/app.py); retained only for the run.py CLI review path.
 """
 Rich-based TUI for reviewing and editing mystery box configuration.
 
@@ -237,7 +238,7 @@ def _run_all_strategies(
     from allocator.allocator import allocate
     from allocator.strategies import list_strategies
 
-    strategies = list_strategies()
+    strategies = list_strategies(include_baselines=True)
     # discard-worst before local-search for bootstrap
     ordered = [s for s in strategies if s != "local-search"]
     ordered.append("local-search")

@@ -65,7 +65,10 @@ TARGET_ITEM_COUNTS = {k: tuple(v) for k, v in _SCORING["target_item_counts"].ite
 SCORING_WEIGHTS = _SCORING["scoring_weights"]
 SLOT_DEGREE_THRESHOLD = _SCORING["slot_degree_threshold"]
 MAX_SLOT_QTY = _SCORING["max_slot_qty"]
-FUNGIBLE_GROUPS = {k: (v[0], v[1]) for k, v in _SCORING["fungible_groups"].items()}
+FUNGIBLE_GROUPS = {
+    k: (v[0], v[1], v[2] if len(v) > 2 else "portioned")
+    for k, v in _SCORING["fungible_groups"].items()
+}
 
 # ---------------------------------------------------------------------------
 # PII-bearing identifiers (loaded from gitignored identifiers.json)
@@ -147,6 +150,15 @@ ITEM_CLASSIFICATIONS = {
 }
 
 # ---------------------------------------------------------------------------
+# Quantity classes and group allowances
+# ---------------------------------------------------------------------------
+
+QUANTITY_CLASSES = _SCORING["quantity_classes"]
+GROUP_ALLOWANCES = _SCORING["group_allowances"]
+# Price cut-points (cents) for usage->quantity-class refinement.
+QTY_CLASS_PRICE_THRESHOLDS = _SCORING["qty_class_price_thresholds"]
+
+# ---------------------------------------------------------------------------
 # Composite scoring
 # ---------------------------------------------------------------------------
 
@@ -155,14 +167,14 @@ VALUE_SWEET_FROM = int(os.environ.get("VALUE_SWEET_FROM", "114"))
 VALUE_SWEET_TO = int(os.environ.get("VALUE_SWEET_TO", "117"))
 VALUE_PENALTY_EXPONENT = float(os.environ.get("VALUE_PENALTY_EXPONENT", "1.25"))
 
-GROUP_QTY_MULTIPLIER = _SCORING["group_qty_multiplier"]
-GROUP_QTY_ALLOWANCE_BASE = _SCORING["group_qty_allowance_base"]
-GROUP_QTY_TIER_RATIO = _SCORING["group_qty_tier_ratio"]
+SAME_ITEM_MULTIPLIER = _SCORING["same_item_multiplier"]
+GROUP_CONCENTRATION_MULTIPLIER = _SCORING["group_concentration_multiplier"]
 GROUP_QTY_EXPONENT = _SCORING["group_qty_exponent"]
-DESIRABILITY_PENALTY_MULTIPLIER = _SCORING["desirability_penalty_multiplier"]
-DESIRABILITY_SHRINKAGE_PRIOR = _SCORING["desirability_shrinkage_prior"]
 DIVERSITY_PENALTY_MULTIPLIER = _SCORING["diversity_penalty_multiplier"]
-FAIRNESS_PENALTY_MULTIPLIER = _SCORING["fairness_penalty_multiplier"]
+MAX_VALUE_SHARE_THRESHOLD = _SCORING["max_value_share_threshold"]
+MAX_VALUE_SHARE_MULTIPLIER = _SCORING["max_value_share_multiplier"]
+SIZE_FLOOR_TARGETS = _SCORING["size_floor_targets"]
+SIZE_FLOOR_MULTIPLIER = _SCORING["size_floor_multiplier"]
 PREF_VIOLATION_PENALTY = _SCORING["pref_violation_penalty"]
 MAX_COMPOSITE_SCORE = _SCORING["max_composite_score"]
 

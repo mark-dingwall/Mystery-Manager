@@ -276,6 +276,7 @@ def allocate(
     charity_names: list[str] | None = None,
     strategy: str = DEFAULT_STRATEGY,
     bootstrap_allocations: list[dict[int, int]] | None = None,
+    charity_target_cents: int | None = None,
 ) -> AllocationResult:
     """
     Run the full allocation pipeline.
@@ -285,10 +286,11 @@ def allocate(
         xlsx_path: Path to the tweaked shopping list XLSX
         boxes: Pre-configured mystery boxes (from TUI). If None, auto-detect.
         charity_names: Charity recipient names. Defaults to [CHARITY_NAME].
-        strategy: Name of the allocation strategy (default: deal-topup).
+        strategy: Name of the allocation strategy (default: ilp-optimal).
         bootstrap_allocations: Pre-computed box allocations to seed the strategy
             with (one dict per box, matching box order). Used by compare.py to
             feed discard-worst results into local-search without recomputing.
+        charity_target_cents: Override charity target in cents (bypasses DB query).
 
     Returns:
         AllocationResult with all allocations
@@ -344,7 +346,11 @@ def allocate(
 
     # Charity allocation (shared infrastructure)
     logger.info("Phase 3: Charity allocation")
-    charity_target = compute_charity_target(offer_id)
+    if charity_target_cents is not None:
+        charity_target = charity_target_cents
+        logger.info(f"Charity target (override): ${charity_target/100:.2f}")
+    else:
+        charity_target = compute_charity_target(offer_id)
     _allocate_charity(result, charity_target)
 
     return result

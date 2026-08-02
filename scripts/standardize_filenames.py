@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# STATUS: dev-tool — infrequent maintenance utility; not part of the canonical pipeline.
 """
 Standardize historical XLSX filenames to canonical format.
 

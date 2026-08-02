@@ -1,6 +1,6 @@
 # Mystery Manager
 
-Allocates bulk produce overage into customer "mystery boxes" for a fruit & veggie box business. Reads weekly shopping-list spreadsheets and item/buyer data from the Laravel DB, runs a pluggable allocation strategy (ILP, local search, or greedy heuristics), then outputs tab-delimited box assignments for import back into the app.
+Allocates bulk produce overage into customer "mystery boxes" for a fruit & veggie box business. Reads weekly shopping-list spreadsheets and item/buyer data from the Laravel DB, allocates overage to mystery boxes using an ILP optimiser, then outputs tab-delimited box assignments for import back into the app.
 
 ## Quick start
 
@@ -8,7 +8,7 @@ Allocates bulk produce overage into customer "mystery boxes" for a fruit & veggi
 python3 run.py 106 offer_106_shopping_list.xlsx                   # full run (TUI + LLM review)
 python3 run.py 106 offer_106_shopping_list.xlsx --no-tui --no-llm # quick run
 python3 compare.py                                                # validate against 42 historical offers
-python3 compare.py --all-strategies                               # strategy leaderboard
+python3 compare.py --all-strategies                               # strategy benchmark
 python3 -m pytest                                                 # run test suite
 ```
 
@@ -21,7 +21,7 @@ Mystery-Manager/
 ├── pyproject.toml          # pytest config
 ├── allocator/              # Core library
 │   ├── allocator.py        #   Pipeline: XLSX + DB → strategy → output
-│   ├── strategies/         #   Pluggable strategies (ILP, local-search, etc.)
+│   ├── strategies/         #   Canonical ILP strategy + benchmark baselines
 │   ├── models.py           #   Item, MysteryBox, CharityBox, AllocationResult
 │   ├── config.py           #   Tiers, weights, scoring constants, identifiers
 │   ├── db.py               #   SSH tunnel + MySQL queries
@@ -38,7 +38,7 @@ Mystery-Manager/
 │   ├── fixtures/           #   Synthetic identifiers + scoring config
 │   └── test_*.py           #   13 test modules
 ├── scripts/                # Maintenance utilities
-│   ├── score_offer.py      #   Per-offer strategy leaderboard
+│   ├── score_offer.py      #   Per-offer strategy benchmark
 │   ├── diagnose_scoring.py #   Penalty breakdown diagnostics
 │   ├── validate_cleaned.py #   Structural + DB checks on cleaned CSVs
 │   ├── validate_prices.py  #   XLSX vs DB price validation

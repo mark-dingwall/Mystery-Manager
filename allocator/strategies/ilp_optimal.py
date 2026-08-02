@@ -2,10 +2,11 @@
 ILP-optimal allocation strategy.
 
 Integer Linear Programming via PuLP/CBC: minimise a composite penalty that
-matches compare.py's scoring — convex piecewise-linear value penalty, 4D
-diversity coverage, weighted dupe penalty, and MAD fairness proxy.
+matches compare.py's scoring — convex piecewise-linear value penalty,
+same-item penalty, group concentration, 4D diversity coverage,
+max value share, and size floor.
 
-Falls back to deal-topup if PuLP is not installed or solver fails.
+Falls back to local-search if PuLP is not installed or solver fails.
 """
 
 import logging
@@ -14,21 +15,24 @@ from allocator.config import (
     BOX_TIERS,
     DIVERSITY_PENALTY_MULTIPLIER,
     DIVERSITY_WEIGHTS,
-    FAIRNESS_PENALTY_MULTIPLIER,
-    GROUP_QTY_ALLOWANCE_BASE,
+    GROUP_ALLOWANCES,
+    GROUP_CONCENTRATION_MULTIPLIER,
     GROUP_QTY_EXPONENT,
-    GROUP_QTY_MULTIPLIER,
-    GROUP_QTY_TIER_RATIO,
     ILP_BALANCE_WEIGHT,
     ILP_COVERAGE_WEIGHT,
     ILP_HHI_BREAKPOINTS,
+    MAX_VALUE_SHARE_MULTIPLIER,
+    MAX_VALUE_SHARE_THRESHOLD,
+    SAME_ITEM_MULTIPLIER,
+    SIZE_FLOOR_MULTIPLIER,
+    SIZE_FLOOR_TARGETS,
     VALUE_CEILING_PCT,
     VALUE_PENALTY_EXPONENT,
     VALUE_SWEET_FROM,
     VALUE_SWEET_TO,
 )
 from allocator.models import AllocationResult
-from allocator.strategies._helpers import compute_available_tags
+from allocator.strategies._helpers import _item_allowance, compute_available_tags
 
 logger = logging.getLogger(__name__)
 
@@ -83,18 +87,15 @@ def _compute_value_lines():
 
 _VALUE_LINES = _compute_value_lines()
 
-# MAD-to-stddev scale factor: sqrt(pi/2) ≈ 1.2533
-_MAD_STDDEV_FACTOR = 1.2533
-
 
 def run(result: AllocationResult) -> None:
     """ILP allocation: optimal assignment via mixed-integer programming."""
     try:
         import pulp
     except ImportError:
-        logger.warning("PuLP not installed, falling back to deal-topup")
-        from allocator.strategies.deal_topup import run as fallback
-        fallback(result)
+        from allocator.strategies import FALLBACK_STRATEGY, get_strategy
+        logger.warning(f"PuLP not installed, falling back to {FALLBACK_STRATEGY}")
+        get_strategy(FALLBACK_STRATEGY)(result)
         return
 
     if not result.boxes or not result.items:
@@ -103,12 +104,12 @@ def run(result: AllocationResult) -> None:
     try:
         _solve_ilp(result, pulp)
     except Exception as e:
-        logger.warning(f"ILP solver failed ({e}), falling back to deal-topup")
+        from allocator.strategies import FALLBACK_STRATEGY, get_strategy
+        logger.warning(f"ILP solver failed ({e}), falling back to {FALLBACK_STRATEGY}")
         # Clear any partial allocations
         for box in result.boxes:
             box.allocations.clear()
-        from allocator.strategies.deal_topup import run as fallback
-        fallback(result)
+        get_strategy(FALLBACK_STRATEGY)(result)
 
 
 def _solve_ilp(result: AllocationResult, pulp) -> None:
@@ -170,23 +171,37 @@ def _solve_ilp(result: AllocationResult, pulp) -> None:
             f"ceiling_{b}",
         )
 
-    # Ceiling guard per fungible group: total qty <= ceil(2 * allowance)
+    # Ceiling guard per fungible group: total qty <= ceil(2 * group_allowance)
+    # Also per-item ceiling: x[i][b] <= 2 * item_allowance
     import math as _math
-    fungible_groups: dict[str, list[int]] = {}
+    fungible_group_members: dict[str, list[int]] = {}
     for i, item in enumerate(items):
         if item.fungible_group:
-            fungible_groups.setdefault(item.fungible_group, []).append(i)
+            fungible_group_members.setdefault(item.fungible_group, []).append(i)
 
-    for group_name, member_indices in fungible_groups.items():
+    for group_name, member_indices in fungible_group_members.items():
         if len(member_indices) <= 1:
             continue
         for b in range(n_boxes):
-            allowance = GROUP_QTY_ALLOWANCE_BASE * GROUP_QTY_TIER_RATIO.get(boxes[b].tier, 1.0)
-            cap = _math.ceil(2 * allowance)
-            prob += (
-                pulp.lpSum(x[mi][b] for mi in member_indices) <= cap,
-                f"fungible_cap_{group_name}_{b}",
-            )
+            # Per-group cap from GROUP_ALLOWANCES
+            if group_name in GROUP_ALLOWANCES:
+                ga = GROUP_ALLOWANCES[group_name].get(boxes[b].tier, 99)
+                cap = _math.ceil(2 * ga)
+                prob += (
+                    pulp.lpSum(x[mi][b] for mi in member_indices) <= cap,
+                    f"fungible_cap_{group_name}_{b}",
+                )
+
+    # Per-item ceiling: x[i][b] <= 2 * item_allowance
+    for i, item in enumerate(items):
+        for b in range(n_boxes):
+            item_allow_tier = _item_allowance(item, boxes[b].tier)
+            cap = 2 * item_allow_tier
+            if cap < item.overage:
+                prob += (
+                    x[i][b] <= cap,
+                    f"item_cap_{item.id}_{b}",
+                )
 
     # -----------------------------------------------------------------------
     # 4a. Convex piecewise-linear value penalty
@@ -297,9 +312,34 @@ def _solve_ilp(result: AllocationResult, pulp) -> None:
         )
 
     # -----------------------------------------------------------------------
-    # 4c. Group-qty penalty (excess above allowance, power function)
+    # 4c. Same-item penalty (per-item excess * price * multiplier)
     # -----------------------------------------------------------------------
-    # Only model explicit fungible groups (singletons too numerous for ILP)
+    pen_si = {}
+    for b in range(n_boxes):
+        pen_si[b] = pulp.LpVariable(f"pen_si_{b}", lowBound=0)
+
+    si_terms = {b: [] for b in range(n_boxes)}
+
+    for i, item in enumerate(items):
+        for b in range(n_boxes):
+            item_allow_tier = _item_allowance(item, boxes[b].tier)
+            if item_allow_tier >= item.overage:
+                continue  # can never exceed allowance
+            # excess >= x[i][b] - item_allowance, excess >= 0
+            si_excess = pulp.LpVariable(f"si_excess_{item.id}_{b}", lowBound=0)
+            prob += si_excess >= x[i][b] - item_allow_tier
+            si_terms[b].append(si_excess * item.price * SAME_ITEM_MULTIPLIER / 100.0)
+
+    for b in range(n_boxes):
+        if si_terms[b]:
+            prob += pen_si[b] >= pulp.lpSum(si_terms[b]), f"si_pen_{b}"
+        else:
+            prob += pen_si[b] == 0, f"si_pen_{b}"
+
+    # -----------------------------------------------------------------------
+    # 4d. Group concentration penalty (group load via min-capped qty)
+    # -----------------------------------------------------------------------
+    # Only model explicit fungible groups with GROUP_ALLOWANCES entries
     all_fungible: dict[str, tuple[float, list[int]]] = {}
     for i, item in enumerate(items):
         if item.fungible_group:
@@ -309,74 +349,110 @@ def _solve_ilp(result: AllocationResult, pulp) -> None:
             else:
                 all_fungible[item.fungible_group] = (item.fungible_degree, [i])
 
-    pen_gq = {}
+    pen_gc = {}
     for b in range(n_boxes):
-        pen_gq[b] = pulp.LpVariable(f"pen_gq_{b}", lowBound=0)
+        pen_gc[b] = pulp.LpVariable(f"pen_gc_{b}", lowBound=0)
 
-    gq_terms = {b: [] for b in range(n_boxes)}
+    gc_terms = {b: [] for b in range(n_boxes)}
 
     # Tangent-line breakpoints for excess^exponent approximation
     _gq_breakpoints = [0, 1, 2, 4, 6, 8]
 
     for group_name, (degree, member_indices) in all_fungible.items():
+        if group_name not in GROUP_ALLOWANCES:
+            continue
         if len(member_indices) <= 1:
             continue
 
         for b in range(n_boxes):
-            allowance = GROUP_QTY_ALLOWANCE_BASE * GROUP_QTY_TIER_RATIO.get(boxes[b].tier, 1.0)
-            # group_qty = sum of x[i][b] for members (qty, not binary)
-            group_qty_expr = pulp.lpSum(x[i][b] for i in member_indices)
-            # excess >= group_qty - allowance, excess >= 0
-            excess = pulp.LpVariable(f"gq_excess_{group_name}_{b}", lowBound=0)
-            prob += excess >= group_qty_expr - allowance
+            ga = GROUP_ALLOWANCES[group_name].get(boxes[b].tier, 99)
+            # group_load = sum of min(x[i][b], item_allowance) for members
+            # Approximate: use x[i][b] directly (min-capping is hard in ILP;
+            # the per-item cap constraint above limits this)
+            group_load_expr = pulp.lpSum(x[i][b] for i in member_indices)
+            # excess >= group_load - group_allowance, excess >= 0
+            gc_excess = pulp.LpVariable(f"gc_excess_{group_name}_{b}", lowBound=0)
+            prob += gc_excess >= group_load_expr - ga
 
             # Epigraph for excess^exponent via tangent lines
-            pen_var = pulp.LpVariable(f"gq_pen_{group_name}_{b}", lowBound=0)
+            pen_var = pulp.LpVariable(f"gc_pen_{group_name}_{b}", lowBound=0)
             n_exp = GROUP_QTY_EXPONENT
             for xi in _gq_breakpoints:
                 if xi == 0:
-                    # pen >= 0 (already handled by lowBound)
                     continue
                 f_xi = xi ** n_exp
                 df_xi = n_exp * xi ** (n_exp - 1)
-                # pen >= df_xi * excess + (f_xi - df_xi * xi)
-                prob += pen_var >= df_xi * excess + (f_xi - df_xi * xi)
+                prob += pen_var >= df_xi * gc_excess + (f_xi - df_xi * xi)
 
-            gq_terms[b].append(degree * GROUP_QTY_MULTIPLIER * pen_var)
+            gc_terms[b].append(degree * GROUP_CONCENTRATION_MULTIPLIER * pen_var)
 
     for b in range(n_boxes):
-        if gq_terms[b]:
-            prob += pen_gq[b] >= pulp.lpSum(gq_terms[b]), f"gq_pen_{b}"
+        if gc_terms[b]:
+            prob += pen_gc[b] >= pulp.lpSum(gc_terms[b]), f"gc_pen_{b}"
         else:
-            prob += pen_gq[b] == 0, f"gq_pen_{b}"
+            prob += pen_gc[b] == 0, f"gc_pen_{b}"
 
     # -----------------------------------------------------------------------
-    # 4d. Fairness via MAD proxy
+    # 4e. Max value share penalty
     # -----------------------------------------------------------------------
-    # mean_vp = (1/n) * sum(vp[b]) — linear
-    # abs_dev[b] >= |vp[b] - mean_vp| — 2 constraints each
-    mean_vp_expr = pulp.lpSum(vp[b] for b in range(n_boxes)) / n_boxes
-
-    abs_dev = {}
+    pen_mvs = {}
     for b in range(n_boxes):
-        abs_dev[b] = pulp.LpVariable(f"abs_dev_{b}", lowBound=0)
-        prob += abs_dev[b] >= vp[b] - mean_vp_expr, f"abs_dev_pos_{b}"
-        prob += abs_dev[b] >= mean_vp_expr - vp[b], f"abs_dev_neg_{b}"
+        pen_mvs[b] = pulp.LpVariable(f"pen_mvs_{b}", lowBound=0)
 
-    # fairness_penalty = avg(abs_dev) * FAIRNESS_PENALTY_MULTIPLIER * MAD_STDDEV_FACTOR
-    fair_pen = (
-        pulp.lpSum(abs_dev[b] for b in range(n_boxes)) / n_boxes
-        * FAIRNESS_PENALTY_MULTIPLIER * _MAD_STDDEV_FACTOR
-    )
+    for b in range(n_boxes):
+        box = boxes[b]
+        target_value = BOX_TIERS[box.tier]["target_value"]
+        if target_value <= 0:
+            prob += pen_mvs[b] == 0, f"mvs_pen_{b}"
+            continue
+        # For each item, share_i ≈ item.price * x[i][b] / target_value
+        # mvs_excess_i >= share_i - threshold
+        mvs_item_terms = []
+        for i, item in enumerate(items):
+            if item.price <= 0:
+                continue
+            mvs_excess_i = pulp.LpVariable(f"mvs_ex_{item.id}_{b}", lowBound=0)
+            share_expr = item.price * x[i][b] / target_value
+            prob += mvs_excess_i >= share_expr - MAX_VALUE_SHARE_THRESHOLD
+            mvs_item_terms.append(mvs_excess_i)
+        if mvs_item_terms:
+            # pen_mvs >= max(mvs_excess_i) * multiplier — approximate with sum
+            # (only one item usually dominates; sum is a valid upper bound for
+            # the minimiser to push down)
+            for mvs_t in mvs_item_terms:
+                prob += pen_mvs[b] >= mvs_t * MAX_VALUE_SHARE_MULTIPLIER
+        else:
+            prob += pen_mvs[b] == 0, f"mvs_pen_{b}"
 
     # -----------------------------------------------------------------------
-    # 4e. Objective: minimise avg(pen_val + pen_gq + pen_div) + fair_pen
+    # 4f. Size floor penalty
+    # -----------------------------------------------------------------------
+    pen_sf = {}
+    for b in range(n_boxes):
+        pen_sf[b] = pulp.LpVariable(f"pen_sf_{b}", lowBound=0)
+
+    for b in range(n_boxes):
+        box = boxes[b]
+        sf_target = SIZE_FLOOR_TARGETS.get(box.tier, 0)
+        if sf_target <= 0:
+            prob += pen_sf[b] == 0, f"sf_pen_{b}"
+            continue
+        total_size_expr = pulp.lpSum(items[i].size * x[i][b] for i in range(n_items))
+        # deficit >= sf_target - total_size, deficit >= 0
+        sf_deficit = pulp.LpVariable(f"sf_deficit_{b}", lowBound=0)
+        prob += sf_deficit >= sf_target - total_size_expr
+        prob += pen_sf[b] >= sf_deficit * SIZE_FLOOR_MULTIPLIER, f"sf_pen_{b}"
+
+    # -----------------------------------------------------------------------
+    # 4g. Objective: minimise avg(pen_val + pen_si + pen_gc + pen_div +
+    #                               pen_mvs + pen_sf)
     # -----------------------------------------------------------------------
     avg_box_pen = pulp.lpSum(
-        pen_val[b] + pen_gq[b] + pen_div[b] for b in range(n_boxes)
+        pen_val[b] + pen_si[b] + pen_gc[b] + pen_div[b] + pen_mvs[b] + pen_sf[b]
+        for b in range(n_boxes)
     ) / n_boxes
 
-    prob += avg_box_pen + fair_pen
+    prob += avg_box_pen
 
     # -----------------------------------------------------------------------
     # Solve

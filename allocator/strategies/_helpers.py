@@ -7,9 +7,13 @@ used across multiple strategies.
 
 from allocator.config import (
     BOX_TIERS,
+    CATEGORY_FRUIT,
+    CATEGORY_VEGETABLES,
     DIVERSITY_WEIGHTS,
-    GROUP_QTY_ALLOWANCE_BASE,
-    GROUP_QTY_TIER_RATIO,
+    FUNGIBLE_GROUPS,
+    GROUP_ALLOWANCES,
+    QTY_CLASS_PRICE_THRESHOLDS,
+    QUANTITY_CLASSES,
     VALUE_CEILING_PCT,
 )
 from allocator.models import AllocationResult, Item, MysteryBox
@@ -35,30 +39,56 @@ def box_fungible_groups(box: MysteryBox, result: AllocationResult) -> set[str]:
     return groups
 
 
+def _item_allowance(item: Item, tier: str) -> int:
+    """Resolve per-item allowance from fungible group quantity_class or usage default."""
+    if item.fungible_group and item.fungible_group in FUNGIBLE_GROUPS:
+        _degree, _prefixes, qty_class = FUNGIBLE_GROUPS[item.fungible_group]
+        if qty_class in QUANTITY_CLASSES:
+            return QUANTITY_CLASSES[qty_class].get(tier, 1)
+
+    # Usage-based default
+    usage = getattr(item, "usage_type", "")
+    price = getattr(item, "price", 0)
+    if usage == "snacking":
+        qty_class = "snack_piece" if price < QTY_CLASS_PRICE_THRESHOLDS["snacking_max"] else "cooking_piece"
+    elif usage == "cooking":
+        qty_class = "cooking_piece" if price < QTY_CLASS_PRICE_THRESHOLDS["cooking_max"] else "portioned"
+    elif usage == "salad":
+        qty_class = "cooking_piece"
+    elif usage == "garnish":
+        qty_class = "garnish"
+    else:
+        qty_class = "portioned"
+
+    if qty_class in QUANTITY_CLASSES:
+        return QUANTITY_CLASSES[qty_class].get(tier, 1)
+    return 1
+
+
 def has_hard_fungible_conflict(
     item: Item, box: MysteryBox, result: AllocationResult, qty: int = 1,
 ) -> bool:
-    """Check if adding qty of item would push its group total above 2x allowance."""
-    if item.fungible_group:
-        group_key = item.fungible_group
-    else:
-        group_key = f"__item_{item.id}"
+    """Check if adding qty of item would push its per-item qty above 2x allowance,
+    or its group total above 2x group allowance."""
+    # Per-item check: current qty of this specific item + qty > 2 * item_allowance
+    current_item_qty = box.allocations.get(item.id, 0)
+    item_allow = _item_allowance(item, box.tier)
+    if current_item_qty + qty > 2 * item_allow:
+        return True
 
-    allowance = GROUP_QTY_ALLOWANCE_BASE * GROUP_QTY_TIER_RATIO.get(box.tier, 1.0)
-
-    # Compute current group qty in box
-    current_qty = 0
-    for alloc_id, alloc_qty in box.allocations.items():
-        if alloc_qty > 0 and alloc_id in result.items:
-            other = result.items[alloc_id]
-            if item.fungible_group:
+    # Group check: total group qty > 2 * group_allowance
+    if item.fungible_group and item.fungible_group in GROUP_ALLOWANCES:
+        group_allow = GROUP_ALLOWANCES[item.fungible_group].get(box.tier, 1)
+        current_group_qty = 0
+        for alloc_id, alloc_qty in box.allocations.items():
+            if alloc_qty > 0 and alloc_id in result.items:
+                other = result.items[alloc_id]
                 if other.fungible_group == item.fungible_group:
-                    current_qty += alloc_qty
-            else:
-                if alloc_id == item.id:
-                    current_qty += alloc_qty
+                    current_group_qty += alloc_qty
+        if current_group_qty + qty > 2 * group_allow:
+            return True
 
-    return current_qty + qty > 2 * allowance
+    return False
 
 
 def can_assign(
@@ -75,7 +105,7 @@ def can_assign(
         return False
     if would_exceed_ceiling(box, item, qty, result):
         return False
-    if has_hard_fungible_conflict(item, box, result):
+    if has_hard_fungible_conflict(item, box, result, qty):
         return False
     return True
 
@@ -100,8 +130,14 @@ def remove_item(item_id: int, qty: int, box: MysteryBox) -> None:
         box.allocations[item_id] = new_qty
 
 
-def compute_available_tags(result: AllocationResult) -> dict[str, set[str]]:
-    """Compute the set of distinct tags available across all items with overage."""
+def compute_available_tags(
+    result: AllocationResult, preference: str | None = None,
+) -> dict[str, set[str]]:
+    """Compute the set of distinct tags available across items with overage.
+
+    If preference is set, filter to only items matching that preference
+    (fruit_only → fruit items, veg_only → veg items).
+    """
     tags: dict[str, set[str]] = {
         "sub_category": set(),
         "usage": set(),
@@ -109,6 +145,12 @@ def compute_available_tags(result: AllocationResult) -> dict[str, set[str]]:
         "shape": set(),
     }
     for item in result.items.values():
+        # Filter by preference
+        if preference == "fruit_only" and item.category_id != CATEGORY_FRUIT:
+            continue
+        if preference == "veg_only" and item.category_id != CATEGORY_VEGETABLES:
+            continue
+
         if item.sub_category:
             tags["sub_category"].add(item.sub_category)
         if item.usage_type:
@@ -166,7 +208,7 @@ def compute_diversity_score(
     have qty=1; progressively penalises concentration.
     """
     if available_tags is None:
-        available_tags = compute_available_tags(result)
+        available_tags = compute_available_tags(result, preference=box.preference)
 
     tc = _box_tag_counts(box, result)
 

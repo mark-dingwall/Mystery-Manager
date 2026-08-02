@@ -95,13 +95,13 @@ class TestScoreTopupCandidate:
         assert score_topup_candidate(item, 1, box, result) == float("-inf")
 
     def test_hard_fungible_conflict_neg_inf(self, make_item, make_box, make_result):
-        """Adding would exceed 2x allowance → -inf."""
-        existing = make_item(id=1, fungible_group="banana", fungible_degree=1.0, overage=5)
-        new_item = make_item(id=2, fungible_group="banana", fungible_degree=1.0, overage=5)
-        # small tier: allowance=2, 2x=4. existing qty=4, adding 1 → 5 > 4 → -inf
-        box = make_box(allocations={1: 4})
-        result = make_result(items=[existing, new_item], boxes=[box])
-        assert score_topup_candidate(new_item, 1, box, result) == float("-inf")
+        """Adding would exceed 2x per-item allowance → -inf."""
+        # snack_piece small = 2, ceiling = 2*2 = 4
+        item = make_item(id=1, fungible_group="banana", fungible_degree=1.0, overage=10)
+        box = make_box(allocations={1: 4})  # at 2x per-item allowance
+        result = make_result(items=[item], boxes=[box])
+        # Adding the SAME item would exceed 2x per-item allowance (4+1 > 4)
+        assert score_topup_candidate(item, 1, box, result) == float("-inf")
 
     def test_new_item_bonus(self, make_item, make_box, make_result):
         """New item (not in box) should score higher than existing item."""

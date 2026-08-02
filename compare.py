@@ -33,24 +33,31 @@ from allocator.config import (
     BOX_TIERS,
     CATEGORY_FRUIT,
     CATEGORY_VEGETABLES,
-    DESIRABILITY_PENALTY_MULTIPLIER,
     DIVERSITY_PENALTY_MULTIPLIER,
     DIVERSITY_WEIGHTS,
     DIVERSITY_FALLBACK_SCORE,
     DONATION_IDENTIFIERS,
-    FAIRNESS_PENALTY_MULTIPLIER,
-    GROUP_QTY_ALLOWANCE_BASE,
+    FUNGIBLE_GROUPS,
+    GROUP_ALLOWANCES,
+    GROUP_CONCENTRATION_MULTIPLIER,
     GROUP_QTY_EXPONENT,
-    GROUP_QTY_MULTIPLIER,
-    GROUP_QTY_TIER_RATIO,
     MAX_COMPOSITE_SCORE,
+    MAX_VALUE_SHARE_MULTIPLIER,
+    MAX_VALUE_SHARE_THRESHOLD,
     PACK_PRICE_TOLERANCE_CENTS,
     PREF_VIOLATION_PENALTY,
+    QUANTITY_CLASSES,
+    SAME_ITEM_MULTIPLIER,
+    SIZE_FLOOR_MULTIPLIER,
+    SIZE_FLOOR_TARGETS,
     SLOT_DEGREE_THRESHOLD,
     detect_pack_size,
 )
-from allocator.strategies._scoring import value_penalty
-from allocator.strategies import list_strategies
+from allocator.strategies._scoring import (
+    _resolve_item_allowance_from_lookup,
+    value_penalty,
+)
+from allocator.strategies import DEFAULT_STRATEGY, list_strategies
 from allocator.db import fetch_categories, fetch_mystery_box_buyers, fetch_offer_items
 
 CLEANED_DIR = Path(__file__).parent / "cleaned"
@@ -70,6 +77,11 @@ def _discover_cleaned_offer_ids() -> set[int]:
         except (ValueError, IndexError):
             pass
     return ids
+
+
+def _effective_algorithm(algorithm: str | None) -> str:
+    """The strategy to run when the caller passes no --algorithm (production default)."""
+    return algorithm or DEFAULT_STRATEGY
 
 
 def _offer_tier(offer_id: int) -> str:
@@ -281,6 +293,7 @@ def build_item_lookup(
             "price": price,
             "category_id": row["category_id"],
             "category_name": categories.get(row["category_id"], "unknown").lower(),
+            "size": row.get("size", 1) or 1,
             "fungible_group": fg,
             "fungible_degree": degree,
             "sub_category": sub_cat,
@@ -295,12 +308,21 @@ def build_item_lookup(
 # Metrics computation
 # ---------------------------------------------------------------------------
 
-def compute_available_tags(item_lookup: dict[int, dict]) -> dict[str, set[str]]:
-    """Compute distinct tags available across all items in the offer."""
+def compute_available_tags(
+    item_lookup: dict[int, dict], preference: str | None = None,
+) -> dict[str, set[str]]:
+    """Compute distinct tags available across all items in the offer.
+
+    If preference is set, filter to items matching that preference.
+    """
     tags: dict[str, set[str]] = {
         "sub_category": set(), "usage": set(), "colour": set(), "shape": set(),
     }
     for info in item_lookup.values():
+        if preference == "fruit_only" and info["category_id"] != CATEGORY_FRUIT:
+            continue
+        if preference == "veg_only" and info["category_id"] != CATEGORY_VEGETABLES:
+            continue
         if info.get("sub_category"):
             tags["sub_category"].add(info["sub_category"])
         if info.get("usage"):
@@ -336,8 +358,6 @@ def compute_box_metrics(
     fruit_value = 0
     veg_value = 0
     unique_items = 0
-    # Track (total_qty, degree) per group key (fungible group or singleton)
-    group_totals: dict[str, tuple[int, float]] = {}
     # Also track variety count per fungible group (for informational display)
     fungible_groups_seen: dict[str, tuple[int, float]] = {}
     pref_violations = 0
@@ -347,6 +367,9 @@ def compute_box_metrics(
     box_tag_counts: dict[str, dict[str, int]] = {
         "sub_category": {}, "usage": {}, "colour": {}, "shape": {},
     }
+
+    # Per-item data for same-item and group-concentration penalties
+    per_item_data: list[tuple[int, int, dict]] = []  # (item_id, qty, info)
 
     for item_id, qty in allocations.items():
         if item_id not in item_lookup:
@@ -360,6 +383,7 @@ def compute_box_metrics(
         val = info["price"] * qty
         total_value += val
         unique_items += 1
+        per_item_data.append((item_id, qty, info))
 
         if info["category_id"] == CATEGORY_FRUIT:
             fruit_value += val
@@ -379,22 +403,11 @@ def compute_box_metrics(
         fg = info["fungible_group"]
         if fg:
             degree = info["fungible_degree"]
-            group_key = fg
             if fg in fungible_groups_seen:
                 prev_count, prev_degree = fungible_groups_seen[fg]
                 fungible_groups_seen[fg] = (prev_count + 1, prev_degree)
             else:
                 fungible_groups_seen[fg] = (1, degree)
-        else:
-            group_key = f"__item_{item_id}"
-            degree = 1.0
-
-        # Accumulate group totals (including singletons)
-        if group_key in group_totals:
-            prev_qty, prev_degree = group_totals[group_key]
-            group_totals[group_key] = (prev_qty + qty, prev_degree)
-        else:
-            group_totals[group_key] = (qty, degree)
 
         # Preference compliance
         if preference == "fruit_only" and info["category_id"] == CATEGORY_VEGETABLES:
@@ -417,13 +430,53 @@ def compute_box_metrics(
         else:
             bad_dupes += dupes
 
-    # Group-qty penalty (matches _scoring.py:group_qty_penalty_for_box)
-    allowance = GROUP_QTY_ALLOWANCE_BASE * GROUP_QTY_TIER_RATIO.get(tier, 1.0)
-    group_qty_penalty = 0.0
-    for total_qty, degree in group_totals.values():
-        excess = max(0, total_qty - allowance)
+    # Same-item penalty
+    same_item_penalty = 0.0
+    for item_id, qty, info in per_item_data:
+        item_allow = _resolve_item_allowance_from_lookup(info, tier)
+        excess = max(0, qty - item_allow)
         if excess > 0:
-            group_qty_penalty += (excess ** GROUP_QTY_EXPONENT) * degree
+            same_item_penalty += excess * info["price"] * SAME_ITEM_MULTIPLIER / 100.0
+
+    # Group concentration penalty (uses min(qty, item_allowance) for group load)
+    group_loads: dict[str, tuple[float, float]] = {}  # group -> (load, degree)
+    for item_id, qty, info in per_item_data:
+        fg = info["fungible_group"]
+        if not fg:
+            continue
+        degree = info["fungible_degree"]
+        item_allow = _resolve_item_allowance_from_lookup(info, tier)
+        capped = min(qty, item_allow)
+        if fg in group_loads:
+            prev_load, prev_deg = group_loads[fg]
+            group_loads[fg] = (prev_load + capped, prev_deg)
+        else:
+            group_loads[fg] = (capped, degree)
+
+    group_concentration_penalty = 0.0
+    for fg, (load, degree) in group_loads.items():
+        if fg in GROUP_ALLOWANCES:
+            ga = GROUP_ALLOWANCES[fg].get(tier, load)
+            excess = max(0, load - ga)
+            if excess > 0:
+                group_concentration_penalty += (excess ** GROUP_QTY_EXPONENT) * degree * GROUP_CONCENTRATION_MULTIPLIER
+
+    # Max value share penalty
+    max_value_share = 0.0
+    if total_value > 0:
+        for item_id, qty, info in per_item_data:
+            share = info["price"] * qty / total_value
+            if share > max_value_share:
+                max_value_share = share
+    mvs_excess = max(0.0, max_value_share - MAX_VALUE_SHARE_THRESHOLD)
+    max_value_share_penalty = mvs_excess * MAX_VALUE_SHARE_MULTIPLIER
+
+    # Size floor penalty
+    total_size_points = 0
+    for item_id, qty, info in per_item_data:
+        total_size_points += info.get("size", 1) * qty
+    sf_target = SIZE_FLOOR_TARGETS.get(tier, 0)
+    size_floor_penalty = max(0, sf_target - total_size_points) * SIZE_FLOOR_MULTIPLIER
 
     total_fv = fruit_value + veg_value
     fruit_pct = (fruit_value / total_fv * 100) if total_fv > 0 else 0.0
@@ -445,10 +498,6 @@ def compute_box_metrics(
     else:
         diversity_score = DIVERSITY_FALLBACK_SCORE  # no reference = neutral
 
-    # Desirability score
-    from allocator.desirability import compute_box_desirability
-    desirability_score = compute_box_desirability(allocations, item_lookup)
-
     return {
         "box_name": box_name,
         "tier": tier,
@@ -460,11 +509,15 @@ def compute_box_metrics(
         "veg_value": veg_value,
         "fruit_pct": fruit_pct,
         "diversity_score": diversity_score,
-        "desirability_score": desirability_score,
+        "same_item_penalty": same_item_penalty,
+        "group_concentration_penalty": group_concentration_penalty,
+        "max_value_share": max_value_share,
+        "max_value_share_penalty": max_value_share_penalty,
+        "total_size_points": total_size_points,
+        "size_floor_penalty": size_floor_penalty,
         "fungible_dupes": fungible_dupes,
         "slot_dupes": slot_dupes,
         "bad_dupes": bad_dupes,
-        "group_qty_penalty": group_qty_penalty,
         "pref_violations": pref_violations,
     }
 
@@ -477,47 +530,46 @@ def compute_composite_score(metrics: list[dict], params: dict | None = None) -> 
     Score = 100 - penalties. Higher is better.
     """
     if not metrics:
-        return {"score": 0.0, "value_pen": 0.0, "gq_pen": 0.0,
-                "diversity_pen": 0.0, "fair_pen": 0.0, "pref_pen": 0.0,
-                "desir_pen": 0.0}
+        return {"score": 0.0, "value_pen": 0.0, "si_pen": 0.0, "gc_pen": 0.0,
+                "diversity_pen": 0.0, "mvs_pen": 0.0, "sf_pen": 0.0,
+                "pref_pen": 0.0}
 
     n = len(metrics)
 
-    gq_mult = (params or {}).get("group_qty_multiplier", GROUP_QTY_MULTIPLIER)
     div_mult = (params or {}).get("diversity_penalty_multiplier", DIVERSITY_PENALTY_MULTIPLIER)
-    desir_mult = (params or {}).get("desirability_penalty_multiplier", DESIRABILITY_PENALTY_MULTIPLIER)
-    fair_mult = (params or {}).get("fairness_penalty_multiplier", FAIRNESS_PENALTY_MULTIPLIER)
 
     # 1. Value penalty (per box, averaged)
     value_penalties = [value_penalty(m["value_pct"], params) for m in metrics]
     avg_value_pen = sum(value_penalties) / n
 
-    # 2. Group-qty penalty (per box, averaged)
-    avg_gq_pen = sum(m["group_qty_penalty"] * gq_mult for m in metrics) / n
+    # 2. Same-item penalty (per box, averaged — already includes multiplier)
+    avg_si_pen = sum(m.get("same_item_penalty", 0.0) for m in metrics) / n
 
-    # 3. Diversity penalty (per box, averaged)
+    # 3. Group concentration penalty (per box, averaged — already includes multiplier)
+    avg_gc_pen = sum(m.get("group_concentration_penalty", 0.0) for m in metrics) / n
+
+    # 4. Diversity penalty (per box, averaged)
     avg_diversity_pen = sum((1.0 - m["diversity_score"]) * div_mult for m in metrics) / n
 
-    # 4. Fairness penalty (aggregate std dev of value_pct)
-    mean_vp = sum(m["value_pct"] for m in metrics) / n
-    std_vp = (sum((m["value_pct"] - mean_vp) ** 2 for m in metrics) / n) ** 0.5
-    fair_pen = std_vp * fair_mult
+    # 5. Max value share penalty (per box, averaged — already includes multiplier)
+    avg_mvs_pen = sum(m.get("max_value_share_penalty", 0.0) for m in metrics) / n
 
-    # 5. Preference violations (hard penalty)
+    # 6. Size floor penalty (per box, averaged — already includes multiplier)
+    avg_sf_pen = sum(m.get("size_floor_penalty", 0.0) for m in metrics) / n
+
+    # 7. Preference violations (hard penalty)
     pref_pen = sum(m["pref_violations"] for m in metrics) * PREF_VIOLATION_PENALTY
 
-    # 6. Desirability penalty (per box, averaged)
-    avg_desir_pen = sum((1.0 - m.get("desirability_score", 0.5)) * desir_mult for m in metrics) / n
-
-    score = MAX_COMPOSITE_SCORE - avg_value_pen - avg_gq_pen - avg_diversity_pen - fair_pen - pref_pen - avg_desir_pen
+    score = MAX_COMPOSITE_SCORE - avg_value_pen - avg_si_pen - avg_gc_pen - avg_diversity_pen - avg_mvs_pen - avg_sf_pen - pref_pen
     return {
         "score": score,
         "value_pen": avg_value_pen,
-        "gq_pen": avg_gq_pen,
+        "si_pen": avg_si_pen,
+        "gc_pen": avg_gc_pen,
         "diversity_pen": avg_diversity_pen,
-        "fair_pen": fair_pen,
+        "mvs_pen": avg_mvs_pen,
+        "sf_pen": avg_sf_pen,
         "pref_pen": pref_pen,
-        "desir_pen": avg_desir_pen,
     }
 
 
@@ -567,7 +619,17 @@ def _process_offer_quiet(
         elif "no fruit" in opt.lower():
             buyer_prefs[email] = "veg_only"
 
-    avail_tags = compute_available_tags(item_lookup)
+    # Precompute available tags for each preference variant
+    avail_tags_all = compute_available_tags(item_lookup)
+    avail_tags_fruit = compute_available_tags(item_lookup, preference="fruit_only")
+    avail_tags_veg = compute_available_tags(item_lookup, preference="veg_only")
+
+    def _tags_for_pref(pref):
+        if pref == "fruit_only":
+            return avail_tags_fruit
+        if pref == "veg_only":
+            return avail_tags_veg
+        return avail_tags_all
 
     manual_metrics = []
     for bn in box_names:
@@ -582,7 +644,7 @@ def _process_offer_quiet(
 
         pref = buyer_prefs.get(bn)
         m = compute_box_metrics(bn, box_allocs, manual_item_lookup, tier, preference=pref,
-                                available_tags=avail_tags)
+                                available_tags=_tags_for_pref(pref))
         if m:
             m["source"] = "manual"
             manual_metrics.append(m)
@@ -622,7 +684,7 @@ def _process_offer_quiet(
             item_lookup,
             box.tier,
             preference=box.preference,
-            available_tags=avail_tags,
+            available_tags=_tags_for_pref(box.preference),
         )
         if m:
             m["source"] = "algorithm"
@@ -743,7 +805,7 @@ def run_all_strategies_parallel(summary, max_workers=None):
     """
     from concurrent.futures import ProcessPoolExecutor, as_completed
 
-    strategies = list_strategies() + ["manual"]
+    strategies = list_strategies(include_baselines=True) + ["manual"]
     phase1_strategies = [s for s in strategies if s != "local-search"]
     n_offers = len(OFFER_IDS)
     n_tasks = len(strategies) * n_offers
@@ -804,7 +866,7 @@ def run_single_strategy_parallel(algorithm, summary, max_workers=None):
     """
     from concurrent.futures import ProcessPoolExecutor
 
-    alg = algorithm or "deal-topup"
+    alg = _effective_algorithm(algorithm)
     tasks = [(oid, alg, summary) for oid in OFFER_IDS]
 
     all_manual, all_algo = [], []
@@ -855,7 +917,7 @@ def print_leaderboard(results: dict[str, dict]):
     ranked = sorted(results.items(), key=lambda x: x[1]["composite"]["score"], reverse=True)
 
     table = Table(
-        title=f"Strategy Leaderboard  (across {len(OFFER_IDS)} offers)",
+        title=f"Canonical vs baselines  (across {len(OFFER_IDS)} offers)",
         box=rich_box.SIMPLE_HEAD,
         show_footer=False,
         title_style="bold",
@@ -864,11 +926,12 @@ def print_leaderboard(results: dict[str, dict]):
     table.add_column("Strategy", min_width=18)
     table.add_column("Score", justify="right", style="bold green")
     table.add_column("Value", justify="right")
-    table.add_column("GrpQty", justify="right")
+    table.add_column("SameI", justify="right")
+    table.add_column("GrpC", justify="right")
     table.add_column("Diver", justify="right")
-    table.add_column("Fair", justify="right")
+    table.add_column("MVS", justify="right")
+    table.add_column("SzFlr", justify="right")
     table.add_column("Pref", justify="right")
-    table.add_column("Desir", justify="right")
 
     for i, (name, avg) in enumerate(ranked, 1):
         c = avg["composite"]
@@ -879,11 +942,12 @@ def print_leaderboard(results: dict[str, dict]):
             name,
             score_str,
             f"{-c['value_pen']:+.1f}",
-            f"{-c['gq_pen']:+.1f}",
+            f"{-c.get('si_pen', 0):+.1f}",
+            f"{-c.get('gc_pen', 0):+.1f}",
             f"{-c['diversity_pen']:+.1f}",
-            f"{-c['fair_pen']:+.1f}",
+            f"{-c.get('mvs_pen', 0):+.1f}",
+            f"{-c.get('sf_pen', 0):+.1f}",
             f"{-c['pref_pen']:+.1f}",
-            f"{-c['desir_pen']:+.1f}",
         )
 
     console.print()
@@ -896,7 +960,7 @@ def print_leaderboard(results: dict[str, dict]):
 
 def print_detail(algorithm: str, per_offer: dict, all_algo: list[dict]):
     """Print per-offer breakdown and value distribution, write JSON dump."""
-    alg_name = algorithm or "deal-topup"
+    alg_name = _effective_algorithm(algorithm)
 
     # --- Per-offer table (worst first) ---
     offer_rows = []
@@ -911,15 +975,16 @@ def print_detail(algorithm: str, per_offer: dict, all_algo: list[dict]):
     print(f"\n{'='*80}")
     print(f"  PER-OFFER BREAKDOWN — {alg_name} (worst first)")
     print(f"{'='*80}")
-    print(f"  {'Offer':>5} {'Boxes':>5} {'Score':>7} {'Value':>7} {'GrpQty':>7} "
-          f"{'Diver':>7} {'Fair':>7} {'Pref':>7} {'Desir':>7}")
-    print(f"  {'-'*60}")
+    print(f"  {'Offer':>5} {'Boxes':>5} {'Score':>7} {'Value':>7} {'SameI':>7} "
+          f"{'GrpC':>7} {'Diver':>7} {'MVS':>7} {'SzFlr':>7} {'Pref':>7}")
+    print(f"  {'-'*70}")
 
     for offer_id, n_boxes, comp in offer_rows:
         print(f"  {offer_id:>5} {n_boxes:>5} {comp['score']:>7.1f} "
-              f"{-comp['value_pen']:>+7.1f} {-comp['gq_pen']:>+7.1f} "
-              f"{-comp['diversity_pen']:>+7.1f} {-comp['fair_pen']:>+7.1f} "
-              f"{-comp['pref_pen']:>+7.1f} {-comp['desir_pen']:>+7.1f}")
+              f"{-comp['value_pen']:>+7.1f} {-comp.get('si_pen', 0):>+7.1f} "
+              f"{-comp.get('gc_pen', 0):>+7.1f} {-comp['diversity_pen']:>+7.1f} "
+              f"{-comp.get('mvs_pen', 0):>+7.1f} {-comp.get('sf_pen', 0):>+7.1f} "
+              f"{-comp['pref_pen']:>+7.1f}")
 
     # --- Value distribution ---
     buckets = [
@@ -1010,11 +1075,12 @@ def write_csv(label: str, per_offer: dict, source: str):
 
     fieldnames = [
         "offer", "box", "tier", "target_value_cents", "total_value_cents",
-        "value_pct", "score", "value_penalty", "group_qty_penalty",
-        "diversity_penalty", "desirability_penalty", "diversity_score",
-        "desirability_score", "bad_dupes",
-        "fungible_dupes", "slot_dupes", "unique_items", "fruit_pct",
-        "pref_violations", "main_issue",
+        "value_pct", "score", "value_penalty", "same_item_penalty",
+        "group_concentration_penalty", "diversity_penalty",
+        "max_value_share_penalty", "size_floor_penalty",
+        "diversity_score", "max_value_share",
+        "bad_dupes", "fungible_dupes", "slot_dupes", "unique_items",
+        "fruit_pct", "pref_violations", "main_issue",
     ]
 
     rows = []
@@ -1023,10 +1089,12 @@ def write_csv(label: str, per_offer: dict, source: str):
         boxes = manual if source == "manual" else algo
         for m in boxes:
             vp = value_penalty(m["value_pct"])
-            gqp = m["group_qty_penalty"] * GROUP_QTY_MULTIPLIER
+            si_pen = m.get("same_item_penalty", 0.0)
+            gc_pen = m.get("group_concentration_penalty", 0.0)
             dv = (1.0 - m["diversity_score"]) * DIVERSITY_PENALTY_MULTIPLIER
-            desir = (1.0 - m.get("desirability_score", 0.5)) * DESIRABILITY_PENALTY_MULTIPLIER
-            score = MAX_COMPOSITE_SCORE - vp - gqp - dv - desir
+            mvs_pen = m.get("max_value_share_penalty", 0.0)
+            sf_pen = m.get("size_floor_penalty", 0.0)
+            score = MAX_COMPOSITE_SCORE - vp - si_pen - gc_pen - dv - mvs_pen - sf_pen
             rows.append({
                 "offer": offer_id,
                 "box": m["box_name"],
@@ -1036,18 +1104,20 @@ def write_csv(label: str, per_offer: dict, source: str):
                 "value_pct": round(m["value_pct"], 2),
                 "score": round(score, 2),
                 "value_penalty": round(vp, 2),
-                "group_qty_penalty": round(gqp, 1),
+                "same_item_penalty": round(si_pen, 2),
+                "group_concentration_penalty": round(gc_pen, 1),
                 "diversity_penalty": round(dv, 2),
-                "desirability_penalty": round(desir, 2),
+                "max_value_share_penalty": round(mvs_pen, 2),
+                "size_floor_penalty": round(sf_pen, 2),
                 "diversity_score": round(m["diversity_score"], 4),
-                "desirability_score": round(m.get("desirability_score", 0.5), 4),
+                "max_value_share": round(m.get("max_value_share", 0.0), 4),
                 "bad_dupes": m["bad_dupes"],
                 "fungible_dupes": m["fungible_dupes"],
                 "slot_dupes": m["slot_dupes"],
                 "unique_items": m["unique_items"],
                 "fruit_pct": round(m["fruit_pct"], 1),
                 "pref_violations": m["pref_violations"],
-                "main_issue": _box_main_issue(vp, gqp, dv),
+                "main_issue": _box_main_issue(vp, gc_pen, dv),
             })
 
     with open(csv_path, "w", newline="") as f:
@@ -1061,9 +1131,9 @@ def write_csv(label: str, per_offer: dict, source: str):
 def main():
     import argparse
     parser = argparse.ArgumentParser(description="Compare algorithm vs historical allocations")
-    parser.add_argument("--algorithm", default=None, help="Allocation algorithm (default: deal-topup)")
+    parser.add_argument("--algorithm", default=None, help="Allocation algorithm (default: ilp-optimal)")
     parser.add_argument("--all-strategies", action="store_true",
-                        help="Run all registered strategies and print a leaderboard")
+                        help="Run all registered strategies and print a ranked benchmark")
     parser.add_argument("--detail", action="store_true",
                         help="Print per-offer breakdown and write detailed JSON")
     parser.add_argument("--csv", action="store_true",
@@ -1108,7 +1178,7 @@ def main():
                 strategy_results[strat_name] = compute_averages(metrics)
 
         else:
-            strategies = list_strategies() + ["manual"]
+            strategies = list_strategies(include_baselines=True) + ["manual"]
             strategy_results = {}
 
             for strat_name in strategies:
@@ -1158,9 +1228,9 @@ def main():
 
     # When no algorithm results, use zeros for display
     if not has_algo:
-        _zero_comp = {"score": 0.0, "value_pen": 0.0, "gq_pen": 0.0,
-                      "diversity_pen": 0.0, "fair_pen": 0.0, "pref_pen": 0.0,
-                      "desir_pen": 0.0}
+        _zero_comp = {"score": 0.0, "value_pen": 0.0, "si_pen": 0.0, "gc_pen": 0.0,
+                      "diversity_pen": 0.0, "mvs_pen": 0.0, "sf_pen": 0.0,
+                      "pref_pen": 0.0}
         alg_avg = {
             "count": 0, "avg_value": 0, "avg_value_pct": 0, "avg_unique_items": 0,
             "avg_fruit_pct": 0, "avg_diversity_score": 0, "avg_fungible_dupes": 0,
@@ -1372,11 +1442,12 @@ def main():
     print(f"  {'-'*47}")
     for label, key in [
         ("Value penalty", "value_pen"),
-        ("Group-qty penalty", "gq_pen"),
+        ("Same-item penalty", "si_pen"),
+        ("Group concentration", "gc_pen"),
         ("Diversity penalty", "diversity_pen"),
-        ("Fairness penalty", "fair_pen"),
+        ("Max value share", "mvs_pen"),
+        ("Size floor", "sf_pen"),
         ("Pref violation penalty", "pref_pen"),
-        ("Desirability penalty", "desir_pen"),
     ]:
         if has_algo:
             print(f"  {label:<25} {-man_comp[key]:>+10.1f} {-alg_comp[key]:>+10.1f}")
@@ -1394,7 +1465,7 @@ def main():
 
     # --- CSV output ---
     if args.csv:
-        alg_name = algorithm or "deal-topup"
+        alg_name = _effective_algorithm(algorithm)
         write_csv("manual", per_offer, "manual")
         write_csv(alg_name, per_offer, "algo")
 

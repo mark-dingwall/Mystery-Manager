@@ -38,7 +38,7 @@ def main():
     offer_id = int(sys.argv[1])
     xlsx_path = Path(sys.argv[2])
 
-    strategies = list_strategies()
+    strategies = list_strategies(include_baselines=True)
     item_lookup = build_item_lookup(offer_id)
     avail_tags = compute_available_tags(item_lookup)
 

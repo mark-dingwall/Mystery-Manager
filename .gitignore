@@ -3,7 +3,8 @@
 .env.local
 identifiers.json
 queries.json
-scoring_config.json
+scoring_config.json*
+tuning_bounds.json
 # But track test fixtures
 !tests/fixtures/identifiers.json
 !tests/fixtures/scoring_config.json

@@ -30,11 +30,11 @@ from allocator.screens.wizard_state import WizardState
 
 
 _STRATEGY_DESCRIPTIONS = {
-    "ilp-optimal":     "Best quality (ILP solver, ~30s) — RECOMMENDED",
+    "ilp-optimal":     "Best quality (ILP solver, ~30s) — canonical",
     "local-search":    "Near-optimal via iterative improvement (~10-20s)",
     "discard-worst":   "Fast subtractive greedy (<1s)",
     "round-robin":     "Fast round-robin draft (<1s)",
-    "deal-topup":      "Three-phase deal + top-up (<1s, default CLI)",
+    "deal-topup":      "Three-phase deal + top-up (<1s) — baseline",
     "minmax-deficit":  "Minimise worst-off box (<1s)",
     "greedy-best-fit": "Greedy item-at-a-time (<1s)",
 }
@@ -214,16 +214,15 @@ class StrategyStep(HelpMixin, Screen):
 
     HELP_TITLE = "Select Strategy"
     HELP_TEXT = (
-        "Choose the allocation algorithm for this week's mystery boxes.\n\n"
-        "Strategies (ranked by quality):\n"
-        "  ilp-optimal — Best results using an ILP solver. Takes ~30 seconds. RECOMMENDED.\n"
-        "  local-search — Near-optimal via iterative improvement. Takes ~10-20 seconds.\n"
-        "  discard-worst — Fast subtractive greedy. Under 1 second.\n"
-        "  round-robin — Fast round-robin draft. Under 1 second.\n"
-        "  deal-topup — Three-phase deal + top-up. Under 1 second (CLI default).\n\n"
-        "Use arrow keys to browse strategies and press Enter to select. "
-        "The recommended strategy (ilp-optimal) is pre-highlighted. "
-        "Press Escape to go back to box review."
+        "The weekly allocation uses ilp-optimal, the canonical production "
+        "strategy (see CLAUDE.md > Project Direction).\n\n"
+        "  ilp-optimal — Best results via an ILP solver (~30s). Falls back to "
+        "local-search automatically if the solver is unavailable.\n\n"
+        "Baseline strategies (deal-topup, greedy-best-fit, round-robin, "
+        "minmax-deficit, discard-worst, local-search) are regression benchmarks "
+        "only — run them via `compare.py --all-strategies` or "
+        "`run.py --algorithm <name>`, not from this wizard.\n\n"
+        "Press Enter to select and Escape to go back to box review."
     )
 
     def __init__(self, state: WizardState) -> None:

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# STATUS: dev-tool — infrequent maintenance utility; not part of the canonical pipeline.
 """
 SUMPRODUCT validation: compare XLSX prices against DB item prices.
 

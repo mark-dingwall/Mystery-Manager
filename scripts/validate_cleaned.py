@@ -1,3 +1,4 @@
+# STATUS: dev-tool — infrequent maintenance utility; not part of the canonical pipeline.
 """Validate cleaned historical CSVs for structural integrity, DB consistency, and cross-file checks."""
 
 import argparse

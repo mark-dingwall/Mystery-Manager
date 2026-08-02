@@ -227,7 +227,7 @@ def _load_workbook_info(offer_id: int, path: Path) -> WorkbookInfo:
 
 def _extract_tab_corner(
     sheet_text: str,
-    max_header_cols: int = 20,
+    max_header_cols: int = 50,
     n_data_rows: int = 3,
     n_label_cols: int = 3,
 ) -> str:

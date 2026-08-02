@@ -1,3 +1,4 @@
+# STATUS: baseline — regression benchmark only; not the production direction (see CLAUDE.md § Project Direction). Do not extend.
 """
 Discard-worst allocation strategy.
 
@@ -21,14 +22,15 @@ from allocator.config import (
     BOX_TIERS,
     DIVERSITY_PENALTY_MULTIPLIER,
     DIVERSITY_WEIGHTS,
-    GROUP_QTY_ALLOWANCE_BASE,
+    GROUP_ALLOWANCES,
+    GROUP_CONCENTRATION_MULTIPLIER,
     GROUP_QTY_EXPONENT,
-    GROUP_QTY_MULTIPLIER,
-    GROUP_QTY_TIER_RATIO,
+    SAME_ITEM_MULTIPLIER,
     VALUE_CEILING_PCT,
 )
 from allocator.models import AllocationResult, Item, MysteryBox
 from allocator.strategies._helpers import (
+    _item_allowance,
     assign_item,
     compute_available_tags,
     has_hard_fungible_conflict,
@@ -96,14 +98,24 @@ def _seed_score(
                 delta = (eff_after - eff_before) / n_avail
                 score += weight * delta * DIVERSITY_PENALTY_MULTIPLIER
 
-    # Group-qty cost: penalise excess above allowance
+    # Same-item cost: penalise exceeding per-item allowance
+    current_item_qty = box.allocations.get(item.id, 0)
+    item_allow = _item_allowance(item, box.tier)
+    item_excess = max(0, current_item_qty + 1 - item_allow)
+    if item_excess > 0:
+        score -= item_excess * item.price * SAME_ITEM_MULTIPLIER / 100.0
+
+    # Group concentration cost: penalise excess above group allowance
     if item.fungible_group and item.fungible_group in box_groups:
         current_qty, degree = box_groups[item.fungible_group]
-        allowance = GROUP_QTY_ALLOWANCE_BASE * GROUP_QTY_TIER_RATIO.get(box.tier, 1.0)
-        new_qty = current_qty + 1
-        excess = max(0, new_qty - allowance)
-        if excess > 0:
-            score -= (excess ** GROUP_QTY_EXPONENT) * degree * GROUP_QTY_MULTIPLIER
+        if item.fungible_group in GROUP_ALLOWANCES:
+            ga = GROUP_ALLOWANCES[item.fungible_group].get(box.tier, current_qty + 1)
+            # Use min(qty, item_allowance) for group load contribution
+            capped_new = min(1, item_allow)
+            new_load = current_qty + capped_new  # approximate: existing load + new capped qty
+            excess = max(0, new_load - ga)
+            if excess > 0:
+                score -= (excess ** GROUP_QTY_EXPONENT) * degree * GROUP_CONCENTRATION_MULTIPLIER
 
     # Tiebreak: prefer placing expensive items (harder to place later)
     score += item.price * 1e-8

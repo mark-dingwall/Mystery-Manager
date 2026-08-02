@@ -1,0 +1,39 @@
+{% extends "base.html" %}
+
+{% block title %}Mystery Manager — Compare{% endblock %}
+
+{% block content %}
+<div class="index-page">
+    <h1>Compare Allocations</h1>
+    <p class="subtitle">Select an offer and algorithm to compare against manual packing.</p>
+
+    {% if error %}
+    <div class="alert alert-error">{{ error }}</div>
+    {% endif %}
+
+    <form action="/compare" method="get" class="compare-form">
+        <div class="form-group">
+            <label for="offer">Offer</label>
+            <select name="offer" id="offer" required>
+                <option value="">Select offer...</option>
+                {% for oid in offers %}
+                <option value="{{ oid }}">Offer {{ oid }}</option>
+                {% endfor %}
+            </select>
+        </div>
+
+        <div class="form-group">
+            <label for="algorithm">Algorithm</label>
+            <select name="algorithm" id="algorithm">
+                {% for alg in algorithms %}
+                <option value="{{ alg }}" {% if alg == "ilp-optimal" %}selected{% endif %}>
+                    {{ alg }}{% if alg != "ilp-optimal" %} (baseline){% endif %}
+                </option>
+                {% endfor %}
+            </select>
+        </div>
+
+        <button type="submit" class="btn btn-primary">Compare</button>
+    </form>
+</div>
+{% endblock %}

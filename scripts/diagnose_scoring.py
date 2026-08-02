@@ -24,17 +24,17 @@ logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(name)s: %(mes
 from allocator.box_parser import classify_box, infer_box_tier
 from allocator.config import (
     BOX_TIERS,
-    DESIRABILITY_PENALTY_MULTIPLIER,
     DIVERSITY_PENALTY_MULTIPLIER,
     DIVERSITY_WEIGHTS,
     DONATION_IDENTIFIERS,
-    FAIRNESS_PENALTY_MULTIPLIER,
-    GROUP_QTY_ALLOWANCE_BASE,
+    GROUP_CONCENTRATION_MULTIPLIER,
     GROUP_QTY_EXPONENT,
-    GROUP_QTY_MULTIPLIER,
-    GROUP_QTY_TIER_RATIO,
     MAX_COMPOSITE_SCORE,
+    MAX_VALUE_SHARE_MULTIPLIER,
+    MAX_VALUE_SHARE_THRESHOLD,
     PREF_VIOLATION_PENALTY,
+    SAME_ITEM_MULTIPLIER,
+    SIZE_FLOOR_MULTIPLIER,
     VALUE_PENALTY_EXPONENT,
     VALUE_SWEET_FROM,
     VALUE_SWEET_TO,
@@ -184,12 +184,12 @@ def collect_offer(offer_id: int, summary: dict) -> dict | None:
         if m is None:
             continue
 
-        # Add per-box penalty breakdown
+        # Add per-box penalty breakdown. same_item, group_concentration,
+        # max_value_share and size_floor penalties are already on m from
+        # compute_box_metrics; derive the value/diversity/pref components here.
         vp = m["value_pct"]
         m["value_penalty"] = value_penalty(vp)
-        m["group_qty_penalty_scaled"] = m["group_qty_penalty"] * GROUP_QTY_MULTIPLIER
         m["diversity_penalty"] = (1.0 - m["diversity_score"]) * DIVERSITY_PENALTY_MULTIPLIER
-        m["desirability_penalty"] = (1.0 - m.get("desirability_score", 0.5)) * DESIRABILITY_PENALTY_MULTIPLIER
         m["pref_penalty"] = m["pref_violations"] * PREF_VIOLATION_PENALTY
         box_metrics.append(m)
 
@@ -306,9 +306,11 @@ def compute_aggregate_stats(boxes: list[dict]) -> dict:
     vp_vals = [b["value_pct"] for b in boxes]
     div_vals = [b["diversity_score"] for b in boxes]
     val_pen = [b["value_penalty"] for b in boxes]
-    gq_pen = [b["group_qty_penalty_scaled"] for b in boxes]
+    si_pen = [b["same_item_penalty"] for b in boxes]
+    gc_pen = [b["group_concentration_penalty"] for b in boxes]
     div_pen = [b["diversity_penalty"] for b in boxes]
-    desir_pen = [b.get("desirability_penalty", 0) for b in boxes]
+    mvs_pen = [b["max_value_share_penalty"] for b in boxes]
+    sf_pen = [b["size_floor_penalty"] for b in boxes]
 
     mean_vp = sum(vp_vals) / n
     std_vp = (sum((v - mean_vp) ** 2 for v in vp_vals) / n) ** 0.5
@@ -332,9 +334,11 @@ def compute_aggregate_stats(boxes: list[dict]) -> dict:
         },
         "penalties": {
             "value": {"mean": round(sum(val_pen) / n, 2), "total": round(sum(val_pen), 1)},
-            "group_qty": {"mean": round(sum(gq_pen) / n, 2), "total": round(sum(gq_pen), 1)},
+            "same_item": {"mean": round(sum(si_pen) / n, 2), "total": round(sum(si_pen), 1)},
+            "group_concentration": {"mean": round(sum(gc_pen) / n, 2), "total": round(sum(gc_pen), 1)},
             "diversity": {"mean": round(sum(div_pen) / n, 2), "total": round(sum(div_pen), 1)},
-            "desirability": {"mean": round(sum(desir_pen) / n, 2), "total": round(sum(desir_pen), 1)},
+            "max_value_share": {"mean": round(sum(mvs_pen) / n, 2), "total": round(sum(mvs_pen), 1)},
+            "size_floor": {"mean": round(sum(sf_pen) / n, 2), "total": round(sum(sf_pen), 1)},
         },
         "unique_items": {
             "mean": round(sum(b["unique_items"] for b in boxes) / n, 1),
@@ -385,9 +389,9 @@ def compute_what_if_sweet_spots(boxes: list[dict]) -> list[dict]:
         avg_val_pen = total_val_pen / n
 
         # Recompute score with new value penalty, keeping other penalties same
-        other_pens = current_score["gq_pen"] + current_score["diversity_pen"] + \
-                     current_score["fair_pen"] + current_score["pref_pen"] + \
-                     current_score.get("desir_pen", 0)
+        other_pens = current_score["si_pen"] + current_score["gc_pen"] + \
+                     current_score["diversity_pen"] + current_score["mvs_pen"] + \
+                     current_score["sf_pen"] + current_score["pref_pen"]
         score = MAX_COMPOSITE_SCORE - avg_val_pen - other_pens
 
         in_sweet = sum(1 for v in vp_vals if lo <= v <= hi)
@@ -427,7 +431,7 @@ def compute_correlations(boxes: list[dict]) -> dict[str, dict[str, float]]:
     if len(boxes) < 3:
         return {}
 
-    fields = ["value_penalty", "group_qty_penalty_scaled", "diversity_penalty", "desirability_penalty", "value_pct", "diversity_score"]
+    fields = ["value_penalty", "same_item_penalty", "group_concentration_penalty", "diversity_penalty", "max_value_share_penalty", "size_floor_penalty", "value_pct", "diversity_score"]
     data = {f: [b.get(f, 0) for b in boxes] for f in fields}
     n = len(boxes)
 
@@ -471,9 +475,10 @@ def print_summary(offers: list[dict], boxes: list[dict], what_if: list[dict]):
     global_composite = compute_composite_score(boxes)
     print(f"  {_BOLD}Global Composite Score (all boxes pooled){_RESET}")
     print(f"    Score: {_BOLD}{global_composite['score']:.1f}{_RESET} / {MAX_COMPOSITE_SCORE:.0f}")
-    print(f"    Value: -{global_composite['value_pen']:.1f}  GrpQty: -{global_composite['gq_pen']:.1f}  "
-          f"Diversity: -{global_composite['diversity_pen']:.1f}  Desir: -{global_composite.get('desir_pen', 0):.1f}  "
-          f"Fairness: -{global_composite['fair_pen']:.1f}  Pref: -{global_composite['pref_pen']:.1f}\n")
+    print(f"    Value: -{global_composite['value_pen']:.1f}  SameItem: -{global_composite['si_pen']:.1f}  "
+          f"Group: -{global_composite['gc_pen']:.1f}  Diversity: -{global_composite['diversity_pen']:.1f}  "
+          f"MaxVal: -{global_composite['mvs_pen']:.1f}  Size: -{global_composite['sf_pen']:.1f}  "
+          f"Pref: -{global_composite['pref_pen']:.1f}\n")
 
     # Composite score distribution per-offer
     offer_scores = [o["composite"]["score"] for o in offers]
@@ -486,14 +491,16 @@ def print_summary(offers: list[dict], boxes: list[dict], what_if: list[dict]):
 
     # Penalty breakdown (global composite)
     gc = global_composite
-    total_pen = gc["value_pen"] + gc["gq_pen"] + gc["diversity_pen"] + gc["fair_pen"] + gc["pref_pen"] + gc.get("desir_pen", 0)
+    total_pen = (gc["value_pen"] + gc["si_pen"] + gc["gc_pen"] + gc["diversity_pen"]
+                 + gc["mvs_pen"] + gc["sf_pen"] + gc["pref_pen"])
     if total_pen > 0:
         print(f"  {_BOLD}Penalty Breakdown (global){_RESET}")
         print(f"    {'Dimension':<15} {'Penalty':>8} {'% of total':>10}")
         print(f"    {'─' * 35}")
-        for name, pen in [("Value", gc["value_pen"]), ("Group-Qty", gc["gq_pen"]),
-                          ("Diversity", gc["diversity_pen"]), ("Desirability", gc.get("desir_pen", 0)),
-                          ("Fairness", gc["fair_pen"]), ("Preference", gc["pref_pen"])]:
+        for name, pen in [("Value", gc["value_pen"]), ("Same-item", gc["si_pen"]),
+                          ("Group", gc["gc_pen"]), ("Diversity", gc["diversity_pen"]),
+                          ("Max-val-share", gc["mvs_pen"]), ("Size-floor", gc["sf_pen"]),
+                          ("Preference", gc["pref_pen"])]:
             pct = pen / total_pen * 100 if total_pen > 0 else 0
             bar = "█" * int(pct / 5) + "░" * (20 - int(pct / 5))
             print(f"    {name:<15} {pen:>7.1f}  {pct:>6.1f}%  {bar}")
@@ -585,17 +592,17 @@ def print_summary(offers: list[dict], boxes: list[dict], what_if: list[dict]):
     # Per-offer table
     print(f"  {_BOLD}Per-Offer Summary{_RESET}")
     print(f"    {'Offer':>5} {'Tier':>4} {'Boxes':>5} {'Score':>6} "
-          f"{'ValPen':>7} {'GQPen':>7} {'DivPen':>7} {'DesirP':>7} {'FairPn':>7} {'Miss%':>6} {'Price':>5}")
-    print(f"    {'─' * 78}")
+          f"{'ValPen':>7} {'SIPen':>7} {'GCPen':>7} {'DivPen':>7} {'MVSPen':>7} {'SFPen':>7} {'Miss%':>6} {'Price':>5}")
+    print(f"    {'─' * 92}")
     for o in offers:
         c = o["composite"]
         price_ok = "ok" if o["pricing"]["plausible"] else "FLAG"
         color = _GREEN if c["score"] >= 70 else (_YELLOW if c["score"] >= 50 else _RED)
         print(f"    {o['offer_id']:>5} {o['data_tier']:>4} {o['box_count']:>5} "
               f"{color}{c['score']:>6.1f}{_RESET} "
-              f"{c['value_pen']:>7.1f} {c['gq_pen']:>7.1f} {c['diversity_pen']:>7.1f} "
-              f"{c.get('desir_pen', 0):>7.1f} "
-              f"{c['fair_pen']:>7.1f} {o['missing_item_pct']:>5.1f}% {price_ok:>5}")
+              f"{c['value_pen']:>7.1f} {c['si_pen']:>7.1f} {c['gc_pen']:>7.1f} "
+              f"{c['diversity_pen']:>7.1f} {c['mvs_pen']:>7.1f} {c['sf_pen']:>7.1f} "
+              f"{o['missing_item_pct']:>5.1f}% {price_ok:>5}")
     print()
 
 
@@ -610,13 +617,13 @@ def write_json_report(offers: list[dict], boxes: list[dict], what_if: list[dict]
     config = {
         "sweet_spot": [VALUE_SWEET_FROM, VALUE_SWEET_TO],
         "penalty_exponent": VALUE_PENALTY_EXPONENT,
-        "group_qty_multiplier": GROUP_QTY_MULTIPLIER,
-        "group_qty_allowance_base": GROUP_QTY_ALLOWANCE_BASE,
-        "group_qty_tier_ratio": GROUP_QTY_TIER_RATIO,
+        "same_item_multiplier": SAME_ITEM_MULTIPLIER,
+        "group_concentration_multiplier": GROUP_CONCENTRATION_MULTIPLIER,
         "group_qty_exponent": GROUP_QTY_EXPONENT,
-        "desirability_penalty_multiplier": DESIRABILITY_PENALTY_MULTIPLIER,
+        "max_value_share_threshold": MAX_VALUE_SHARE_THRESHOLD,
+        "max_value_share_multiplier": MAX_VALUE_SHARE_MULTIPLIER,
+        "size_floor_multiplier": SIZE_FLOOR_MULTIPLIER,
         "diversity_penalty_multiplier": DIVERSITY_PENALTY_MULTIPLIER,
-        "fairness_penalty_multiplier": FAIRNESS_PENALTY_MULTIPLIER,
         "pref_violation_penalty": PREF_VIOLATION_PENALTY,
         "max_composite_score": MAX_COMPOSITE_SCORE,
         "diversity_weights": DIVERSITY_WEIGHTS,
@@ -640,9 +647,11 @@ def write_json_report(offers: list[dict], boxes: list[dict], what_if: list[dict]
                 "fungible_dupes": b["fungible_dupes"],
                 "penalties": {
                     "value": round(b["value_penalty"], 2),
-                    "group_qty": round(b["group_qty_penalty_scaled"], 2),
+                    "same_item": round(b["same_item_penalty"], 2),
+                    "group_concentration": round(b["group_concentration_penalty"], 2),
                     "diversity": round(b["diversity_penalty"], 2),
-                    "desirability": round(b.get("desirability_penalty", 0), 2),
+                    "max_value_share": round(b["max_value_share_penalty"], 2),
+                    "size_floor": round(b["size_floor_penalty"], 2),
                     "pref": round(b.get("pref_penalty", 0), 2),
                 },
             })
@@ -709,11 +718,11 @@ def _plot_penalty_breakdown(offers, plt):
     """1. Horizontal stacked bar showing avg penalty by dimension."""
     if not offers:
         return
-    dims = ["Value", "GrpQty", "Diversity", "Desir", "Fairness", "Preference"]
-    keys = ["value_pen", "gq_pen", "diversity_pen", "desir_pen", "fair_pen", "pref_pen"]
+    dims = ["Value", "Same-item", "Group", "Diversity", "Max-val", "Size", "Preference"]
+    keys = ["value_pen", "si_pen", "gc_pen", "diversity_pen", "mvs_pen", "sf_pen", "pref_pen"]
     n = len(offers)
     avgs = [sum(o["composite"].get(k, 0) for o in offers) / n for k in keys]
-    colors = ["#e74c3c", "#e67e22", "#3498db", "#f39c12", "#2ecc71", "#9b59b6"]
+    colors = ["#e74c3c", "#e67e22", "#d35400", "#3498db", "#f39c12", "#16a085", "#9b59b6"]
 
     fig, ax = plt.subplots(figsize=(10, 3))
     left = 0

@@ -7,39 +7,54 @@
   "preference_mix": "Mix of Everything (test)",
 
   "scoring_weights": {
-    "new_item_bonus": 5.0,
-    "fungible_spread": 3.0,
-    "diversity": 2.0,
+    "new_item_bonus": 4.0,
+    "fungible_spread": 2.0,
+    "diversity": 1.5,
     "value_progress": 1.0
   },
 
-  "slot_degree_threshold": 0.7,
+  "slot_degree_threshold": 0.6,
 
   "max_slot_qty": {
-    "small": 4,
-    "medium": 6,
-    "large": 8
+    "small": 3,
+    "medium": 5,
+    "large": 7
   },
 
   "cheap_item_threshold": 300,
 
   "target_item_counts": {
-    "small": [8, 12],
-    "medium": [14, 20],
-    "large": [20, 28]
+    "small": [5, 9],
+    "medium": [10, 16],
+    "large": [16, 24]
   },
 
   "fungible_groups": {
-    "apple":  [0.7, ["Apples -"]],
-    "banana": [1.0, ["Bananas -"]],
-    "tomato": [1.0, ["Tomatoes -"]]
+    "apple":  [0.7, ["Apples -"],   "snack_piece"],
+    "banana": [1.0, ["Bananas -"],  "snack_piece"],
+    "tomato": [1.0, ["Tomatoes -"], "cooking_piece"]
   },
 
+  "quantity_classes": {
+    "snack_piece":   {"small": 2, "medium": 3, "large": 4},
+    "cooking_piece": {"small": 1, "medium": 2, "large": 2},
+    "garnish":       {"small": 1, "medium": 1, "large": 1},
+    "portioned":     {"small": 1, "medium": 1, "large": 1}
+  },
+
+  "group_allowances": {
+    "apple":  {"small": 2, "medium": 4, "large": 6},
+    "banana": {"small": 2, "medium": 3, "large": 4},
+    "tomato": {"small": 1, "medium": 2, "large": 3}
+  },
+
+  "qty_class_price_thresholds": {"snacking_max": 120, "cooking_max": 180},
+
   "diversity_weights": {
-    "sub_category": 0.50,
-    "usage": 0.20,
-    "colour": 0.15,
-    "shape": 0.15
+    "sub_category": 0.40,
+    "usage": 0.30,
+    "colour": 0.20,
+    "shape": 0.10
   },
 
   "item_classifications": {
@@ -49,14 +64,14 @@
     "carrot":   [["Carrots -"],  "root_veg",     "cooking",  "orange", "long"]
   },
 
-  "group_qty_multiplier": 8.0,
-  "group_qty_allowance_base": 2,
-  "group_qty_tier_ratio": {"small": 1.0, "medium": 1.5, "large": 2.0},
+  "same_item_multiplier": 2.0,
+  "group_concentration_multiplier": 4.0,
   "group_qty_exponent": 1.5,
-  "desirability_penalty_multiplier": 5.0,
-  "desirability_shrinkage_prior": 5,
   "diversity_penalty_multiplier": 10.0,
-  "fairness_penalty_multiplier": 0.5,
+  "max_value_share_threshold": 0.25,
+  "max_value_share_multiplier": 12.0,
+  "size_floor_targets": {"small": 6, "medium": 12, "large": 18},
+  "size_floor_multiplier": 1.0,
   "pref_violation_penalty": 20.0,
   "max_composite_score": 100.0,
 
@@ -73,8 +88,8 @@
   "minmax_max_passes": 100,
 
   "ilp_hhi_breakpoints": [0.0, 0.1, 0.2, 0.3, 0.5, 0.7, 1.0],
-  "ilp_coverage_weight": 0.4,
-  "ilp_balance_weight": 0.6,
+  "ilp_coverage_weight": 0.3,
+  "ilp_balance_weight": 0.7,
 
   "classification_fallback": {
     "fruit": ["other_fruit", "cooking", "green", "round"],

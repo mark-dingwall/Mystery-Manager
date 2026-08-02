@@ -11,7 +11,9 @@ Unknown items return 0.5 (neutral).
 import csv
 from pathlib import Path
 
-from allocator.config import DESIRABILITY_SHRINKAGE_PRIOR
+# Default shrinkage prior (was in scoring_config.json, now hardcoded since
+# desirability is no longer a scoring dimension — only used by analyze_desirability.py)
+DESIRABILITY_SHRINKAGE_PRIOR = 5
 
 _DEFAULT_CSV = Path(__file__).resolve().parent.parent / "diagnostics" / "desirability_items.csv"
 

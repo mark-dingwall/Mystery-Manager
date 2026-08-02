@@ -3,7 +3,13 @@
 import pytest
 
 from allocator.config import CATEGORY_FRUIT, CATEGORY_VEGETABLES
-from allocator.strategies import DEFAULT_STRATEGY, get_strategy, list_strategies
+from allocator.strategies import (
+    BASELINE_STRATEGIES,
+    DEFAULT_STRATEGY,
+    FALLBACK_STRATEGY,
+    get_strategy,
+    list_strategies,
+)
 from allocator.strategies._helpers import has_hard_fungible_conflict
 
 
@@ -16,7 +22,7 @@ class TestStrategyRegistry:
             get_strategy("nonexistent-strategy")
 
     def test_all_registered_strategies_loadable(self):
-        for name in list_strategies():
+        for name in list_strategies(include_baselines=True):
             if name == "ilp-optimal":
                 # ILP requires PuLP — skip if not installed
                 try:
@@ -28,26 +34,37 @@ class TestStrategyRegistry:
                 fn = get_strategy(name)
                 assert callable(fn)
 
-    def test_default_strategy_exists(self):
+    def test_default_strategy_is_canonical(self):
+        assert DEFAULT_STRATEGY == "ilp-optimal"
         assert DEFAULT_STRATEGY in list_strategies()
 
-    def test_list_strategies_returns_list(self):
+    def test_fallback_strategy_is_local_search(self):
+        assert FALLBACK_STRATEGY == "local-search"
+
+    def test_list_strategies_excludes_baselines_by_default(self):
         strategies = list_strategies()
         assert isinstance(strategies, list)
-        assert len(strategies) >= 5
+        assert "ilp-optimal" in strategies
+        assert not (set(strategies) & BASELINE_STRATEGIES)
+        # Exact singleton: the wizard's canonical-only guarantee (Task 4) relies
+        # on this. If a second canonical strategy is ever added, this fails loudly
+        # so the production picker's "renders ilp-optimal alone" claim is revisited.
+        assert strategies == ["ilp-optimal"]
+
+    def test_list_strategies_include_baselines_returns_all(self):
+        strategies = list_strategies(include_baselines=True)
+        assert set(BASELINE_STRATEGIES).issubset(set(strategies))
+        assert len(strategies) >= 6
+
+    def test_baselines_still_resolvable(self):
+        for name in BASELINE_STRATEGIES:
+            assert callable(get_strategy(name))
 
 
 # ── Cross-strategy invariants ──────────────────────────────────────────────
 
 
-_STRATEGIES_TO_TEST = [
-    "deal-topup",
-    "greedy-best-fit",
-    "round-robin",
-    "minmax-deficit",
-    "discard-worst",
-    "local-search",
-]
+_STRATEGIES_TO_TEST = sorted(BASELINE_STRATEGIES)
 
 
 @pytest.mark.parametrize("strategy_name", _STRATEGIES_TO_TEST)
@@ -86,22 +103,18 @@ class TestStrategyInvariants:
             )
 
     def test_no_hard_fungible_conflicts(self, strategy_name, two_box_result):
-        """No group should exceed 2x allowance in any box."""
-        from allocator.config import GROUP_QTY_ALLOWANCE_BASE, GROUP_QTY_TIER_RATIO
+        """No item should exceed 2x its per-item allowance in any box."""
+        from allocator.strategies._helpers import _item_allowance
         strategy = get_strategy(strategy_name)
         strategy(two_box_result)
         for box in two_box_result.boxes:
-            allowance = GROUP_QTY_ALLOWANCE_BASE * GROUP_QTY_TIER_RATIO.get(box.tier, 1.0)
-            group_totals: dict[str, int] = {}
             for item_id, qty in box.allocations.items():
                 if qty > 0 and item_id in two_box_result.items:
                     item = two_box_result.items[item_id]
-                    key = item.fungible_group or f"__item_{item_id}"
-                    group_totals[key] = group_totals.get(key, 0) + qty
-            for group_key, total_qty in group_totals.items():
-                assert total_qty <= 2 * allowance, (
-                    f"{strategy_name}: box {box.name} has group {group_key} "
-                    f"with qty {total_qty} > 2x allowance {2 * allowance}"
+                    allowance = _item_allowance(item, box.tier)
+                    assert qty <= 2 * allowance, (
+                        f"{strategy_name}: box {box.name} has item {item.name} "
+                        f"with qty {qty} > 2x allowance {2 * allowance}"
                 )
 
     def test_no_excluded_items(self, strategy_name, make_item, make_box, make_result, make_charity):
@@ -128,3 +141,21 @@ class TestStrategyInvariants:
         assert box1.allocations.get(2, 0) == 0, (
             f"{strategy_name}: box with broccoli exclusion got broccoli allocated"
         )
+
+
+def test_ilp_falls_back_to_local_search(two_box_result, monkeypatch, caplog):
+    """When the ILP solver is unavailable/failing, ilp-optimal must fall back
+    to local-search (not deal-topup) and warn — boxes still get filled."""
+    import logging
+    import allocator.strategies.ilp_optimal as ilp
+
+    def boom(result, pulp):
+        raise RuntimeError("synthetic solver failure")
+
+    monkeypatch.setattr(ilp, "_solve_ilp", boom)
+    with caplog.at_level(logging.WARNING):
+        ilp.run(two_box_result)
+
+    assert any("falling back to local-search" in r.message for r in caplog.records)
+    for box in two_box_result.boxes:
+        assert sum(box.allocations.values()) > 0

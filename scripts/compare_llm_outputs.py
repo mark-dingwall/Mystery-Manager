@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# STATUS: dev-tool — infrequent maintenance utility; not part of the canonical pipeline.
 """
 Compare LLM extraction outputs between methods side-by-side.
 

@@ -11,13 +11,13 @@ from allocator.config import (
     DIVERSITY_WEIGHTS,
     FUNGIBLE_NEUTRAL_SCORE,
     FUNGIBLE_NEW_GROUP_BONUS,
-    GROUP_QTY_ALLOWANCE_BASE,
-    GROUP_QTY_TIER_RATIO,
+    GROUP_ALLOWANCES,
     SCORING_WEIGHTS,
     SLOT_DEGREE_THRESHOLD,
     VALUE_CEILING_PCT,
 )
 from allocator.models import AllocationResult, Item, MysteryBox
+from allocator.strategies._helpers import _item_allowance
 
 import logging
 logger = logging.getLogger(__name__)
@@ -99,18 +99,34 @@ def score_topup_candidate(
 
     # --- fungible_spread: qty-based penalty for same-group items ---
     fungible_spread = 0.0
+    item_allow = _item_allowance(item, box.tier)
+    current_item_qty = box.allocations.get(item.id, 0)
+
+    # Hard block: per-item qty would exceed 2x item allowance
+    if current_item_qty + qty > 2 * item_allow:
+        return float("-inf")
+
+    # Hard block: group total would exceed 2x group allowance
+    if item.fungible_group and item.fungible_group in GROUP_ALLOWANCES:
+        group_allow = GROUP_ALLOWANCES[item.fungible_group].get(box.tier, 1)
+        current_group_qty = sum(
+            aq for aid, aq in box.allocations.items()
+            if aq > 0 and aid in result.items
+            and result.items[aid].fungible_group == item.fungible_group
+        )
+        if current_group_qty + qty > 2 * group_allow:
+            return float("-inf")
+
     if item.fungible_group:
-        allowance = GROUP_QTY_ALLOWANCE_BASE * GROUP_QTY_TIER_RATIO.get(box.tier, 1.0)
         current_group_qty = sum(
             aq for aid, aq in box.allocations.items()
             if aq > 0 and aid in result.items
             and result.items[aid].fungible_group == item.fungible_group
         )
         if current_group_qty > 0:
-            if current_group_qty + qty > 2 * allowance:
-                return float("-inf")  # hard block: would exceed 2x allowance
-            excess = max(0, current_group_qty + qty - allowance)
-            fungible_spread = -item.fungible_degree * excess  # graduated penalty
+            # Same-item penalty term: penalise exceeding per-item allowance
+            item_excess = max(0, current_item_qty + qty - item_allow)
+            fungible_spread = -item.fungible_degree * item_excess
         else:
             fungible_spread = FUNGIBLE_NEW_GROUP_BONUS
     else:

@@ -1,3 +1,4 @@
+# STATUS: baseline — regression benchmark only; not the production direction (see CLAUDE.md § Project Direction). Do not extend.
 """
 Min-max deficit allocation strategy.
 

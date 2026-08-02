@@ -5,3 +5,5 @@ python-dotenv
 rich
 pulp
 textual
+optuna
+flask

@@ -15,9 +15,12 @@ python3 run.py <offer_id> <xlsx> --no-tui --no-llm --algorithm deal-topup
 python3 compare.py                                                # validate vs 42 Tier A offers
 python3 compare.py --algorithm deal-topup                         # specific strategy
 python3 compare.py --only-offers 55-63                            # Tier B
-python3 compare.py --all-strategies                               # full leaderboard
+python3 compare.py --all-strategies                               # full benchmark (canonical vs baselines)
 python3 compare.py --detail                                       # per-offer breakdown + detailed JSON
 python3 compare.py --csv                                          # write per-box metrics CSV to output/
+
+python3 web/app.py                                                # comparison web app (localhost:5000)
+python3 web/app.py --port 8080                                    # custom port
 ```
 
 ### Library tools (allocator/)
@@ -34,7 +37,7 @@ python3 allocator/benchmark_extraction.py 5                       # benchmark LL
 ### Tests
 
 ```bash
-python3 -m pytest                                                 # run full suite (268 tests)
+python3 -m pytest                                                 # run full suite
 python3 -m pytest tests/test_strategies.py -v                     # single module, verbose
 python3 -m pytest -k "test_value_penalty"                         # run by name pattern
 ```
@@ -44,7 +47,7 @@ Tests use synthetic fixtures (no DB required). See `tests/conftest.py` for facto
 ### Utility scripts (scripts/)
 
 ```bash
-python3 scripts/score_offer.py 106 offer_106_shopping_list.xlsx   # per-offer strategy leaderboard
+python3 scripts/score_offer.py 106 offer_106_shopping_list.xlsx   # per-offer strategy benchmark
 python3 scripts/diagnose_scoring.py --no-plots                    # penalty breakdown diagnostics
 python3 scripts/validate_cleaned.py                               # structural + DB checks on cleaned CSVs
 python3 scripts/validate_cleaned.py --no-db                       # offline structural checks only
@@ -57,13 +60,41 @@ python3 scripts/analyze_offer_values.py                           # per-offer va
 python3 scripts/analyze_offer_values.py --only-offers 64-106      # Tier A only
 python3 scripts/analyze_desirability.py                           # item desirability from packing history
 python3 scripts/analyze_desirability.py --csv --no-plots          # export CSV, skip visuals
+python3 scripts/extract_features.py                               # extract box features for tuning (needs DB)
+python3 scripts/extract_features.py --only-offers 85-106          # post-85 only
+python3 scripts/extract_features.py --no-synthetics               # manual boxes only
+python3 scripts/tune_scoring.py                                   # parameter tuning (needs features JSON)
+python3 scripts/tune_scoring.py --trials 200 --folds 3            # quick run
+python3 scripts/tune_scoring.py --trials 3000 --repeats 25        # overnight stability run
+python3 scripts/tune_scoring.py --features path/to/features.json  # custom features file
+python3 scripts/generate_survey_scenarios.py                      # generate packer survey scenarios (needs DB)
+python3 scripts/generate_survey_scenarios.py --seed 42            # reproducible
+python3 scripts/process_survey_results.py responses.json          # analyze survey responses vs scoring function
 ```
 
 `compare.py` is the primary validation tool — it compares algorithm output against cleaned historical CSVs and prints per-box and aggregate metrics with a composite score. Default run uses Tier A offers only; use `--only-offers` for others.
 
+## Project Direction
+
+The committed allocation direction is **Optuna → ILP** (parameter tuning feeds a
+single ILP optimiser), with an EBM diagnostic planned. Modules, scripts, and docs
+carry one of three states:
+
+- **canonical** — the committed direction: `ilp-optimal`, shared scoring/infra, and
+  the tuning/diagnostic pipeline. Extend and maintain here.
+- **baseline** — runnable regression benchmarks the canonical model must beat
+  (`deal-topup`, `greedy-best-fit`, `round-robin`, `minmax-deficit`, `discard-worst`,
+  `local-search`). Not production-selectable, not to be extended. `local-search` is
+  also the ILP fallback (load-bearing).
+- **superseded** — replaced; retained as history only (e.g. `allocator/tui.py`).
+
+`ilp-optimal` is the default everywhere; production pickers (wizard, `run.py`) offer
+it alone. Baselines run only via `compare.py --all-strategies` or `--algorithm <name>`.
+Non-canonical modules carry a `# STATUS:` header; grep `STATUS:` to find them.
+
 ## Architecture
 
-Pluggable allocation framework with shared infrastructure and swappable strategies.
+Allocation framework: one canonical strategy (ilp-optimal) plus runnable baselines, over shared infrastructure. See § Project Direction.
 
 **Data flow:** XLSX overage + DB items/buyers → `AllocationResult` → strategy fills boxes → charity allocation → tab-delimited output
 
@@ -73,7 +104,7 @@ Pluggable allocation framework with shared infrastructure and swappable strategi
 allocate()
   ├── shared: build_items, build_boxes, create AllocationResult
   ├── optional: apply bootstrap_allocations (pre-fill boxes from prior run)
-  ├── STRATEGY(result)          ← pluggable (fills box.allocations in place)
+  ├── STRATEGY(result)          ← canonical strategy or a baseline (fills box.allocations in place)
   ├── shared: _allocate_charity()
   └── shared: remaining → stock
 ```
@@ -82,26 +113,27 @@ allocate()
 
 A strategy is a callable `(AllocationResult) -> None`. Strategies are registered in `allocator/strategies/__init__.py` and lazy-loaded to avoid circular imports.
 
-**`ilp-optimal`** — ILP-based multi-objective optimiser via PuLP/CBC. Minimises a composite penalty across value, diversity, dupes, and fairness. Falls back to deal-topup if PuLP is missing or solver fails.
+**`ilp-optimal`** (canonical, default) — ILP-based multi-objective optimiser via PuLP/HiGHS. Minimises a composite penalty (see `docs/SCORING.md`, gitignored). Falls back to local-search if PuLP is missing or solver fails.
 
 **`local-search`** — Bootstraps from discard-worst, then iteratively relocates and swaps items between boxes to minimise composite penalty.
 
 **`discard-worst`** — Subtractive. Seeds all boxes via greedy draft, then trims items whose removal most reduces penalty.
 
-**`deal-topup`** (default) — Additive. Deals items round-robin to all eligible boxes, then tops up under-target boxes.
+**`deal-topup`** (baseline) — Additive. Deals items round-robin to all eligible boxes, then tops up under-target boxes.
 
 **`greedy-best-fit`**, **`round-robin`**, **`minmax-deficit`** — Simpler additive strategies. See module docstrings.
 
 Charity allocation (remaining overage to charity toward computed target, then stock) is shared infrastructure, not part of any strategy.
 
-To add a new strategy: create `allocator/strategies/my_strat.py` with a `run(result)` function, then register it in `_REGISTRY` in `allocator/strategies/__init__.py`. Select it with `--algorithm my-strat`.
+To add a baseline benchmark: create `allocator/strategies/my_strat.py` with a `run(result)` function, then register it in `_REGISTRY` in `allocator/strategies/__init__.py`. Select it with `--algorithm my-strat`.
 
 ### Key modules (`allocator/`)
 
-- **`strategies/`** — pluggable allocation strategies. `__init__.py` has the registry; `deal_topup.py` is the default strategy. `_scoring.py` provides shared penalty functions used by strategies and compare.py. `_helpers.py` has shared constraint checks and diversity scoring.
+- **`strategies/`** — pluggable allocation strategies. `__init__.py` has the registry; `ilp_optimal.py` is the canonical strategy; `deal_topup.py` is a baseline. `_scoring.py` provides shared penalty functions used by strategies and compare.py. `_helpers.py` has shared constraint checks and diversity scoring.
+- **`tuning.py`** — pure re-scoring module for parameter tuning. Precomputed box features + params dict → composite score. No DB imports, no config imports, no side effects. Used by `scripts/tune_scoring.py`.
 - **`models.py`** — `Item`, `MysteryBox`, `CharityBox`, `AllocationResult`, `ExclusionRule`. All prices in cents.
-- **`config.py`** — tier definitions (from `.env`), identifier sets (from `identifiers.json`), scoring/classification config (from `scoring_config.json`). Key exports: `BOX_TIERS`, `FUNGIBLE_GROUPS`, `ITEM_CLASSIFICATIONS`, `DIVERSITY_WEIGHTS`, `GROUP_QTY_*` (group-qty penalty config), `DESIRABILITY_*` (desirability penalty config), composite scoring constants.
-- **`desirability.py`** — item desirability scores from historical packing. Loads `diagnostics/desirability_items.csv`, applies Bayesian shrinkage, normalises to [0,1]. Exports `get_item_desirability(name)`, `compute_box_desirability(allocations, items)`.
+- **`config.py`** — tier definitions (from `.env`), identifier sets (from `identifiers.json`), scoring/classification config (from `scoring_config.json`, gitignored). Exposes `BOX_TIERS`, `FUNGIBLE_GROUPS`, `ITEM_CLASSIFICATIONS`, and composite scoring constants (full model in `docs/SCORING.md`).
+- **`desirability.py`** — item desirability scores from historical packing (used by `scripts/analyze_desirability.py`, not a scoring dimension). Loads `diagnostics/desirability_items.csv`, applies Bayesian shrinkage, normalises to [0,1].
 - **`scorer.py`** — deal-topup specific scoring. `prioritize_items_for_deal()` sorts items for deal phase; `score_topup_candidate()` scores top-up additions with hard constraints and soft scoring.
 - **`db.py`** — SSH tunnel (via paramiko) to MySQL DB. Singleton `TunnelManager` with reference counting. Supports `DB_SOCKET` env var for Unix socket connections (overrides host/port). All query functions are `@functools.cache`-decorated for within-run deduplication. SQL loaded from `queries.json` (gitignored).
 - **`excel_io.py`** — reads `ID` + `Overage` columns from XLSX; writes tab-delimited output for import.
@@ -119,16 +151,29 @@ To add a new strategy: create `allocator/strategies/my_strat.py` with a `run(res
 - **`name_matcher.py`** — LLM-based item name → DB ID matching for Tier C offers (no ID column). Exact/prefix match first, then Claude CLI (Haiku) for fuzzy matching. Cached in `mappings/`.
 - **`claude_cli.py`** — subprocess wrapper for `claude -p` CLI calls.
 
+### Packer survey tool (cross-repo)
+
+Livewire v2 component in the Jointly.Shop codebase (`app/Http/Livewire/PackerSurvey.php`), admin-only. Scenarios generated here (`scripts/generate_survey_scenarios.py`), JSON manually copied to Jointly.Shop `storage/app/survey/`. Responses exported as JSON from the UI, processed here (`scripts/process_survey_results.py`). See `docs/OPTIMISATION_PLAN.md` Phase 3b.
+
+### Web app (`web/`)
+
+Flask app for side-by-side comparison of algorithm vs manual packing at the box level.
+
+- **`app.py`** — Flask app factory and routes. Landing page (offer/algorithm selector) and comparison view.
+- **`comparison.py`** — `build_comparison_data()` bridges `compare.py` functions to templates. `compute_item_diff()` and `build_box_pairs()` are pure functions for box matching and item-level diffs.
+- **`templates/`** — Jinja2: `base.html` (shell), `index.html` (selector), `compare.html` (side-by-side cards with colour-coded metrics and item diffs).
+- **`static/`** — `style.css` (grid layout, colour coding), `compare.js` (expand/collapse unchanged items, sort box cards).
+
 ### Tests (`tests/`)
 
-268 tests across 14 modules covering models, config, categorizer, scoring, desirability, strategies, allocator pipeline, box parser, excel I/O, wizard helpers, and historical service. Uses synthetic fixtures — no DB or network required.
+Tests across 16 modules covering models, config, categorizer, scoring, desirability, tuning, strategies, allocator pipeline, box parser, excel I/O, wizard helpers, historical service, and web comparison. Uses synthetic fixtures — no DB or network required.
 
 - **`conftest.py`** — test config bootstrap (sets env vars before allocator import), factory fixtures for Item/MysteryBox/CharityBox/AllocationResult.
 - **`tests/fixtures/`** — synthetic `identifiers.json` and `scoring_config.json` for CI portability.
 
 ### Utility scripts (`scripts/`)
 
-- **`score_offer.py`** — runs all strategies against a single offer, prints per-box metrics and a leaderboard.
+- **`score_offer.py`** — runs all strategies against a single offer, prints per-box metrics and a ranked benchmark.
 - **`diagnose_scoring.py`** — penalty breakdowns, pricing anomaly detection, and visualisations across all historical tiers.
 - **`validate_cleaned.py`** — structural integrity, DB consistency, and cross-file checks on cleaned CSVs. (underlying library for `HistoricalService` — validate_cleaned logic is now accessible via the TUI Historical Data screen via `python3 run.py` → Historical Data → Validate All. Keep as standalone tool for direct CLI use.)
 - **`validate_prices.py`** — SUMPRODUCT validation comparing XLSX prices against DB prices.
@@ -136,6 +181,10 @@ To add a new strategy: create `allocator/strategies/my_strat.py` with a `run(res
 - **`compare_llm_outputs.py`** — side-by-side comparison of LLM extraction methods with Jaccard similarity and optional Claude investigation. (dev tool — infrequent use, kept as standalone)
 - **`analyze_offer_values.py`** — per-offer, per-size-tier average box values. Writes `diagnostics/offer_value_targets.json` for training data.
 - **`analyze_desirability.py`** — per-item desirability analysis from historical packing decisions. OLS regression + distribution stats. Writes `diagnostics/desirability_items.csv`.
+- **`extract_features.py`** — extracts precomputed box features from historical CSVs + DB, generates synthetic bad boxes, writes `diagnostics/tuning_features.json`. Requires DB connection.
+- **`tune_scoring.py`** — parameter tuning over precomputed features JSON (no DB needed). Writes `diagnostics/tuning_results.json`.
+- **`generate_survey_scenarios.py`** — constructs packer survey scenarios from historical boxes + overage. Tier 1 (random calibration) + Tier 2 (dimension-targeted). Writes `diagnostics/survey_scenarios.json`. Requires DB.
+- **`process_survey_results.py`** — analyses survey responses against the scoring function. Writes `diagnostics/survey_analysis.json`.
 
 ## Database gotchas
 
@@ -147,24 +196,25 @@ To add a new strategy: create `allocator/strategies/my_strat.py` with a `run(res
 
 ## Conventions
 
-- Fungible groups limit accumulation of the same item type (e.g. apples) in one box. Each group has a tier-scaled allowance; excess above allowance is penalised with increasing severity. Hard ceiling prevents extreme concentration. The deal phase skips groups at allowance; top-up scorer hard-blocks above the ceiling.
+- **Scoring model — single source of truth: `docs/SCORING.md`** (gitignored; full model, formulas, and what was dropped). `docs/OPTIMISATION_PLAN.md` is the roadmap/history. Code is ground truth: `allocator/strategies/_scoring.py` + `compare.py`.
+- Concentration is penalised in two complementary layers (same-item and fungible-group), with a hard allocation ceiling enforced in `_helpers.py` (not a scoring cap). Full mechanism, allowances, and formulas: `docs/SCORING.md` (gitignored).
 - Merged boxes (emails) get added to the customer's existing order. Standalone boxes (`?Name` prefix in output) ship separately.
 - `BOX_TIERS` target values are `BOX_TARGET_PCT`% of price (configured in `.env`).
 - Category IDs are configured in `scoring_config.json`.
 
-## Strategy Leaderboard
+## Strategy Benchmark (canonical vs baselines)
 
-Composite scores across 42 Tier A offers (2026-03-11). Update when algorithms change by running `python3 compare.py --all-strategies`.
+Benchmark of the canonical strategy (`ilp-optimal`) against the baselines across 45 Tier A offers (2026-07-07). `ilp-optimal` leads and is the production choice; the rest are regression baselines. Refresh by running `python3 compare.py --all-strategies`.
 
-Rank order: ilp-optimal > local-search > round-robin > discard-worst > deal-topup > minmax-deficit > greedy-best-fit > manual.
+Rank order: ilp-optimal > local-search > round-robin > discard-worst > greedy-best-fit > manual > minmax-deficit > deal-topup.
 
-All automated strategies outperform manual packing. Score = 100 minus penalties across value accuracy, group-qty excess, diversity coverage, desirability, cross-box fairness, and preference compliance.
+Score = 100 minus composite penalties (full breakdown in `docs/SCORING.md`, gitignored).
 
 ## Historical data tiers
 
 | Tier | Offers | Count | Has IDs? | Source dir | Notes |
 |------|--------|-------|----------|------------|-------|
-| A | 64–106 | 42 | Yes | `historical/` | Full algorithm comparison |
+| A | 64–109 | 45 | Yes | `historical/` | Full algorithm comparison |
 | B | 55–63 | 9 | Yes | `historical/older/` | All standalone boxes |
 | C | 45–54 | 10 | No (names) | `historical/older/` | Programmatic extraction validated; name matching via cached LLM maps in `mappings/` |
 | D | 22–44 | 12 | — | `historical/older/` | Items soft-deleted but prices still valid; uses `include_deleted=True` for name matching |

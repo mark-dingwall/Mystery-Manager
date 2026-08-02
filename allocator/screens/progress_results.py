@@ -209,9 +209,7 @@ class ResultsScreen(HelpMixin, Screen):
 
         from allocator.strategies._scoring import value_penalty
         from allocator.config import (
-            DESIRABILITY_PENALTY_MULTIPLIER,
             DIVERSITY_PENALTY_MULTIPLIER,
-            GROUP_QTY_MULTIPLIER,
             PREF_VIOLATION_PENALTY,
         )
 
@@ -228,15 +226,19 @@ class ResultsScreen(HelpMixin, Screen):
             )
             if m:
                 val_pen = value_penalty(m["value_pct"])
-                gq_pen = m["group_qty_penalty"] * GROUP_QTY_MULTIPLIER
+                si_pen = m.get("same_item_penalty", 0.0)
+                gc_pen = m.get("group_concentration_penalty", 0.0)
                 div_pen = (1.0 - m["diversity_score"]) * DIVERSITY_PENALTY_MULTIPLIER
-                desir_pen = (1.0 - m.get("desirability_score", 0.5)) * DESIRABILITY_PENALTY_MULTIPLIER
+                mvs_pen = m.get("max_value_share_penalty", 0.0)
+                sf_pen = m.get("size_floor_penalty", 0.0)
                 pref_pen = m["pref_violations"] * PREF_VIOLATION_PENALTY
-                total_pen = val_pen + gq_pen + div_pen + desir_pen + pref_pen
+                total_pen = val_pen + si_pen + gc_pen + div_pen + mvs_pen + sf_pen + pref_pen
                 m["_val_pen"] = val_pen
-                m["_gq_pen"] = gq_pen
+                m["_si_pen"] = si_pen
+                m["_gc_pen"] = gc_pen
                 m["_div_pen"] = div_pen
-                m["_desir_pen"] = desir_pen
+                m["_mvs_pen"] = mvs_pen
+                m["_sf_pen"] = sf_pen
                 m["_total_pen"] = total_pen
                 m["_box_score"] = 100.0 - total_pen
                 metrics.append(m)
@@ -286,10 +288,11 @@ class ResultsScreen(HelpMixin, Screen):
         self.query_one("#aggregate-label", Label).update(
             f"Composite score: {score:.1f} / 100   "
             f"(value -{composite.get('value_pen', 0):.1f}  "
-            f"grp-qty -{composite.get('gq_pen', 0):.1f}  "
+            f"same-item -{composite.get('si_pen', 0):.1f}  "
+            f"grp-conc -{composite.get('gc_pen', 0):.1f}  "
             f"diversity -{composite.get('diversity_pen', 0):.1f}  "
-            f"fairness -{composite.get('fair_pen', 0):.1f}  "
-            f"desir -{composite.get('desir_pen', 0):.1f})"
+            f"mvs -{composite.get('mvs_pen', 0):.1f}  "
+            f"sz-floor -{composite.get('sf_pen', 0):.1f})"
         )
 
         table = self.query_one("#results-table", DataTable)

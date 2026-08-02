@@ -66,10 +66,8 @@ class TestWouldExceedCeiling:
 
 
 class TestHasHardFungibleConflict:
-    """Tests for allowance-based has_hard_fungible_conflict.
+    """Tests for per-item and per-group hard ceiling checks."""
 
-    Small tier: allowance = 2 * 1.0 = 2. Hard conflict = current + qty > 2 * allowance = 4.
-    """
     def test_no_fungible_group_under_limit(self, make_item, make_box, make_result):
         """Singleton item with qty=1 on empty box → no conflict."""
         item = make_item(id=1, fungible_group=None)
@@ -78,20 +76,20 @@ class TestHasHardFungibleConflict:
         assert not has_hard_fungible_conflict(item, box, result)
 
     def test_fungible_group_within_limit(self, make_item, make_box, make_result):
-        """Adding 1 banana when 1 already in box → total=2, 2x allowance=4 → ok."""
+        """Adding 1 banana when 1 already in box → within per-item limit."""
         existing = make_item(id=1, fungible_group="banana", fungible_degree=1.0)
         new_item = make_item(id=2, fungible_group="banana", fungible_degree=1.0)
         box = make_box(allocations={1: 1})
         result = make_result(items=[existing, new_item], boxes=[box])
         assert not has_hard_fungible_conflict(new_item, box, result)
 
-    def test_fungible_group_exceeds_limit(self, make_item, make_box, make_result):
-        """Adding 1 banana when 4 already in box → total=5 > 2*2=4 → conflict."""
-        existing = make_item(id=1, fungible_group="banana", fungible_degree=1.0)
-        new_item = make_item(id=2, fungible_group="banana", fungible_degree=1.0)
-        box = make_box(allocations={1: 4})
-        result = make_result(items=[existing, new_item], boxes=[box])
-        assert has_hard_fungible_conflict(new_item, box, result)
+    def test_per_item_exceeds_limit(self, make_item, make_box, make_result):
+        """Adding would exceed 2x per-item allowance → conflict."""
+        # snack_piece small = 2, so 2*2 = 4 is ceiling
+        item = make_item(id=1, fungible_group="apple", fungible_degree=0.7)
+        box = make_box(allocations={1: 4})  # already at ceiling
+        result = make_result(items=[item], boxes=[box])
+        assert has_hard_fungible_conflict(item, box, result)
 
     def test_different_groups_no_conflict(self, make_item, make_box, make_result):
         existing = make_item(id=1, fungible_group="apple", fungible_degree=0.7)
@@ -107,7 +105,8 @@ class TestHasHardFungibleConflict:
         assert not has_hard_fungible_conflict(item, box, result)
 
     def test_large_tier_higher_limit(self, make_item, make_box, make_result):
-        """Large tier: allowance=2*2.0=4, 2x=8. Adding when 7 in box → total=8, still ok."""
+        """Large tier has higher per-item allowance."""
+        # snack_piece large = 6, so 2*6 = 12 is ceiling
         existing = make_item(id=1, fungible_group="banana", fungible_degree=1.0)
         new_item = make_item(id=2, fungible_group="banana", fungible_degree=1.0)
         box = make_box(tier="large", allocations={1: 7})
@@ -167,13 +166,12 @@ class TestCanAssign:
         assert not can_assign(item, 1, box, result)
 
     def test_hard_fungible_conflict(self, make_item, make_box, make_result):
-        """Adding would exceed 2x allowance → can't assign."""
-        existing = make_item(id=1, fungible_group="banana", fungible_degree=1.0, overage=5)
-        new_item = make_item(id=2, fungible_group="banana", fungible_degree=1.0, overage=5)
-        # small: allowance=2, 2x=4. existing qty=4, adding 1 → 5 > 4
+        """Adding would exceed 2x per-item allowance → can't assign."""
+        # snack_piece small = 2, ceiling = 4
+        item = make_item(id=1, fungible_group="apple", fungible_degree=0.7, overage=10)
         box = make_box(allocations={1: 4})
-        result = make_result(items=[existing, new_item], boxes=[box])
-        assert not can_assign(new_item, 1, box, result)
+        result = make_result(items=[item], boxes=[box])
+        assert not can_assign(item, 1, box, result)
 
     def test_all_constraints_pass(self, make_item, make_box, make_result):
         item = make_item(id=1, price=100, overage=10, fungible_group=None)
@@ -276,6 +274,18 @@ class TestComputeAvailableTags:
         for dim_tags in tags.values():
             assert len(dim_tags) == 0
 
+    def test_preference_filters_items(self, make_item, make_result):
+        """fruit_only preference should exclude veg items from available tags."""
+        from allocator.config import CATEGORY_FRUIT, CATEGORY_VEGETABLES
+        items = [
+            make_item(id=1, category_id=CATEGORY_FRUIT, sub_category="tropical"),
+            make_item(id=2, category_id=CATEGORY_VEGETABLES, sub_category="root_veg"),
+        ]
+        result = make_result(items=items)
+        fruit_tags = compute_available_tags(result, preference="fruit_only")
+        assert "root_veg" not in fruit_tags["sub_category"]
+        assert "tropical" in fruit_tags["sub_category"]
+
 
 # ── compute_diversity_score ─────────────────────────────────────────────────
 
@@ -290,6 +300,7 @@ class TestComputeDiversityScore:
         assert score == 0.0
 
     def test_single_item_in_box(self, make_item, make_box, make_result):
+        from allocator.config import DIVERSITY_WEIGHTS
         item = make_item(id=1, sub_category="tropical", usage_type="snacking",
                          colour="yellow", shape="long")
         box = make_box(allocations={1: 1})
@@ -297,7 +308,8 @@ class TestComputeDiversityScore:
         tags = compute_available_tags(result)
         score = compute_diversity_score(box, result, tags)
         # With only 1 available tag per dimension, coverage is full
-        assert abs(score - 1.0) < 0.01
+        expected = sum(DIVERSITY_WEIGHTS.values())
+        assert abs(score - expected) < 0.01
 
     def test_diverse_box_higher_score(self, make_item, make_box, make_result):
         """More diverse allocations → higher score."""
@@ -319,16 +331,19 @@ class TestComputeDiversityScore:
 
     def test_no_available_tags_full_marks(self, make_item, make_box, make_result):
         """If no tags available in a dimension → full marks for that dimension."""
+        from allocator.config import DIVERSITY_WEIGHTS
         item = make_item(id=1, sub_category="", usage_type="", colour="", shape="")
         box = make_box(allocations={1: 1})
         result = make_result(items=[item], boxes=[box])
         tags = {"sub_category": set(), "usage": set(), "colour": set(), "shape": set()}
         score = compute_diversity_score(box, result, tags)
-        assert abs(score - 1.0) < 0.01
+        expected = sum(DIVERSITY_WEIGHTS.values())
+        assert abs(score - expected) < 0.01
 
-    def test_score_bounded_0_to_1(self, sample_items, make_box, make_result):
+    def test_score_bounded(self, sample_items, make_box, make_result):
+        from allocator.config import DIVERSITY_WEIGHTS
         box = make_box(allocations={i.id: 1 for i in sample_items})
         result = make_result(items=sample_items, boxes=[box])
         tags = compute_available_tags(result)
         score = compute_diversity_score(box, result, tags)
-        assert 0.0 <= score <= 1.0
+        assert 0.0 <= score <= sum(DIVERSITY_WEIGHTS.values()) + 0.01

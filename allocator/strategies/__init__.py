@@ -1,5 +1,11 @@
 """
-Pluggable allocation strategies.
+Allocation strategies: one canonical production strategy plus runnable baselines.
+
+`ilp-optimal` is the canonical production strategy (see CLAUDE.md § Project
+Direction). The remaining strategies are BASELINES — runnable regression
+benchmarks the canonical model must beat; they are not production-selectable
+and should not be extended. `local-search` is also the ILP fallback
+(load-bearing — do not remove).
 
 A strategy is a callable (AllocationResult) -> None that fills box.allocations
 in place. Everything before (data loading, box building) and after (charity
@@ -23,7 +29,21 @@ _REGISTRY: dict[str, tuple[str, str]] = {
     "discard-worst": ("allocator.strategies.discard_worst", "run"),
 }
 
-DEFAULT_STRATEGY = "deal-topup"
+# --- Canonical direction (see CLAUDE.md § Project Direction) ---
+CANONICAL_STRATEGY = "ilp-optimal"
+FALLBACK_STRATEGY = "local-search"  # used when ilp-optimal is unavailable
+BASELINE_STRATEGIES = frozenset(
+    {
+        "deal-topup",
+        "greedy-best-fit",
+        "round-robin",
+        "minmax-deficit",
+        "discard-worst",
+        "local-search",
+    }
+)
+
+DEFAULT_STRATEGY = CANONICAL_STRATEGY
 
 
 def get_strategy(name: str) -> Strategy:
@@ -37,5 +57,15 @@ def get_strategy(name: str) -> Strategy:
     return getattr(mod, func_name)
 
 
-def list_strategies() -> list[str]:
-    return list(_REGISTRY.keys())
+def list_strategies(include_baselines: bool = False) -> list[str]:
+    """List selectable strategies.
+
+    By default returns only canonical (production) strategies, so production
+    pickers surface `ilp-optimal` alone. Benchmark and diagnostic surfaces pass
+    include_baselines=True for the full set (canonical + baselines) used in
+    leaderboards/comparisons. Baseline strategies remain runnable via
+    get_strategy() regardless of this filter.
+    """
+    if include_baselines:
+        return list(_REGISTRY.keys())
+    return [name for name in _REGISTRY if name not in BASELINE_STRATEGIES]

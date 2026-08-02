@@ -1,3 +1,4 @@
+# STATUS: baseline — regression benchmark only; not the production direction (see CLAUDE.md § Project Direction). Do not extend.
 """
 Deal + Top-up allocation strategy.
 
@@ -11,8 +12,7 @@ import logging
 
 from allocator.config import (
     CHEAP_ITEM_THRESHOLD,
-    GROUP_QTY_ALLOWANCE_BASE,
-    GROUP_QTY_TIER_RATIO,
+    GROUP_ALLOWANCES,
     MAX_SLOT_QTY,
     SLOT_DEGREE_THRESHOLD,
     TOPUP_MAX_PASSES,
@@ -21,6 +21,7 @@ from allocator.config import (
 from allocator.models import AllocationResult, Item, MysteryBox
 from allocator.scorer import prioritize_items_for_deal, score_topup_candidate
 from allocator.strategies._helpers import (
+    _item_allowance,
     box_fungible_groups,
     would_exceed_ceiling,
 )
@@ -221,16 +222,22 @@ def _deal_card_deal(result: AllocationResult, num_boxes: int) -> None:
             if result.box_value(box) >= box.target_value:
                 continue
 
-            # For low-degree fungible items, skip if group qty >= allowance
+            # For low-degree fungible items, skip if per-item qty >= item allowance
+            # or group qty >= group allowance
             if item.fungible_group:
-                allowance = GROUP_QTY_ALLOWANCE_BASE * GROUP_QTY_TIER_RATIO.get(box.tier, 1.0)
-                current_group_qty = sum(
-                    aq for aid, aq in box.allocations.items()
-                    if aq > 0 and aid in result.items
-                    and result.items[aid].fungible_group == item.fungible_group
-                )
-                if current_group_qty >= allowance:
+                item_allow = _item_allowance(item, box.tier)
+                current_item_qty = box.allocations.get(item.id, 0)
+                if current_item_qty >= item_allow:
                     continue
+                if item.fungible_group in GROUP_ALLOWANCES:
+                    group_allow = GROUP_ALLOWANCES[item.fungible_group].get(box.tier, 1)
+                    current_group_qty = sum(
+                        aq for aid, aq in box.allocations.items()
+                        if aq > 0 and aid in result.items
+                        and result.items[aid].fungible_group == item.fungible_group
+                    )
+                    if current_group_qty >= group_allow:
+                        continue
 
             remaining = result.remaining_overage(item.id)
             if remaining <= 0:

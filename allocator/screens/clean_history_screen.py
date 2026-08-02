@@ -38,7 +38,7 @@ class CleanHistoryScreen(HelpMixin, Screen):
 
     BINDINGS = [
         Binding("escape", "cancel_or_back", "Back/Cancel"),
-        Binding("enter", "start_run", "Run", show=False),
+        Binding("enter", "start_run", "Run", show=True),
         Binding("question_mark", "help", "Help", key_display="?"),
     ]
 
@@ -233,6 +233,10 @@ class CleanHistoryScreen(HelpMixin, Screen):
     # -------------------------------------------------------------------
     # Run
     # -------------------------------------------------------------------
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "run-btn":
+            self.action_start_run()
 
     def action_start_run(self) -> None:
         if self._view_state != "configure":

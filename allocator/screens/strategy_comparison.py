@@ -5,10 +5,10 @@ drill-down.
 Four visual states managed via .hidden CSS class:
   1. confirm  -- pre-run confirmation with estimated time
   2. running  -- per-strategy progress counter with elapsed timer
-  3. leaderboard -- ranked table with winner recommendation + detail drill-down
+  3. leaderboard -- ranked table (canonical vs baselines) + detail drill-down
   4. error    -- shown on failure (hidden by default)
 
-Implements STRAT-01 (winner recommendation) and STRAT-02 (colour-coded scores).
+Implements STRAT-01 (highest-score highlight) and STRAT-02 (colour-coded scores).
 """
 from __future__ import annotations
 
@@ -19,7 +19,7 @@ from textual import work
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.screen import Screen
-from textual.widgets import DataTable, Footer, Header, Label
+from textual.widgets import Button, DataTable, Footer, Header, Label
 from textual.worker import Worker, WorkerState, get_current_worker
 
 from allocator.screens.help_overlay import HelpMixin
@@ -49,14 +49,14 @@ class StrategyComparisonScreen(HelpMixin, Screen):
 
     BINDINGS = [
         Binding("escape", "cancel_or_back", "Back/Cancel"),
-        Binding("enter", "start_run", "Start", show=False),
+        Binding("enter", "start_run", "Start", show=True),
         Binding("question_mark", "help", "Help", key_display="?"),
     ]
 
     HELP_TITLE = "Strategy Comparison"
     HELP_TEXT = (
-        "This screen runs all allocation strategies against ~60 historical offers "
-        "and ranks them by composite score.\n\n"
+        "This screen benchmarks the canonical strategy (ilp-optimal) against the "
+        "baselines across ~60 historical offers, ranked by composite score.\n\n"
         "Flow:\n"
         "  1. Confirmation -- shows estimated time. Press Enter to start.\n"
         "  2. Running -- progress counter shows which strategy is running and elapsed time.\n"
@@ -66,7 +66,8 @@ class StrategyComparisonScreen(HelpMixin, Screen):
         "  Green  = 90+   (excellent)\n"
         "  Yellow = 80-89  (good)\n"
         "  Red    = <80    (needs improvement)\n\n"
-        "The winner is highlighted with a recommendation above the table.\n\n"
+        "The highest-scoring strategy is highlighted above the table. ilp-optimal "
+        "is the canonical production strategy; the rest are baselines.\n\n"
         "Escape cancels during a run (partial results shown if any strategies "
         "completed) or returns to the main menu from the leaderboard."
     )
@@ -98,9 +99,10 @@ class StrategyComparisonScreen(HelpMixin, Screen):
             id="confirm-message",
         )
         yield Label(
-            "Press Enter to start, Escape to go back.",
+            "Run all strategies and compare results.",
             id="confirm-prompt",
         )
+        yield Button("Run", id="run-btn")
 
         # -- Progress state (hidden) --
         yield Label(
@@ -142,7 +144,7 @@ class StrategyComparisonScreen(HelpMixin, Screen):
         self._view_state = new_state
 
         # Confirm widgets
-        for wid in ("#confirm-message", "#confirm-prompt"):
+        for wid in ("#confirm-message", "#confirm-prompt", "#run-btn"):
             self.query_one(wid).set_class(new_state != "confirm", "hidden")
 
         # Progress widgets
@@ -160,6 +162,10 @@ class StrategyComparisonScreen(HelpMixin, Screen):
     # -----------------------------------------------------------------------
     # Confirmation -> Running
     # -----------------------------------------------------------------------
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "run-btn":
+            self.action_start_run()
 
     def action_start_run(self) -> None:
         """Start the comparison run (only active from confirmation state)."""
@@ -264,7 +270,7 @@ class StrategyComparisonScreen(HelpMixin, Screen):
             first_data = ranked[0][1]
             n_offers = len(first_data.get("per_offer", {}))
 
-        # Winner recommendation
+        # Highest-score highlight (canonical vs baselines)
         rec_label = self.query_one("#recommendation-label", Label)
         if ranked:
             winner_name = ranked[0][0]
@@ -276,8 +282,8 @@ class StrategyComparisonScreen(HelpMixin, Screen):
                 )
             else:
                 rec_label.update(
-                    f"Recommended: {winner_name} -- highest composite score "
-                    f"({winner_score:.1f}/100) across {n_offers} offers"
+                    f"Highest score: {winner_name} ({winner_score:.1f}/100) across "
+                    f"{n_offers} offers. Canonical production strategy: ilp-optimal."
                 )
         else:
             rec_label.update("No results available.")
@@ -294,9 +300,9 @@ class StrategyComparisonScreen(HelpMixin, Screen):
                 name,
                 f"[{colour}]{score:.1f}[/{colour}]",
                 f"-{comp.get('value_pen', 0.0):.1f}",
-                f"-{comp.get('gq_pen', 0.0):.1f}",
+                f"-{comp.get('si_pen', 0.0):.1f}",
+                f"-{comp.get('gc_pen', 0.0):.1f}",
                 f"-{comp.get('diversity_pen', 0.0):.1f}",
-                f"-{comp.get('fair_pen', 0.0):.1f}",
                 f"-{comp.get('pref_pen', 0.0):.1f}",
                 key=name,
             )
@@ -374,9 +380,9 @@ class StrategyComparisonScreen(HelpMixin, Screen):
                 tier,
                 f"[{score_colour}]{score:.1f}[/{score_colour}]",
                 f"[{val_colour}]{avg_value_pct:.1f}%[/{val_colour}]",
-                f"-{comp.get('gq_pen', 0.0):.1f}",
+                f"-{comp.get('si_pen', 0.0):.1f}",
+                f"-{comp.get('gc_pen', 0.0):.1f}",
                 f"-{comp.get('diversity_pen', 0.0):.1f}",
-                f"-{comp.get('fair_pen', 0.0):.1f}",
                 f"-{comp.get('pref_pen', 0.0):.1f}",
             )
 

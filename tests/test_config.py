@@ -72,14 +72,18 @@ class TestConfigLoading:
         assert isinstance(CATEGORY_FRUIT, int)
         assert isinstance(CATEGORY_VEGETABLES, int)
 
-    def test_diversity_weights_sum_to_one(self):
-        assert abs(sum(DIVERSITY_WEIGHTS.values()) - 1.0) < 1e-9
+    def test_diversity_weights_positive(self):
+        total = sum(DIVERSITY_WEIGHTS.values())
+        assert total > 0.0
+        for v in DIVERSITY_WEIGHTS.values():
+            assert v >= 0.0
 
     def test_fungible_groups_structure(self):
-        for group_name, (degree, prefixes) in FUNGIBLE_GROUPS.items():
+        for group_name, (degree, prefixes, qty_class) in FUNGIBLE_GROUPS.items():
             assert isinstance(degree, (int, float))
             assert isinstance(prefixes, (list, tuple))
             assert len(prefixes) > 0
+            assert isinstance(qty_class, str)
 
     def test_item_classifications_structure(self):
         for key, (prefixes, sub_cat, usage, colour, shape) in ITEM_CLASSIFICATIONS.items():

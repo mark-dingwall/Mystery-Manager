@@ -1,0 +1,223 @@
+{% extends "base.html" %}
+
+{% block title %}Offer {{ data.offer_id }} — {{ data.algorithm }} vs Manual{% endblock %}
+
+{% block content %}
+<div class="compare-page">
+    {# --- Summary bar --- #}
+    <div class="summary-bar">
+        <div class="summary-header">
+            <h1>Offer {{ data.offer_id }}</h1>
+            <span class="algorithm-badge">{{ data.algorithm }}</span>
+            <span class="elapsed">{{ data.elapsed }}s</span>
+        </div>
+
+        <div class="composite-scores">
+            <div class="composite-card">
+                <div class="composite-label">Manual</div>
+                <div class="composite-score {{ 'score-green' if data.manual_composite.score >= 90 else ('score-yellow' if data.manual_composite.score >= 80 else 'score-red') }}">
+                    {{ "%.1f"|format(data.manual_composite.score) }}
+                </div>
+            </div>
+            <div class="composite-card">
+                <div class="composite-label">{{ data.algorithm }}</div>
+                <div class="composite-score {{ 'score-green' if data.algo_composite.score >= 90 else ('score-yellow' if data.algo_composite.score >= 80 else 'score-red') }}">
+                    {{ "%.1f"|format(data.algo_composite.score) }}
+                </div>
+            </div>
+        </div>
+
+        <div class="penalty-breakdown">
+            <table class="penalty-table">
+                <thead>
+                    <tr>
+                        <th></th>
+                        <th>Value</th>
+                        <th>Same-item</th>
+                        <th>Group</th>
+                        <th>Diversity</th>
+                        <th>Max-val</th>
+                        <th>Size</th>
+                        <th>Pref</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td class="row-label">Manual</td>
+                        {% for key in ['value_pen', 'si_pen', 'gc_pen', 'diversity_pen', 'mvs_pen', 'sf_pen', 'pref_pen'] %}
+                        <td class="{{ 'pen-zero' if data.manual_composite[key] < 0.05 else ('pen-low' if data.manual_composite[key] < 2 else 'pen-high') }}">
+                            {{ "%.2f"|format(data.manual_composite[key]) }}
+                        </td>
+                        {% endfor %}
+                    </tr>
+                    <tr>
+                        <td class="row-label">{{ data.algorithm }}</td>
+                        {% for key in ['value_pen', 'si_pen', 'gc_pen', 'diversity_pen', 'mvs_pen', 'sf_pen', 'pref_pen'] %}
+                        <td class="{{ 'pen-zero' if data.algo_composite[key] < 0.05 else ('pen-low' if data.algo_composite[key] < 2 else 'pen-high') }}">
+                            {{ "%.2f"|format(data.algo_composite[key]) }}
+                        </td>
+                        {% endfor %}
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+    </div>
+
+    {# --- Sort controls --- #}
+    <div class="sort-controls">
+        <label>Sort boxes by:</label>
+        <button class="btn btn-sort active" data-sort="name">Name</button>
+        <button class="btn btn-sort" data-sort="delta">Score delta</button>
+        <button class="btn btn-sort" data-sort="manual-score">Manual score</button>
+        <button class="btn btn-sort" data-sort="algo-score">Algo score</button>
+    </div>
+
+    {# --- Box pair cards --- #}
+    <div class="box-pairs" id="box-pairs">
+        {% for pair in data.box_pairs %}
+        <div class="box-card"
+             data-name="{{ pair.box_name }}"
+             data-manual-score="{{ pair.manual.metrics.box_score if pair.manual.metrics else 0 }}"
+             data-algo-score="{{ pair.algo.metrics.box_score if pair.algo.metrics else 0 }}"
+             data-delta="{{ (pair.algo.metrics.box_score - pair.manual.metrics.box_score)|round(1) if pair.algo.metrics and pair.manual.metrics else 0 }}">
+
+            <div class="box-header">
+                <span class="box-name">{{ pair.box_name }}</span>
+                <span class="box-tier tier-{{ pair.tier }}">{{ pair.tier }}</span>
+            </div>
+
+            <div class="box-metrics">
+                {# --- Manual column --- #}
+                <div class="metrics-col">
+                    <div class="col-label">MANUAL</div>
+                    {% if pair.manual.metrics %}
+                    {% set m = pair.manual.metrics %}
+                    <div class="metric">
+                        <span class="metric-label">Value</span>
+                        <span class="metric-value">${{ "%.2f"|format(m.total_value / 100) }}
+                            <span class="{{ 'val-sweet' if m.value_pct >= 114 and m.value_pct <= 117 else ('val-near' if m.value_pct >= 109 and m.value_pct <= 122 else 'val-far') }}">
+                                ({{ "%.0f"|format(m.value_pct) }}%)
+                            </span>
+                        </span>
+                    </div>
+                    <div class="metric">
+                        <span class="metric-label">Score</span>
+                        <span class="metric-value {{ 'score-green' if m.box_score >= 90 else ('score-yellow' if m.box_score >= 80 else 'score-red') }}">
+                            {{ "%.1f"|format(m.box_score) }}
+                        </span>
+                    </div>
+                    <div class="metric">
+                        <span class="metric-label">Items</span>
+                        <span class="metric-value">{{ m.unique_items }}</span>
+                    </div>
+                    <div class="metric">
+                        <span class="metric-label">Diversity</span>
+                        <span class="metric-value">{{ "%.2f"|format(m.diversity_score) }}</span>
+                    </div>
+                    <div class="metric">
+                        <span class="metric-label">Same-item pen</span>
+                        <span class="metric-value {{ 'pen-zero' if m.same_item_penalty < 0.05 else 'pen-high' }}">{{ "%.1f"|format(m.same_item_penalty) }}</span>
+                    </div>
+                    <div class="metric">
+                        <span class="metric-label">Group pen</span>
+                        <span class="metric-value {{ 'pen-zero' if m.group_concentration_penalty < 0.05 else 'pen-high' }}">{{ "%.1f"|format(m.group_concentration_penalty) }}</span>
+                    </div>
+                    {% else %}
+                    <div class="no-data">No manual data</div>
+                    {% endif %}
+                </div>
+
+                {# --- Algo column --- #}
+                <div class="metrics-col">
+                    <div class="col-label">{{ data.algorithm|upper }}</div>
+                    {% if pair.algo.metrics %}
+                    {% set a = pair.algo.metrics %}
+                    <div class="metric">
+                        <span class="metric-label">Value</span>
+                        <span class="metric-value">${{ "%.2f"|format(a.total_value / 100) }}
+                            <span class="{{ 'val-sweet' if a.value_pct >= 114 and a.value_pct <= 117 else ('val-near' if a.value_pct >= 109 and a.value_pct <= 122 else 'val-far') }}">
+                                ({{ "%.0f"|format(a.value_pct) }}%)
+                            </span>
+                        </span>
+                    </div>
+                    <div class="metric">
+                        <span class="metric-label">Score</span>
+                        <span class="metric-value {{ 'score-green' if a.box_score >= 90 else ('score-yellow' if a.box_score >= 80 else 'score-red') }}">
+                            {{ "%.1f"|format(a.box_score) }}
+                        </span>
+                    </div>
+                    <div class="metric">
+                        <span class="metric-label">Items</span>
+                        <span class="metric-value">{{ a.unique_items }}</span>
+                    </div>
+                    <div class="metric">
+                        <span class="metric-label">Diversity</span>
+                        <span class="metric-value">{{ "%.2f"|format(a.diversity_score) }}</span>
+                    </div>
+                    <div class="metric">
+                        <span class="metric-label">Same-item pen</span>
+                        <span class="metric-value {{ 'pen-zero' if a.same_item_penalty < 0.05 else 'pen-high' }}">{{ "%.1f"|format(a.same_item_penalty) }}</span>
+                    </div>
+                    <div class="metric">
+                        <span class="metric-label">Group pen</span>
+                        <span class="metric-value {{ 'pen-zero' if a.group_concentration_penalty < 0.05 else 'pen-high' }}">{{ "%.1f"|format(a.group_concentration_penalty) }}</span>
+                    </div>
+                    {% else %}
+                    <div class="no-data">No algorithm data</div>
+                    {% endif %}
+                </div>
+            </div>
+
+            {# --- Item diff --- #}
+            <div class="item-diff">
+                <div class="diff-header">ITEMS</div>
+
+                {% for iid, qty in pair.diff.added.items() %}
+                <div class="diff-row diff-added">
+                    <span class="diff-icon">+</span>
+                    <span class="diff-name">{{ data.item_lookup[iid].name if iid in data.item_lookup else "Item #" ~ iid }}</span>
+                    <span class="diff-qty">&times;{{ qty|int }}</span>
+                </div>
+                {% endfor %}
+
+                {% for iid, qty in pair.diff.removed.items() %}
+                <div class="diff-row diff-removed">
+                    <span class="diff-icon">&minus;</span>
+                    <span class="diff-name">{{ data.item_lookup[iid].name if iid in data.item_lookup else "Item #" ~ iid }}</span>
+                    <span class="diff-qty">&times;{{ qty|int }}</span>
+                </div>
+                {% endfor %}
+
+                {% for iid, (mq, aq) in pair.diff.changed.items() %}
+                <div class="diff-row diff-changed">
+                    <span class="diff-icon">&bull;</span>
+                    <span class="diff-name">{{ data.item_lookup[iid].name if iid in data.item_lookup else "Item #" ~ iid }}</span>
+                    <span class="diff-qty">{{ mq|int }} &rarr; {{ aq|int }}</span>
+                </div>
+                {% endfor %}
+
+                {% if pair.diff.unchanged %}
+                <div class="unchanged-toggle" onclick="toggleUnchanged(this)">
+                    <span class="toggle-icon">&#9656;</span>
+                    {{ pair.diff.unchanged|length }} unchanged item{{ "s" if pair.diff.unchanged|length != 1 }}
+                </div>
+                <div class="unchanged-items" style="display: none;">
+                    {% for iid, qty in pair.diff.unchanged.items() %}
+                    <div class="diff-row diff-unchanged">
+                        <span class="diff-icon">=</span>
+                        <span class="diff-name">{{ data.item_lookup[iid].name if iid in data.item_lookup else "Item #" ~ iid }}</span>
+                        <span class="diff-qty">&times;{{ qty|int }}</span>
+                    </div>
+                    {% endfor %}
+                </div>
+                {% endif %}
+            </div>
+        </div>
+        {% endfor %}
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script src="{{ url_for('static', filename='compare.js') }}"></script>
+{% endblock %}

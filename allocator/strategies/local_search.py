@@ -1,10 +1,12 @@
+# STATUS: baseline — regression benchmark only; not the production direction (see CLAUDE.md § Project Direction). Do not extend.
+# load-bearing: also the ilp-optimal fallback — do not remove.
 """
 Local-search allocation strategy.
 
 Bootstrap from discard-worst (greedy draft + penalty-delta trim), then
 iteratively relocate/swap items between boxes to minimise the composite
-penalty matching compare.py's scoring (value sweet-spot, weighted dupes,
-4D diversity, fairness via stddev).
+penalty matching compare.py's scoring (value sweet-spot, same-item,
+group concentration, 4D diversity, max value share, size floor).
 
 Uses incremental objective evaluation: only the 2 affected boxes are
 recomputed per candidate move, not all boxes. When run via compare.py
@@ -13,22 +15,24 @@ to avoid redundant work.
 """
 
 import logging
-import math
 
 from allocator.config import (
     BOX_TIERS,
-    DESIRABILITY_PENALTY_MULTIPLIER,
     DIVERSITY_PENALTY_MULTIPLIER,
     DIVERSITY_WEIGHTS,
-    FAIRNESS_PENALTY_MULTIPLIER,
-    GROUP_QTY_ALLOWANCE_BASE,
+    GROUP_ALLOWANCES,
+    GROUP_CONCENTRATION_MULTIPLIER,
     GROUP_QTY_EXPONENT,
-    GROUP_QTY_MULTIPLIER,
-    GROUP_QTY_TIER_RATIO,
     LOCAL_SEARCH_MAX_ITERATIONS,
+    MAX_VALUE_SHARE_MULTIPLIER,
+    MAX_VALUE_SHARE_THRESHOLD,
+    SAME_ITEM_MULTIPLIER,
+    SIZE_FLOOR_MULTIPLIER,
+    SIZE_FLOOR_TARGETS,
 )
 from allocator.models import AllocationResult
 from allocator.strategies._helpers import (
+    _item_allowance,
     compute_available_tags,
     has_hard_fungible_conflict,
     would_exceed_ceiling,
@@ -43,13 +47,18 @@ MAX_ITERATIONS = LOCAL_SEARCH_MAX_ITERATIONS
 class _BoxState:
     """Cached per-box metrics for incremental objective computation."""
 
-    __slots__ = ("value_pct", "diversity_score", "group_qty_penalty", "desirability_score")
+    __slots__ = (
+        "value_pct", "diversity_score", "same_item_penalty",
+        "group_concentration_penalty", "max_value_share", "size_floor",
+    )
 
     def __init__(self):
         self.value_pct = 0.0
         self.diversity_score = 0.0
-        self.group_qty_penalty = 0.0
-        self.desirability_score = 0.5
+        self.same_item_penalty = 0.0
+        self.group_concentration_penalty = 0.0
+        self.max_value_share = 0.0
+        self.size_floor = 0.0
 
 
 class _ObjectiveCache:
@@ -117,49 +126,96 @@ class _ObjectiveCache:
                 score += weight
         state.diversity_score = score
 
-        # Group-qty penalty (total qty per group including singletons)
-        allowance = GROUP_QTY_ALLOWANCE_BASE * GROUP_QTY_TIER_RATIO.get(box.tier, 1.0)
-        groups: dict[str, tuple[int, float]] = {}
+        # Same-item penalty: per-item excess * price * multiplier
+        si_pen = 0.0
         for item_id, qty in box.allocations.items():
-            if qty > 0 and item_id in items:
-                item = items[item_id]
-                if item.fungible_group:
-                    key = item.fungible_group
-                    degree = item.fungible_degree
-                else:
-                    key = f"__item_{item_id}"
-                    degree = 1.0
-                if key in groups:
-                    prev_qty, prev_degree = groups[key]
-                    groups[key] = (prev_qty + qty, prev_degree)
-                else:
-                    groups[key] = (qty, degree)
-        state.group_qty_penalty = sum(
-            (max(0, total_qty - allowance) ** GROUP_QTY_EXPONENT) * degree
-            for total_qty, degree in groups.values()
-            if total_qty > allowance
-        )
+            if qty <= 0 or item_id not in items:
+                continue
+            item = items[item_id]
+            allow = _item_allowance(item, box.tier)
+            excess = max(0, qty - allow)
+            if excess > 0:
+                si_pen += excess * item.price * SAME_ITEM_MULTIPLIER / 100.0
+        state.same_item_penalty = si_pen
 
-        # Desirability score
-        from allocator.desirability import compute_box_desirability
-        state.desirability_score = compute_box_desirability(box.allocations, items)
+        # Group concentration penalty: min(qty, item_allowance) per group member
+        groups: dict[str, tuple[float, float]] = {}
+        for item_id, qty in box.allocations.items():
+            if qty <= 0 or item_id not in items:
+                continue
+            item = items[item_id]
+            if item.fungible_group:
+                key = item.fungible_group
+                degree = item.fungible_degree
+            else:
+                key = f"__item_{item_id}"
+                degree = 1.0
+            allow = _item_allowance(item, box.tier)
+            capped_qty = min(qty, allow)
+            if key in groups:
+                prev_load, prev_degree = groups[key]
+                groups[key] = (prev_load + capped_qty, prev_degree)
+            else:
+                groups[key] = (capped_qty, degree)
 
-    def save(self, *box_indices: int) -> list[tuple[float, float, float, float]]:
+        gc_pen = 0.0
+        for key, (group_load, degree) in groups.items():
+            if key in GROUP_ALLOWANCES:
+                ga = GROUP_ALLOWANCES[key].get(box.tier, group_load)
+            else:
+                continue
+            excess = max(0, group_load - ga)
+            if excess > 0:
+                gc_pen += (excess ** GROUP_QTY_EXPONENT) * degree * GROUP_CONCENTRATION_MULTIPLIER
+        state.group_concentration_penalty = gc_pen
+
+        # Max value share penalty
+        total_value = value
+        if total_value > 0:
+            max_share = 0.0
+            for item_id, qty in box.allocations.items():
+                if qty <= 0 or item_id not in items:
+                    continue
+                share = items[item_id].price * qty / total_value
+                if share > max_share:
+                    max_share = share
+            mvs_excess = max(0.0, max_share - MAX_VALUE_SHARE_THRESHOLD)
+            state.max_value_share = mvs_excess * MAX_VALUE_SHARE_MULTIPLIER
+        else:
+            state.max_value_share = 0.0
+
+        # Size floor penalty
+        sf_target = SIZE_FLOOR_TARGETS.get(box.tier, 0)
+        if sf_target > 0:
+            total_size = 0
+            for item_id, qty in box.allocations.items():
+                if qty <= 0 or item_id not in items:
+                    continue
+                total_size += items[item_id].size * qty
+            deficit = max(0, sf_target - total_size)
+            state.size_floor = deficit * SIZE_FLOOR_MULTIPLIER
+        else:
+            state.size_floor = 0.0
+
+    def save(self, *box_indices: int) -> list[tuple[float, ...]]:
         """Save state of specified boxes for cheap restore on revert."""
         return [
             (self.states[i].value_pct, self.states[i].diversity_score,
-             self.states[i].group_qty_penalty, self.states[i].desirability_score)
+             self.states[i].same_item_penalty, self.states[i].group_concentration_penalty,
+             self.states[i].max_value_share, self.states[i].size_floor)
             for i in box_indices
         ]
 
-    def restore(self, box_indices: tuple[int, ...], saved: list[tuple[float, float, float, float]]) -> None:
+    def restore(self, box_indices: tuple[int, ...], saved: list[tuple[float, ...]]) -> None:
         """Restore previously saved state (O(1) instead of recompute)."""
-        for idx, (vp, ds, gqp, desir) in zip(box_indices, saved):
+        for idx, (vp, ds, si, gc, mvs, sf) in zip(box_indices, saved):
             s = self.states[idx]
             s.value_pct = vp
             s.diversity_score = ds
-            s.group_qty_penalty = gqp
-            s.desirability_score = desir
+            s.same_item_penalty = si
+            s.group_concentration_penalty = gc
+            s.max_value_share = mvs
+            s.size_floor = sf
 
     def recompute(self, *box_indices: int) -> None:
         """Recompute only the specified boxes."""
@@ -171,7 +227,8 @@ class _ObjectiveCache:
         Compute composite objective from cached per-box state.
 
         Matches compare.py's composite scoring:
-        avg(value_penalty + dupe_penalty + diversity_penalty) + fairness_penalty
+        avg(value + same_item + group_concentration + diversity +
+            max_value_share + size_floor). No fairness term.
         """
         states = self.states
         n = len(states)
@@ -183,18 +240,14 @@ class _ObjectiveCache:
         for s in states:
             total_box_pen += (
                 value_penalty(s.value_pct)
-                + s.group_qty_penalty * GROUP_QTY_MULTIPLIER
+                + s.same_item_penalty
+                + s.group_concentration_penalty
                 + (1.0 - s.diversity_score) * DIVERSITY_PENALTY_MULTIPLIER
-                + (1.0 - s.desirability_score) * DESIRABILITY_PENALTY_MULTIPLIER
+                + s.max_value_share
+                + s.size_floor
             )
-        avg_box_pen = total_box_pen / n
 
-        # Fairness: stddev of value_pct
-        mean_vp = sum(s.value_pct for s in states) / n
-        variance = sum((s.value_pct - mean_vp) ** 2 for s in states) / n
-        fair_pen = math.sqrt(variance) * FAIRNESS_PENALTY_MULTIPLIER
-
-        return avg_box_pen + fair_pen
+        return total_box_pen / n
 
 
 def run(result: AllocationResult) -> None:

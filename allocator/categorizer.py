@@ -23,7 +23,7 @@ def assign_fungible_group(item_name: str) -> tuple[str | None, float]:
     Degree indicates how interchangeable items in the group are:
     1.0 = near-identical, 0.7 = same type, 0.5 = related, 0.3 = similar role.
     """
-    for group_name, (degree, prefixes) in FUNGIBLE_GROUPS.items():
+    for group_name, (degree, prefixes, *_rest) in FUNGIBLE_GROUPS.items():
         for prefix in prefixes:
             if item_name.startswith(prefix) or item_name.lower().startswith(prefix.lower()):
                 return group_name, degree

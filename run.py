@@ -53,11 +53,15 @@ def main():
         "--charity", action="append", default=None,
         help="Charity recipient name (can be repeated)",
     )
+    parser.add_argument(
+        "--charity-target", type=float, default=None, metavar="DOLLARS",
+        help="Override charity target in dollars (bypasses DB calculation)",
+    )
     parser.add_argument("--output", type=Path, help="Write output to file")
     parser.add_argument("--verbose", "-v", action="store_true", help="Verbose logging")
     parser.add_argument(
         "--algorithm", default=None,
-        help="Allocation algorithm (default: deal-topup)",
+        help="Allocation algorithm (default: ilp-optimal)",
     )
     args = parser.parse_args()
 
@@ -114,6 +118,8 @@ def main():
     kwargs = {}
     if args.algorithm:
         kwargs["strategy"] = args.algorithm
+    if args.charity_target is not None:
+        kwargs["charity_target_cents"] = int(args.charity_target * 100)
     result = allocate(
         offer_id=args.offer_id,
         xlsx_path=args.xlsx,
