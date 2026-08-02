@@ -204,9 +204,15 @@ Tests across 16 modules covering models, config, categorizer, scoring, desirabil
 
 ## Strategy Benchmark (canonical vs baselines)
 
-Benchmark of the canonical strategy (`ilp-optimal`) against the baselines across 45 Tier A offers (2026-07-07). `ilp-optimal` leads and is the production choice; the rest are regression baselines. Refresh by running `python3 compare.py --all-strategies`.
+Benchmark of the canonical strategy (`ilp-optimal`) against the baselines across 45 Tier A offers (2026-08-02). `ilp-optimal` leads and is the production choice; the rest are regression baselines. Refresh by running `python3 compare.py --all-strategies`.
 
-Rank order: ilp-optimal > local-search > round-robin > discard-worst > greedy-best-fit > manual > minmax-deficit > deal-topup.
+Rank order: ilp-optimal > local-search > discard-worst > round-robin > manual > greedy-best-fit > deal-topup > minmax-deficit.
+
+Baseline and `manual` rankings currently carry a value-dimension distortion: the
+value sweet-spot band was recentred but `BOX_TARGET_PCT` was not, so strategies
+that fill toward `BOX_TARGET_PCT` (and historical manual packing, done under the
+older target) absorb value penalties that reflect the config split rather than
+packing quality. Resolves when both are recentred and retuned together.
 
 Score = 100 minus composite penalties (full breakdown in `docs/SCORING.md`, gitignored).
 
