@@ -48,16 +48,27 @@ the penalty means, not just how it's computed.
 
 **Priority:** medium (fold into the next retune) · **Size:** small
 
-Six groups added 2026-08-02 (`watermelon`, `pumpkin`, `mushroom`, `kale`,
-`cabbage`, `capsicum`) carry hand-set `group_allowances` derived by analogy to
-comparable existing groups. Optuna has never seen them. Add them to the search
-space at the next retune.
+Ten groups added 2026-08-02 (`watermelon`, `pumpkin`, `mushroom`, `kale`,
+`cabbage`, `capsicum`, `cauliflower`, `celery`, `cooking_greens`, `mild_allium`)
+plus allowances backfilled for three previously inert ones (`lemon`, `lime`,
+`orange`) carry hand-set `group_allowances` derived by analogy to comparable
+existing groups — 39 numbers Optuna has never seen. Add them to the search space
+at the next retune.
 
-## Inert fungible groups
+## Periodic roster-vs-config audit
 
-**Priority:** low · **Size:** trivial
+**Priority:** medium · **Size:** small
 
-`lemon`, `lime`, and `orange` are defined in `fungible_groups` but have no
-`group_allowances` entry. `group_concentration_penalty_for_box()` skips any group
-without an allowance (`else: continue`), so these three never incur a group
-penalty. Either give them allowances or drop the groups.
+Item names drift in the DB while config prefixes don't follow. A fungible-group
+miss is **silent** — `assign_fungible_group()` returns `(None, 0.0)` with no
+warning, unlike `assign_classification()` which logs a fallback. The 2026-08-02
+audit found five items silently ungrouped this way (`Tomatoes - Cherry`,
+`Lettuce - Baby Cos`, `Orange - Navels`, `Strawberries 500g Punnet`, plus the
+Hawkes potato rename).
+
+Worth a small script that runs current `offer_parts` for the produce categories
+through `assign_fungible_group()` / `assign_classification()` and reports:
+items hitting the classification fallback; items sharing a group's vocabulary
+but not assigned to it; config prefixes matching nothing live; and ungrouped
+clusters sharing a leading token. Seasonal absences (stone fruit in winter)
+produce expected noise and need filtering, not fixing.
