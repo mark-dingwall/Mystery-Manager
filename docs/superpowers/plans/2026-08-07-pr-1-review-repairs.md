@@ -27,14 +27,19 @@
 
 **Files:**
 - Modify: `requirements-diagnostics.txt`
-- Modify: `tests/conftest.py:11-18,258-325`
-- Modify: `tests/test_box_features.py:28-172`
+- Modify: `tests/conftest.py` diagnostics dependency gating section
+- Modify: `tests/test_box_features.py` dependency-gating helpers and tests
+
+Tasks in this plan are strictly sequential. Symbol names, not inherited line
+numbers, identify edit locations after earlier tasks shift the files.
 
 **Interfaces:**
 - Consumes: `requirements-diagnostics.txt` lines in the exact form `distribution>=minimum`.
 - Produces:
   ```python
-  def _load_diagnostic_dependencies(path: Path) -> dict[str, tuple[str, str]]
+  def _load_diagnostic_dependencies(
+      path: Path, *, strict: bool = False,
+  ) -> dict[str, tuple[str, str]]
   def require_dep(name: str):
       """Import a module and enforce its manifest floor when declared."""
   ```
@@ -42,7 +47,9 @@
 
 - [ ] **Step 1: Add regression tests for manifest parsing and lazy version imports**
 
-Replace `test_declared_dependency_floors_and_distribution_names_are_exact` with behavior tests that use a temporary manifest:
+Replace `test_declared_dependency_floors_and_distribution_names_are_exact`
+with behavior tests that use a temporary manifest while retaining explicit
+bootstrap-presence coverage:
 
 ```python
 def test_dependency_floors_are_loaded_from_the_manifest(tmp_path):
@@ -61,19 +68,68 @@ def test_dependency_floors_are_loaded_from_the_manifest(tmp_path):
     }
 
 
-def test_unknown_dependency_does_not_import_packaging(monkeypatch):
-    from tests import conftest
+def test_manifest_parser_is_tolerant_for_plain_collection_but_strict_on_demand(
+    tmp_path,
+):
+    from tests.conftest import _load_diagnostic_dependencies
 
-    real_import = conftest.importlib.import_module
-    imported = []
+    manifest = tmp_path / "requirements-diagnostics.txt"
+    manifest.write_text(
+        "valid>=1.0\n"
+        "conditional>=2; python_version >= '3.10'\n"
+        "pinned==3\n"
+    )
 
-    def recording_import(name):
-        imported.append(name)
-        return real_import(name)
+    assert _load_diagnostic_dependencies(manifest) == {
+        "valid": ("valid", "1.0")
+    }
+    with pytest.raises(ValueError, match="expected distribution>=minimum"):
+        _load_diagnostic_dependencies(manifest, strict=True)
 
-    monkeypatch.setattr(conftest.importlib, "import_module", recording_import)
-    assert require_dep("json").loads("{}") == {}
-    assert "packaging.version" not in imported
+
+def test_bootstrap_dependency_must_be_present_in_manifest():
+    from tests.conftest import _validate_bootstrap_dependencies
+
+    with pytest.raises(pytest.UsageError, match="packaging.*manifest"):
+        _validate_bootstrap_dependencies({
+            "pytest": ("pytest", "9.0.0"),
+        })
+```
+
+Add a fresh-interpreter regression that imports pytest first, removes its
+already-loaded `packaging.version`, blocks any re-import, and executes the root
+conftest as a module. This fails if a top-level
+`from packaging.version import Version` returns:
+
+```python
+def test_conftest_does_not_import_packaging_version_at_module_scope():
+    code = r'''\
+import importlib.abc
+import runpy
+import sys
+import packaging
+import pytest
+
+sys.modules.pop("packaging.version", None)
+if hasattr(packaging, "version"):
+    delattr(packaging, "version")
+
+class BlockPackagingVersion(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path, target=None):
+        if fullname == "packaging.version":
+            raise ModuleNotFoundError(fullname)
+        return None
+
+sys.meta_path.insert(0, BlockPackagingVersion())
+runpy.run_path("tests/conftest.py", run_name="conftest_import_probe")
+'''
+    proc = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=_PROJECT_ROOT,
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
 ```
 
 Add `sitecustomize.py` support to `_collect_module_scope_dependency()` so subprocesses can override distribution metadata before pytest imports the project plugin:
@@ -81,7 +137,7 @@ Add `sitecustomize.py` support to `_collect_module_scope_dependency()` so subpro
 ```python
 def _collect_module_scope_dependency(
     tmp_path, *pytest_args, dependency="a_module_that_does_not_exist_xyz",
-    version_overrides=None, absent_distributions=(),
+    version_overrides=None, absent_distributions=(), running_pytest_version=None,
 ):
     sitecustomize = tmp_path / "sitecustomize.py"
     sitecustomize.write_text(
@@ -90,6 +146,10 @@ def _collect_module_scope_dependency(
         "_real_version = metadata.version\n"
         "_overrides = json.loads(os.environ.get('DIAGNOSTIC_VERSION_OVERRIDES', '{}'))\n"
         "_absent = set(json.loads(os.environ.get('DIAGNOSTIC_ABSENT_DISTRIBUTIONS', '[]')))\n"
+        "_running_pytest = os.environ.get('DIAGNOSTIC_RUNNING_PYTEST_VERSION')\n"
+        "if _running_pytest:\n"
+        "    import pytest\n"
+        "    pytest.__version__ = _running_pytest\n"
         "def _version(name):\n"
         "    if name in _absent:\n"
         "        raise metadata.PackageNotFoundError(name)\n"
@@ -104,13 +164,20 @@ def _collect_module_scope_dependency(
         f"require_dep({dependency!r})\n"
         "def test_reached(): pass\n"
     )
+    (tmp_path / "test_sentinel.py").write_text(
+        "import pytest\n"
+        "pytestmark = pytest.mark.diagnostics(reason='synthetic')\n"
+        "def test_pytest_completed_collection(): pass\n"
+    )
     env = os.environ.copy()
     env["PYTHONPATH"] = os.pathsep.join((str(tmp_path), str(_PROJECT_ROOT)))
     env["DIAGNOSTIC_VERSION_OVERRIDES"] = json.dumps(version_overrides or {})
     env["DIAGNOSTIC_ABSENT_DISTRIBUTIONS"] = json.dumps(absent_distributions)
+    if running_pytest_version is not None:
+        env["DIAGNOSTIC_RUNNING_PYTEST_VERSION"] = running_pytest_version
     return subprocess.run(
         [sys.executable, "-m", "pytest", "-c", str(_PROJECT_ROOT / "pyproject.toml"),
-         "-p", "tests.conftest", *pytest_args, str(test_module)],
+         "-p", "tests.conftest", *pytest_args, str(tmp_path)],
         cwd=tmp_path, env=env, capture_output=True, text=True,
     )
 ```
@@ -126,36 +193,66 @@ def test_plain_pytest_skips_when_packaging_distribution_is_absent(tmp_path):
     assert "1 skipped" in proc.stdout
 
 
-@pytest.mark.parametrize("distribution, found", [
-    ("packaging", "21.9"),
-    ("pytest", "8.4.2"),
-])
-def test_strict_mode_rejects_below_floor_bootstrap_dependencies(
-    tmp_path, distribution, found,
-):
+def test_strict_mode_rejects_absent_packaging_distribution(tmp_path):
     proc = _collect_module_scope_dependency(
         tmp_path,
         "-m", "diagnostics", "--strict-diagnostics-deps",
         dependency="json",
-        version_overrides={distribution: found},
+        absent_distributions=["packaging"],
     )
-    assert proc.returncode != 0
+    assert proc.returncode == pytest.ExitCode.USAGE_ERROR
+    assert "packaging" in proc.stdout + proc.stderr
+    assert "absent" in proc.stdout + proc.stderr
+
+
+def test_strict_mode_rejects_below_floor_packaging(tmp_path):
+    proc = _collect_module_scope_dependency(
+        tmp_path,
+        "-m", "diagnostics", "--strict-diagnostics-deps",
+        dependency="json",
+        version_overrides={"packaging": "21.9"},
+    )
+    assert proc.returncode == pytest.ExitCode.USAGE_ERROR
     output = proc.stdout + proc.stderr
-    assert f"{distribution}>=" in output
-    assert f"found {found}" in output
+    assert "packaging>=22" in output
+    assert "found 21.9" in output
+
+
+def test_strict_mode_checks_the_running_pytest_version(tmp_path):
+    proc = _collect_module_scope_dependency(
+        tmp_path,
+        "-m", "diagnostics", "--strict-diagnostics-deps",
+        dependency="json",
+        version_overrides={"pytest": "99.0.0"},
+        running_pytest_version="8.4.2",
+    )
+    assert proc.returncode == pytest.ExitCode.USAGE_ERROR
+    output = proc.stdout + proc.stderr
+    assert "pytest>=9.0.0" in output
+    assert "found 8.4.2" in output
 ```
 
-Before writing these tests, name their mutations: hardcoded floors should fail the temporary-manifest test; a top-level `Version` import should fail the import-recording test; removing strict bootstrap validation should make each strict subprocess unexpectedly exit zero.
+Preserving `test_sentinel.py` and targeting `str(tmp_path)` keeps the existing
+`test_marker_keyword_selection_does_not_arm_dependency_strictness` expectation
+of `1 passed, 1 skipped`. Before writing these tests, name their mutations:
+hardcoded floors fail the temporary-manifest test; a top-level `Version` import
+fails the fresh-interpreter blocker; deleting either bootstrap manifest line
+fails the presence test; using distribution metadata for pytest fails the
+running-version subprocess; removing strict bootstrap validation makes strict
+subprocesses unexpectedly exit zero.
 
 - [ ] **Step 2: Run the dependency tests and verify RED**
 
 Run:
 
 ```bash
-python3 -m pytest tests/test_box_features.py -v -k "dependency or packaging or bootstrap"
+python3 -m pytest tests/test_box_features.py -v -k "require_dep or dependency or packaging or bootstrap or conftest or marker_keyword"
 ```
 
-Expected failures: `_load_diagnostic_dependencies` is absent; the current hardcoded dictionary ignores the temporary manifest; strict startup does not validate bootstrap floors.
+Expected failures: `_load_diagnostic_dependencies` and
+`_validate_bootstrap_dependencies` are absent; the current hardcoded dictionary
+ignores the temporary manifest; strict startup does not validate bootstrap
+floors.
 
 - [ ] **Step 3: Make the manifest authoritative and add lazy bootstrap validation**
 
@@ -170,6 +267,8 @@ _BOOTSTRAP_DEPENDENCIES = ("packaging", "pytest")
 
 def _load_diagnostic_dependencies(
     path: Path = _PROJECT_ROOT / "requirements-diagnostics.txt",
+    *,
+    strict: bool = False,
 ) -> dict[str, tuple[str, str]]:
     dependencies = {}
     for line_number, raw_line in enumerate(path.read_text().splitlines(), 1):
@@ -178,10 +277,17 @@ def _load_diagnostic_dependencies(
             continue
         distribution, separator, minimum = line.partition(">=")
         distribution, minimum = distribution.strip(), minimum.strip()
-        if not separator or not distribution or not minimum:
-            raise ValueError(
-                f"{path}:{line_number}: expected distribution>=minimum"
-            )
+        valid = (
+            bool(separator and distribution and minimum)
+            and ";" not in minimum
+            and not any(token in distribution for token in "<>=!~[]")
+        )
+        if not valid:
+            if strict:
+                raise ValueError(
+                    f"{path}:{line_number}: expected distribution>=minimum"
+                )
+            continue
         module = _MODULE_NAME_OVERRIDES.get(
             distribution, distribution.replace("-", "_")
         )
@@ -201,40 +307,103 @@ def _unavailable(message: str, cause: BaseException | None = None):
     pytest.skip(message, allow_module_level=True)
 
 
-def _require_version(distribution: str, minimum: str) -> None:
+def _require_version(
+    distribution: str,
+    minimum: str,
+    *,
+    installed: str | None = None,
+) -> None:
+    if installed is None:
+        try:
+            installed = importlib_metadata.version(distribution)
+        except importlib_metadata.PackageNotFoundError as exc:
+            _unavailable(
+                f"required diagnostic distribution {distribution!r} is absent", exc
+            )
     try:
-        installed = importlib_metadata.version(distribution)
-    except importlib_metadata.PackageNotFoundError as exc:
-        _unavailable(f"required diagnostic distribution {distribution!r} is absent", exc)
-    try:
-        version_module = importlib.import_module("packaging.version")
+        from packaging.version import Version
     except ImportError as exc:
         _unavailable("required diagnostic dependency 'packaging' is not importable", exc)
-    if version_module.Version(installed) < version_module.Version(minimum):
+    if Version(installed) < Version(minimum):
         _unavailable(
             f"required diagnostic dependency {distribution}>={minimum}; found {installed}"
         )
 ```
 
-Update `require_dep()` to return immediately for unknown names and otherwise call `_require_version(distribution, minimum)`. In `pytest_configure()` set `_STRICT` first, then validate bootstrap modules only in strict mode:
+Update `require_dep()` with the complete flow below. It returns immediately for
+unknown names and passes `module.__version__` only when `name == "pytest"`; all
+other modules use distribution metadata:
 
 ```python
+def require_dep(name: str):
+    """Import `name` and enforce its manifest floor when one is declared."""
+    try:
+        module = importlib.import_module(name)
+    except ImportError as exc:
+        _unavailable(
+            f"required diagnostic dependency {name!r} is not importable", exc
+        )
+
+    requirement = _DIAGNOSTIC_DEPENDENCIES.get(name)
+    if requirement is None:
+        return module
+    distribution, minimum = requirement
+    installed = module.__version__ if name == "pytest" else None
+    _require_version(distribution, minimum, installed=installed)
+    return module
+```
+
+The lazy `Version` import uses an import statement, not
+`conftest.importlib.import_module`, preserving the three existing tests that
+monkeypatch that function wholesale.
+
+Add strict bootstrap validation that accepts an explicit dependency mapping for
+direct testing and converts startup failures into concise pytest usage errors:
+
+```python
+def _validate_bootstrap_dependencies(
+    dependencies: dict[str, tuple[str, str]],
+) -> None:
+    for name in _BOOTSTRAP_DEPENDENCIES:
+        requirement = dependencies.get(name)
+        if requirement is None:
+            raise pytest.UsageError(
+                f"bootstrap dependency {name!r} is missing from requirements-diagnostics.txt"
+            )
+        try:
+            module = importlib.import_module(name)
+            distribution, minimum = requirement
+            installed = module.__version__ if name == "pytest" else None
+            _require_version(distribution, minimum, installed=installed)
+        except ImportError as exc:
+            raise pytest.UsageError(str(exc)) from exc
+
+
 def pytest_configure(config):
     global _STRICT
     _STRICT = config.getoption("--strict-diagnostics-deps")
     if _STRICT:
-        for name in _BOOTSTRAP_DEPENDENCIES:
-            require_dep(name)
+        try:
+            dependencies = _load_diagnostic_dependencies(
+                _PROJECT_ROOT / "requirements-diagnostics.txt", strict=True
+            )
+        except ValueError as exc:
+            raise pytest.UsageError(str(exc)) from exc
+        _validate_bootstrap_dependencies(dependencies)
 ```
 
-Validation order is `packaging`, then `pytest`: an absent packaging distribution is reported without trying to compare pytest first, while an installed below-floor packaging can still supply `Version` to compare its own version.
+Validation order is `packaging`, then `pytest`: an absent packaging distribution
+is reported without trying to compare pytest first, while an installed
+below-floor packaging can still supply `Version` to compare its own version.
+Strict parsing turns unsupported requirement syntax into a clean usage error;
+ordinary collection ignores such lines instead of losing the entire suite.
 
 - [ ] **Step 4: Run dependency tests and verify GREEN**
 
 Run:
 
 ```bash
-python3 -m pytest tests/test_box_features.py -v -k "dependency or packaging or bootstrap"
+python3 -m pytest tests/test_box_features.py -v -k "require_dep or dependency or packaging or bootstrap or conftest or marker_keyword"
 ```
 
 Expected: all selected tests pass, with subprocess outputs containing the declared floors from the manifest.
@@ -251,8 +420,8 @@ git commit -m "fix: derive diagnostic floors from manifest"
 ### Task 2: Effective Configuration Identity
 
 **Files:**
-- Modify: `allocator/box_features.py:12-29,302-358`
-- Modify: `tests/test_box_features.py:184-253,706-875`
+- Modify: `allocator/box_features.py` imports, extraction helper call, and identity contracts
+- Modify: `tests/test_box_features.py` synthetic-config fixture and identity tests
 
 **Interfaces:**
 - Consumes: frozen local bindings in `allocator.box_features`; allowance bindings in `allocator.strategies._scoring`.
@@ -317,9 +486,68 @@ def test_quantity_class_owner_changes_allowance_hash_and_snapshot(monkeypatch):
     assert record["item_quantities"][0][2] == classes["snack_piece"]["small"]
     assert box_features.config_hash() != before_hash
     assert box_features.config_snapshot() != before_snapshot
+
+
+def test_fungible_group_owner_changes_allowance_hash_and_snapshot(monkeypatch):
+    import allocator.box_features as box_features
+    import allocator.strategies._scoring as scoring
+
+    before_hash = box_features.config_hash()
+    before_snapshot = box_features.config_snapshot()
+    groups = dict(scoring.FUNGIBLE_GROUPS)
+    degree, prefixes, _quantity_class = groups["apple"]
+    groups["apple"] = (degree, prefixes, "cooking_piece")
+    monkeypatch.setattr(scoring, "FUNGIBLE_GROUPS", groups)
+
+    record = box_features.extract_box_features(
+        "x", {1: 1}, _item_lookup(), "small", _available_tags(), 1
+    )
+    assert record["item_quantities"][0][2] == scoring.QUANTITY_CLASSES[
+        "cooking_piece"
+    ]["small"]
+    assert box_features.config_hash() != before_hash
+    assert box_features.config_snapshot() != before_snapshot
+
+
+def test_price_threshold_owner_changes_allowance_hash_and_snapshot(monkeypatch):
+    import allocator.box_features as box_features
+    import allocator.strategies._scoring as scoring
+
+    lookup = _item_lookup()
+    original_threshold = scoring.QTY_CLASS_PRICE_THRESHOLDS["snacking_max"]
+    lookup[4] = {
+        **lookup[1],
+        "price": original_threshold - 1,
+        "fungible_group": None,
+        "fungible_degree": 0.0,
+    }
+    before_hash = box_features.config_hash()
+    before_snapshot = box_features.config_snapshot()
+    before_record = box_features.extract_box_features(
+        "x", {4: 1}, lookup, "small", _available_tags(), 1
+    )
+
+    thresholds = dict(scoring.QTY_CLASS_PRICE_THRESHOLDS)
+    thresholds["snacking_max"] -= 1
+    monkeypatch.setattr(scoring, "QTY_CLASS_PRICE_THRESHOLDS", thresholds)
+    after_record = box_features.extract_box_features(
+        "x", {4: 1}, lookup, "small", _available_tags(), 1
+    )
+
+    assert before_record["item_quantities"][0][2] == scoring.QUANTITY_CLASSES[
+        "snack_piece"
+    ]["small"]
+    assert after_record["item_quantities"][0][2] == scoring.QUANTITY_CLASSES[
+        "cooking_piece"
+    ]["small"]
+    assert box_features.config_hash() != before_hash
+    assert box_features.config_snapshot() != before_snapshot
 ```
 
-Use the existing apple fixture to change `FUNGIBLE_GROUPS["apple"]` to a different quantity class. Use an ungrouped snacking fixture priced at the boundary to change `QTY_CLASS_PRICE_THRESHOLDS["snacking_max"]`. Do not assert only on guard text: each mutation must change `item_quantities` as well.
+The price-threshold test explicitly creates item 4 as an ungrouped snacking
+fixture one cent below the original boundary, then lowers the boundary by one so
+the comparison changes from `snack_piece` to `cooking_piece`. Do not assert only
+on guard text: each mutation changes `item_quantities` as well.
 
 Before writing, name the mutations: reading `_cfg.CATEGORY_FRUIT` should fail the category-owner test; reading live `_cfg`/`_categorizer` should fail the frozen-owner test; hashing config copies instead of `_scoring` values should fail the paired allowance tests.
 
@@ -375,6 +603,11 @@ def _hash_inputs() -> dict:
 
 
 def config_hash() -> str:
+    """Stamp over thirteen effective schema/scoring inputs.
+
+    BOX_TARGET_PCT is represented by BOX_TIERS' derived target_value entries;
+    config_snapshot() carries the frozen percentage directly.
+    """
     return _digest(_hash_inputs())
 ```
 
@@ -404,6 +637,11 @@ return {
 
 Read `FUNGIBLE_GROUPS`, `QUANTITY_CLASSES`, and `QTY_CLASS_PRICE_THRESHOLDS` only through `_scoring`; do not add direct imports for them.
 
+Adding the two category IDs intentionally changes the hash value. No migration
+is required: repository search confirms nothing outside
+`allocator.box_features` and its tests reads `config_hash()` yet, and no stored
+feature file currently carries that stamp.
+
 - [ ] **Step 4: Run identity tests and verify GREEN**
 
 Run:
@@ -426,17 +664,30 @@ git commit -m "fix: hash effective box feature configuration"
 ### Task 3: Per-Record Unsupported-Category Skipping
 
 **Files:**
-- Modify: `allocator/box_features.py:32-44,176-188`
-- Modify: `scripts/extract_features.py:28-51,54-164,246-252`
-- Modify: `tests/test_box_features.py:535-566` and add batch-boundary tests
+- Modify: `allocator/box_features.py` exception type and category guard
+- Modify: `scripts/extract_features.py` imports, extraction wrapper, and all batch call sites
+- Modify: `tests/test_box_features.py` unsupported-category and batch-boundary tests
 
 **Interfaces:**
 - Produces:
   ```python
   class UnsupportedCategoryError(ValueError): ...
-  def _extract_or_skip(*args, **kwargs) -> dict | None
+  def _extract_or_skip(
+      box_name: str,
+      allocations: dict[int, int],
+      item_lookup: dict[int, dict],
+      tier: str,
+      available_tags: dict[str, set[str]],
+      offer_id: int,
+      source: str = "manual",
+      preference: str | None = None,
+  ) -> dict | None
   ```
-- `_extract_or_skip` prints `  [SKIP] {error}` only for `UnsupportedCategoryError`; it returns `None` for that record.
+- `_extract_or_skip` prints `  [SKIP] {error}` only for
+  `UnsupportedCategoryError`. It also preserves the extractor's existing `None`
+  for an empty/unresolved box. Both outcomes are intentionally absent from the
+  emitted feature list, so `n_manual` continues to count emitted manual records,
+  not attempted boxes.
 
 - [ ] **Step 1: Write failing exception and batch-continuation tests**
 
@@ -540,15 +791,37 @@ In `scripts/extract_features.py`, import both symbols and add:
 from allocator.box_features import UnsupportedCategoryError, extract_box_features
 
 
-def _extract_or_skip(*args, **kwargs) -> dict | None:
+def _extract_or_skip(
+    box_name: str,
+    allocations: dict[int, int],
+    item_lookup: dict[int, dict],
+    tier: str,
+    available_tags: dict[str, set[str]],
+    offer_id: int,
+    source: str = "manual",
+    preference: str | None = None,
+) -> dict | None:
     try:
-        return extract_box_features(*args, **kwargs)
+        return extract_box_features(
+            box_name,
+            allocations,
+            item_lookup,
+            tier,
+            available_tags,
+            offer_id,
+            source=source,
+            preference=preference,
+        )
     except UnsupportedCategoryError as exc:
         print(f"  [SKIP] {exc}")
         return None
 ```
 
-Replace all five synthetic calls and the manual call with `_extract_or_skip`. Remove unused `CATEGORY_FRUIT`, `CATEGORY_VEGETABLES`, and `GROUP_ALLOWANCES` imports. Keep `BOX_TIERS`, `FUNGIBLE_GROUPS`, and `QUANTITY_CLASSES`, which synthetic generation uses.
+Replace all five synthetic calls and the manual call with `_extract_or_skip`.
+Keep only `BOX_TIERS`, `DONATION_IDENTIFIERS`, `SKIP_COLUMN_IDENTIFIERS`, and
+`STAFF_IDENTIFIERS` in the config import block. Remove the five import-only
+names `CATEGORY_FRUIT`, `CATEGORY_VEGETABLES`, `FUNGIBLE_GROUPS`,
+`GROUP_ALLOWANCES`, and `QUANTITY_CLASSES`.
 
 - [ ] **Step 4: Run category-boundary tests and verify GREEN**
 
@@ -598,7 +871,21 @@ In `CLAUDE.md`, keep the install command but remove the nonexistent script invoc
 pip install --target .venv-diagnostics/lib -r requirements-diagnostics.txt
 ```
 
-Keep the strict diagnostic pytest command unchanged. Change the key-module description from “exact 12-key `config_snapshot()`” to “exact 14-key `config_snapshot()`”.
+Keep the strict diagnostic pytest command unchanged. Replace the single pytest
+floor paragraph with:
+
+```markdown
+`pytest>=9.0.0` and `packaging>=22` are bootstrap dependencies for diagnostic
+tests, not production runtime dependencies. Under
+`--strict-diagnostics-deps`, pytest validates `packaging` and the running
+pytest's `__version__` against those floors before collection. Other diagnostic
+libraries remain demand-checked by `require_dep()` when their test modules load.
+```
+
+Update the plain-versus-strict explanation to state that malformed bootstrap
+requirements or missing/below-floor bootstrap dependencies fail startup with a
+concise pytest usage error. Change the key-module description from “exact
+12-key `config_snapshot()`” to “exact 14-key `config_snapshot()`”.
 
 - [ ] **Step 2: Synchronize the parent diagnostics design in the planning workspace**
 
@@ -609,6 +896,10 @@ packaging>=22
 ```
 
 immediately after `pytest>=9.0.0`, and document both as bootstrap dependencies validated at strict pytest startup.
+State that pytest's floor is checked against the running module's
+`pytest.__version__`, not distribution metadata, and that missing/below-floor or
+strictly malformed bootstrap requirements raise `pytest.UsageError` before
+collection.
 
 In the schema-guard section, add `CATEGORY_FRUIT` and `CATEGORY_VEGETABLES` to the enumerated hash inputs and change every “eleven named inputs”/“11-input” statement to 13.
 
@@ -624,6 +915,9 @@ after `box_target_pct`, and change every exact twelve-key statement to fourteen 
 - [ ] **Step 3: Synchronize the foundation plan in the planning workspace**
 
 Apply the same manifest, hash-input, snapshot-key, code-example, test-expectation, and prose-count changes throughout `2026-08-04-diagnostics-foundation.md`. Its Task 1 dependency file example must list `packaging>=22`; its Task 5 interfaces must say 13 inputs and 14 keys; its `_HASH_INPUTS` and snapshot examples must include both category IDs and effective-owner semantics.
+Its dependency-gating example must preserve the sentinel collection test, use
+the running pytest version, lazily import `Version`, enforce bootstrap manifest
+membership, and specify `pytest.UsageError` for strict startup failures.
 
 - [ ] **Step 4: Verify documentation consistency**
 
@@ -683,7 +977,11 @@ git diff main...HEAD --check
 git status --short
 ```
 
-Expected: compilation and DB-free import exit zero; diff check emits nothing; status contains only the separately managed planning-document edits outside this worktree, not uncommitted PR files.
+Expected: compilation and DB-free import exit zero; diff check emits nothing;
+PR-worktree status is empty. The separately managed planning documents are
+gitignored files in another checkout and therefore cannot appear in this status;
+their contents are verified by Task 4's explicit `rg` command and reported by
+absolute path in the final handoff.
 
 - [ ] **Step 4: Audit each review item against the resulting diff**
 
@@ -695,7 +993,8 @@ Confirm all seven outcomes explicitly:
 4. guards read the same frozen owners as feature production;
 5. unsupported categories skip one record while unrelated errors propagate;
 6. dependency floors occur only in the manifest, with code deriving them;
-7. the three unused script imports are removed.
+7. all five import-only config names are removed from the script, including the
+   three named by the original review.
 
 - [ ] **Step 5: Request code review before integration**
 
