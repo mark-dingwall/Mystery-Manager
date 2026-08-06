@@ -1,11 +1,65 @@
 """Tests for allocator.box_features and the diagnostics test-marker infrastructure."""
 
 import json
+import os
 from pathlib import Path
+import shutil
+import subprocess
+import sys
 
 import pytest
 
 from tests.conftest import require_dep
+
+
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+_SCORING_FIXTURE_PATH = _PROJECT_ROOT / "tests" / "fixtures" / "scoring_config.json"
+_SCORING_FIXTURE = json.loads(_SCORING_FIXTURE_PATH.read_text())
+_TEST_ONLY_CONFIG = _SCORING_FIXTURE["test_only"]
+_TEST_BOX_TIERS = {
+    tier: {
+        "price": price,
+        "target_value": round(price * _TEST_ONLY_CONFIG["box_target_pct"] / 100),
+    }
+    for tier, price in _TEST_ONLY_CONFIG["box_prices"].items()
+}
+
+
+def _collect_module_scope_dependency(tmp_path, *pytest_args):
+    test_module = tmp_path / "test_diagnostic_dependency.py"
+    test_module.write_text(
+        "import pytest\n"
+        "from tests.conftest import require_dep\n"
+        "pytestmark = pytest.mark.diagnostics(reason='synthetic')\n"
+        "require_dep('a_module_that_does_not_exist_xyz')\n"
+        "def test_unreachable():\n"
+        "    raise AssertionError('missing dependency did not stop collection')\n"
+    )
+    (tmp_path / "test_sentinel.py").write_text(
+        "import pytest\n"
+        "pytestmark = pytest.mark.diagnostics(reason='synthetic')\n"
+        "def test_pytest_completed_collection():\n"
+        "    pass\n"
+    )
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(_PROJECT_ROOT)
+    return subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "-c",
+            str(_PROJECT_ROOT / "pyproject.toml"),
+            "-p",
+            "tests.conftest",
+            *pytest_args,
+            str(tmp_path),
+        ],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
 
 
 def test_require_dep_returns_module_when_present():
@@ -16,13 +70,45 @@ def test_require_dep_returns_module_when_present():
 
 
 def test_require_dep_skips_when_absent_and_not_strict():
-    # Outside `-m diagnostics`, a missing dependency must skip, not error.
+    # Outside explicit strict mode, a missing dependency must skip, not error.
     from tests import conftest
 
     assert conftest._STRICT is False
     with pytest.raises(BaseException) as exc:
         require_dep("a_module_that_does_not_exist_xyz")
     assert exc.typename == "Skipped"
+
+
+def test_module_scope_require_dep_skips_in_plain_pytest(tmp_path):
+    proc = _collect_module_scope_dependency(tmp_path)
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "1 skipped" in proc.stdout
+
+
+def test_module_scope_require_dep_fails_in_explicit_strict_mode(tmp_path):
+    proc = _collect_module_scope_dependency(
+        tmp_path,
+        "-m",
+        "diagnostics",
+        "--strict-diagnostics-deps",
+    )
+
+    assert proc.returncode == pytest.ExitCode.INTERRUPTED
+    output = proc.stdout + proc.stderr
+    assert "ImportError: required diagnostic dependency" in output
+    assert "a_module_that_does_not_exist_xyz" in output
+
+
+def test_marker_keyword_selection_does_not_arm_dependency_strictness(tmp_path):
+    proc = _collect_module_scope_dependency(
+        tmp_path,
+        "-m",
+        "diagnostics(reason='synthetic')",
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "1 passed, 1 skipped" in proc.stdout
 
 
 def test_declared_dependency_floors_and_distribution_names_are_exact():
@@ -86,37 +172,13 @@ def test_require_dep_raises_when_absent_and_strict(monkeypatch):
         require_dep("statsmodels")
 
 
-@pytest.mark.parametrize("expr,expected", [
-    ("", False),
-    ("diagnostics", True),
-    ("diagnostics and not slow", True),
-    ("diagnostics and slow", True),       # satisfiable when slow is true
-    ("diagnostics or slow", True),
-    ("not diagnostics", False),          # exclusion must NOT arm strict mode
-    ("not (diagnostics or slow)", False),
-    ("not diagnostics or slow", False),  # diagnostics has only negative influence
-    ("slow and not diagnostics", False),
-    ("diagnostics and not diagnostics", False),
-    ("diagnostics and slow and not slow", False),
-    ("diagnostics or not diagnostics", False),
-    ("not slow", False),                 # never named diagnostics: opt-in only
-])
-def test_strict_mode_follows_positive_selection_not_substring(expr, expected):
-    """`-m "not diagnostics"` excludes these tests, but require_dep() runs at
-    import time — during collection, before deselection. A substring check would
-    hard-fail that command on the dependencies it is excluding."""
-    from tests.conftest import _selects_diagnostics
-
-    assert _selects_diagnostics(expr) is expected
-
-
 # ---------------------------------------------------------------------------
 # Shared fixture data for the box-feature tests
 # ---------------------------------------------------------------------------
 #
 # Values come from tests/fixtures/scoring_config.json (synthetic): fungible
-# groups apple/banana/tomato, quantity classes snack_piece (small=2) and
-# cooking_piece (small=1), and a test-pinned small-box price of 2000.
+# groups apple/banana/tomato, quantity classes snack_piece and cooking_piece,
+# and deliberately non-production test-only box/value scalars.
 
 
 @pytest.fixture(autouse=True)
@@ -126,18 +188,17 @@ def _use_synthetic_scoring_config(monkeypatch):
     import allocator.config as allocator_config
     import allocator.strategies._scoring as scoring
 
-    config = json.loads(
-        (Path(__file__).resolve().parent / "fixtures" / "scoring_config.json").read_text()
-    )
+    config = _SCORING_FIXTURE
+    value_band = _TEST_ONLY_CONFIG["value_band"]
     monkeypatch.setattr(box_features, "CATEGORY_FRUIT", config["category_fruit"])
     monkeypatch.setattr(box_features, "CATEGORY_VEGETABLES", config["category_vegetables"])
-    monkeypatch.setattr(box_features, "BOX_TIERS", {"small": {"price": 2000}})
-    monkeypatch.setattr(allocator_config, "BOX_TARGET_PCT", 115)
-    monkeypatch.setattr(allocator_config, "BOX_TIERS", {
-        "small": {"price": 2000, "target_value": 2300},
-        "medium": {"price": 3500, "target_value": 4025},
-        "large": {"price": 5000, "target_value": 5750},
-    })
+    monkeypatch.setattr(box_features, "BOX_TIERS", _TEST_BOX_TIERS)
+    monkeypatch.setattr(
+        allocator_config,
+        "BOX_TARGET_PCT",
+        _TEST_ONLY_CONFIG["box_target_pct"],
+    )
+    monkeypatch.setattr(allocator_config, "BOX_TIERS", _TEST_BOX_TIERS)
     monkeypatch.setattr(box_features, "GROUP_ALLOWANCES", config["group_allowances"])
     monkeypatch.setattr(allocator_config, "GROUP_ALLOWANCES", config["group_allowances"])
     classifications = {
@@ -168,18 +229,33 @@ def _use_synthetic_scoring_config(monkeypatch):
         "QTY_CLASS_PRICE_THRESHOLDS",
         config["qty_class_price_thresholds"],
     )
-    monkeypatch.setattr(allocator_config, "VALUE_SWEET_FROM", 114)
-    monkeypatch.setattr(allocator_config, "VALUE_SWEET_TO", 117)
-    monkeypatch.setattr(allocator_config, "VALUE_PENALTY_EXPONENT", 1.25)
+    monkeypatch.setattr(
+        allocator_config,
+        "VALUE_SWEET_FROM",
+        value_band["sweet_from"],
+    )
+    monkeypatch.setattr(
+        allocator_config,
+        "VALUE_SWEET_TO",
+        value_band["sweet_to"],
+    )
+    monkeypatch.setattr(
+        allocator_config,
+        "VALUE_PENALTY_EXPONENT",
+        value_band["penalty_exponent"],
+    )
     monkeypatch.setattr(scoring, "FUNGIBLE_GROUPS", config["fungible_groups"])
     monkeypatch.setattr(scoring, "QUANTITY_CLASSES", config["quantity_classes"])
+    monkeypatch.setattr(
+        scoring,
+        "QTY_CLASS_PRICE_THRESHOLDS",
+        config["qty_class_price_thresholds"],
+    )
 
 
 def _item_lookup():
     """Three items spanning both categories, all three fungible groups."""
-    config = json.loads(
-        (Path(__file__).resolve().parent / "fixtures" / "scoring_config.json").read_text()
-    )
+    config = _SCORING_FIXTURE
     category_fruit = config["category_fruit"]
     category_vegetables = config["category_vegetables"]
 
@@ -213,7 +289,7 @@ def _record():
 
     allocations {1: 3, 2: 1, 3: 2} on a small box. Hand-computed expectations:
       total_value  = 100*3 + 150*1 + 200*2 = 850
-      value_pct    = 850 / 2000 * 100 = 42.5
+      value_pct    = total_value / synthetic small-box price * 100
       allowances   = apple/banana -> snack_piece small = 2; tomato -> cooking_piece small = 1
     """
     from allocator.box_features import extract_box_features
@@ -229,25 +305,53 @@ def _record():
     )
 
 
-def test_box_features_module_imports_without_queries_json(monkeypatch):
+def test_box_features_module_imports_from_isolated_root_without_db(tmp_path):
     """The module must not reach allocator.db, directly or transitively."""
-    import subprocess
-    import sys
+    isolated_root = tmp_path / "isolated-project"
+    shutil.copytree(
+        _PROJECT_ROOT / "allocator",
+        isolated_root / "allocator",
+        ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+    )
+    shutil.copy2(_SCORING_FIXTURE_PATH, isolated_root / "scoring_config.json")
+    shutil.copy2(
+        _PROJECT_ROOT / "tests" / "fixtures" / "identifiers.json",
+        isolated_root / "identifiers.json",
+    )
+
+    env = os.environ.copy()
+    for tier, price in _TEST_ONLY_CONFIG["box_prices"].items():
+        env[f"BOX_PRICE_{tier.upper()}"] = str(price)
+    env["BOX_TARGET_PCT"] = str(_TEST_ONLY_CONFIG["box_target_pct"])
+    value_band = _TEST_ONLY_CONFIG["value_band"]
+    env["VALUE_SWEET_FROM"] = str(value_band["sweet_from"])
+    env["VALUE_SWEET_TO"] = str(value_band["sweet_to"])
+    env["VALUE_PENALTY_EXPONENT"] = str(value_band["penalty_exponent"])
+    env["PYTHONPATH"] = str(isolated_root)
 
     # A subprocess with an import hook that hard-fails on allocator.db proves the
     # absence of the transitive path, which a plain import in this process cannot
     # (conftest may already have imported db via another test module).
     code = (
         "import sys\n"
+        "from pathlib import Path\n"
         "class Blocker:\n"
         "    def find_module(self, name, path=None):\n"
         "        if name in ('allocator.db', 'compare', 'scripts.extract_features'):\n"
         "            raise AssertionError('box_features imported ' + name)\n"
         "sys.meta_path.insert(0, Blocker())\n"
-        "import allocator.box_features\n"
+        "import allocator.box_features as box_features\n"
+        "assert Path(box_features.__file__).resolve().is_relative_to("
+        "Path(sys.argv[1]).resolve())\n"
         "print('ok')\n"
     )
-    proc = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+    proc = subprocess.run(
+        [sys.executable, "-c", code, str(isolated_root)],
+        cwd=isolated_root,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
     assert proc.returncode == 0, proc.stderr
     assert "ok" in proc.stdout
 
@@ -258,7 +362,11 @@ def test_extract_box_features_scalar_fields():
     assert rec["box_name"] == "test@example.com"
     assert rec["tier"] == "small"
     assert rec["source"] == "manual"
-    assert rec["value_pct"] == 42.5
+    expected_value_pct = round(
+        850 / _TEST_BOX_TIERS["small"]["price"] * 100,
+        4,
+    )
+    assert rec["value_pct"] == expected_value_pct
     assert rec["total_size_points"] == 7          # 1*3 + 2*1 + 1*2
     assert rec["max_value_share"] == 0.470588     # 400/850
     assert rec["pref_violations"] == 0
@@ -271,6 +379,34 @@ def test_extract_box_features_scored_lists_unchanged():
     assert rec["item_quantities"] == [[3, 100, 2], [1, 150, 2], [2, 200, 1]]
     # [capped_load, degree, group_allowance] per group, insertion-ordered
     assert rec["group_totals"] == [[2, 0.7, 2], [1, 1.0, 2], [1, 1.0, 1]]
+
+
+def test_extract_box_features_uses_synthetic_price_threshold_for_allowance():
+    from allocator.box_features import extract_box_features
+
+    config = _SCORING_FIXTURE
+    price = config["qty_class_price_thresholds"]["snacking_max"]
+    lookup = _item_lookup()
+    lookup[4] = {
+        **lookup[1],
+        "name": "Unclassified Snack",
+        "price": price,
+        "fungible_group": None,
+        "fungible_degree": 0.0,
+    }
+
+    rec = extract_box_features(
+        box_name="x",
+        allocations={4: 2},
+        item_lookup=lookup,
+        tier="small",
+        available_tags=_available_tags(),
+        offer_id=1,
+    )
+
+    assert rec["item_quantities"] == [
+        [2, price, config["quantity_classes"]["cooking_piece"]["small"]]
+    ]
 
 
 def test_extract_box_features_dim_ratios():
@@ -477,7 +613,7 @@ def test_tag_vocabulary_size_matches_config():
         for dimension, tag in zip(dims, fallback):
             expected[dimension].add(tag)
 
-    assert len(tag_vocabulary()) == sum(len(tags) for tags in expected.values())
+    assert len(tag_vocabulary()) == sum(len(tags) for tags in expected.values()) == 15
 
 
 def test_flatten_column_count_derived_from_config():
@@ -486,7 +622,7 @@ def test_flatten_column_count_derived_from_config():
 
     cols = flatten(_record())
     expected = 3 + 8 + 3 + 5 + 1 + 2 * len(GROUP_ALLOWANCES) + len(tag_vocabulary())
-    assert len(cols) == expected
+    assert len(cols) == expected == 41
 
 
 def test_flatten_is_globally_name_sorted():
@@ -638,7 +774,8 @@ def test_config_snapshot_has_exactly_the_pinned_keys():
         "box_tiers", "box_target_pct", "value_sweet_from", "value_sweet_to",
         "value_penalty_exponent", "group_allowances", "quantity_classes",
         "qty_class_price_thresholds", "item_classifications_hash",
-        "fungible_groups_hash",
+        "fungible_groups_hash", "classification_fallback_hash",
+        "default_classification_hash",
     }
 
 
@@ -658,9 +795,51 @@ def test_config_snapshot_classification_structures_are_digests():
     from allocator.box_features import config_snapshot
 
     snap = config_snapshot()
-    for key in ("item_classifications_hash", "fungible_groups_hash"):
+    for key in (
+        "item_classifications_hash",
+        "fungible_groups_hash",
+        "classification_fallback_hash",
+        "default_classification_hash",
+    ):
         assert isinstance(snap[key], str)
         assert len(snap[key]) == 16
+
+
+def test_config_snapshot_changes_with_classification_fallback(monkeypatch):
+    import allocator.config as cfg
+    from allocator.box_features import config_snapshot
+
+    before = config_snapshot()
+    fallback = dict(cfg.CLASSIFICATION_FALLBACK)
+    category_id = next(iter(fallback))
+    fallback[category_id] = ("reserved_fallback", *fallback[category_id][1:])
+    monkeypatch.setattr(cfg, "CLASSIFICATION_FALLBACK", fallback)
+
+    after = config_snapshot()
+    assert after != before
+    assert (
+        after["classification_fallback_hash"]
+        != before["classification_fallback_hash"]
+    )
+
+
+def test_config_snapshot_changes_with_default_classification(monkeypatch):
+    import allocator.categorizer as categorizer
+    from allocator.box_features import config_snapshot
+
+    before = config_snapshot()
+    monkeypatch.setattr(
+        categorizer,
+        "DEFAULT_CLASSIFICATION",
+        ("reserved_default", *categorizer.DEFAULT_CLASSIFICATION[1:]),
+    )
+
+    after = config_snapshot()
+    assert after != before
+    assert (
+        after["default_classification_hash"]
+        != before["default_classification_hash"]
+    )
 
 
 def test_config_snapshot_is_json_serialisable_and_round_trips():

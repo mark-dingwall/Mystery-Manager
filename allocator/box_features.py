@@ -334,7 +334,7 @@ def config_hash() -> str:
 def config_snapshot() -> dict:
     """Stamp for scenario files, compared for equality by the ordinal analyser.
 
-    Enumerated rather than derived. The two large classification structures
+    Enumerated rather than derived. The classification and fungible structures
     enter as digests to keep the written file readable.
     """
     return {
@@ -351,4 +351,8 @@ def config_snapshot() -> dict:
         "qty_class_price_thresholds": _cfg.QTY_CLASS_PRICE_THRESHOLDS,
         "item_classifications_hash": _digest(_cfg.ITEM_CLASSIFICATIONS),
         "fungible_groups_hash": _digest(_cfg.FUNGIBLE_GROUPS),
+        "classification_fallback_hash": _digest(_cfg.CLASSIFICATION_FALLBACK),
+        "default_classification_hash": _digest(
+            _categorizer.DEFAULT_CLASSIFICATION
+        ),
     }
