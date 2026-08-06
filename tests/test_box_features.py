@@ -130,6 +130,7 @@ def _use_synthetic_scoring_config(monkeypatch):
     )
     monkeypatch.setattr(box_features, "CATEGORY_FRUIT", config["category_fruit"])
     monkeypatch.setattr(box_features, "CATEGORY_VEGETABLES", config["category_vegetables"])
+    monkeypatch.setattr(box_features, "BOX_TIERS", {"small": {"price": 2000}})
     monkeypatch.setattr(box_features, "GROUP_ALLOWANCES", config["group_allowances"])
     monkeypatch.setattr(scoring, "FUNGIBLE_GROUPS", config["fungible_groups"])
     monkeypatch.setattr(scoring, "QUANTITY_CLASSES", config["quantity_classes"])
@@ -137,19 +138,23 @@ def _use_synthetic_scoring_config(monkeypatch):
 
 def _item_lookup():
     """Three items spanning both categories, all three fungible groups."""
-    from allocator.config import CATEGORY_FRUIT, CATEGORY_VEGETABLES
+    config = json.loads(
+        (Path(__file__).resolve().parent / "fixtures" / "scoring_config.json").read_text()
+    )
+    category_fruit = config["category_fruit"]
+    category_vegetables = config["category_vegetables"]
 
     return {
         1: {"name": "Apples - Fuji", "price": 100, "size": 1,
-            "category_id": CATEGORY_FRUIT, "fungible_group": "apple",
+            "category_id": category_fruit, "fungible_group": "apple",
             "fungible_degree": 0.7, "sub_category": "pome_fruit",
             "usage": "snacking", "colour": "red", "shape": "round"},
         2: {"name": "Bananas - Cavendish", "price": 150, "size": 2,
-            "category_id": CATEGORY_FRUIT, "fungible_group": "banana",
+            "category_id": category_fruit, "fungible_group": "banana",
             "fungible_degree": 1.0, "sub_category": "tropical",
             "usage": "snacking", "colour": "yellow", "shape": "long"},
         3: {"name": "Tomatoes - Roma", "price": 200, "size": 1,
-            "category_id": CATEGORY_VEGETABLES, "fungible_group": "tomato",
+            "category_id": category_vegetables, "fungible_group": "tomato",
             "fungible_degree": 1.0, "sub_category": "fruiting_veg",
             "usage": "cooking", "colour": "red", "shape": "round"},
     }
@@ -169,7 +174,7 @@ def _record():
 
     allocations {1: 3, 2: 1, 3: 2} on a small box. Hand-computed expectations:
       total_value  = 100*3 + 150*1 + 200*2 = 850
-      value_pct    = 850 / BOX_TIERS["small"]["price"] * 100
+      value_pct    = 850 / 2000 * 100 = 42.5
       allowances   = apple/banana -> snack_piece small = 2; tomato -> cooking_piece small = 1
     """
     from allocator.box_features import extract_box_features
@@ -209,14 +214,12 @@ def test_box_features_module_imports_without_queries_json(monkeypatch):
 
 
 def test_extract_box_features_scalar_fields():
-    from allocator.config import BOX_TIERS
-
     rec = _record()
     assert rec["offer_id"] == 999
     assert rec["box_name"] == "test@example.com"
     assert rec["tier"] == "small"
     assert rec["source"] == "manual"
-    assert rec["value_pct"] == round(850 / BOX_TIERS["small"]["price"] * 100, 4)
+    assert rec["value_pct"] == 42.5
     assert rec["total_size_points"] == 7          # 1*3 + 2*1 + 1*2
     assert rec["max_value_share"] == 0.470588     # 400/850
     assert rec["pref_violations"] == 0
