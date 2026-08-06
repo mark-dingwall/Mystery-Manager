@@ -1202,14 +1202,17 @@ Expected: zero failures and zero collection errors.
 
 ```bash
 python3 -m py_compile allocator/box_features.py scripts/extract_features.py tests/conftest.py tests/test_box_features.py
-python3 -c "import allocator.box_features; print('DB-free import passed')"
-python3 -c "import sys, scripts.extract_features; assert 'compare' not in sys.modules and 'allocator.db' not in sys.modules; print('batch-helper import passed')"
+BOX_PRICE_SMALL=2000 BOX_PRICE_MEDIUM=3500 BOX_PRICE_LARGE=5000 python3 -c "import allocator.box_features; print('DB-free import passed')"
+BOX_PRICE_SMALL=2000 BOX_PRICE_MEDIUM=3500 BOX_PRICE_LARGE=5000 python3 -c "import sys, scripts.extract_features; assert 'compare' not in sys.modules and 'allocator.db' not in sys.modules; print('batch-helper import passed')"
 git diff main...HEAD --check
 git status --short
 ```
 
-Expected: compilation and both DB-free imports exit zero; diff check emits nothing;
-PR-worktree status is empty. The separately managed planning documents are
+Expected: the two imports use the test suite's synthetic box-price preconditions
+(`BOX_PRICE_SMALL=2000`, `BOX_PRICE_MEDIUM=3500`, and
+`BOX_PRICE_LARGE=5000`) and both pass without loading `compare` or
+`allocator.db`; compilation exits zero; diff check emits nothing; PR-worktree
+status is empty. The separately managed planning documents are
 gitignored files in another checkout and therefore cannot appear in this status;
 their contents are verified by Task 5's explicit `rg` command and reported by
 absolute path in the final handoff.
