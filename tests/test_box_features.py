@@ -373,6 +373,11 @@ def _use_synthetic_scoring_config(monkeypatch):
     monkeypatch.setattr(box_features, "CATEGORY_VEGETABLES", config["category_vegetables"])
     monkeypatch.setattr(box_features, "BOX_TIERS", _TEST_BOX_TIERS)
     monkeypatch.setattr(
+        box_features,
+        "BOX_TARGET_PCT",
+        _TEST_ONLY_CONFIG["box_target_pct"],
+    )
+    monkeypatch.setattr(
         allocator_config,
         "BOX_TARGET_PCT",
         _TEST_ONLY_CONFIG["box_target_pct"],
@@ -420,6 +425,21 @@ def _use_synthetic_scoring_config(monkeypatch):
     )
     monkeypatch.setattr(
         allocator_config,
+        "VALUE_PENALTY_EXPONENT",
+        value_band["penalty_exponent"],
+    )
+    monkeypatch.setattr(
+        box_features,
+        "VALUE_SWEET_FROM",
+        value_band["sweet_from"],
+    )
+    monkeypatch.setattr(
+        box_features,
+        "VALUE_SWEET_TO",
+        value_band["sweet_to"],
+    )
+    monkeypatch.setattr(
+        box_features,
         "VALUE_PENALTY_EXPONENT",
         value_band["penalty_exponent"],
     )
@@ -892,57 +912,55 @@ def test_config_hash_is_sixteen_hex_chars_and_stable():
 
 
 @pytest.mark.parametrize("name", [
-    "BOX_TIERS", "GROUP_ALLOWANCES", "ITEM_CLASSIFICATIONS", "FUNGIBLE_GROUPS",
-    "CLASSIFICATION_FALLBACK", "QUANTITY_CLASSES", "QTY_CLASS_PRICE_THRESHOLDS",
-    "VALUE_SWEET_FROM", "VALUE_SWEET_TO", "VALUE_PENALTY_EXPONENT",
+    "BOX_TIERS",
+    "GROUP_ALLOWANCES",
+    "ITEM_CLASSIFICATIONS",
+    "CLASSIFICATION_FALLBACK",
+    "VALUE_SWEET_FROM",
+    "VALUE_SWEET_TO",
+    "VALUE_PENALTY_EXPONENT",
 ])
-def test_config_hash_changes_when_any_pinned_input_changes(monkeypatch, name):
-    """All ten allocator.config inputs are load-bearing. QUANTITY_CLASSES and
-    QTY_CLASS_PRICE_THRESHOLDS were the original omission — they determine the
-    item_allowance persisted in every feature record."""
-    import allocator.config as cfg
-    from allocator.box_features import config_hash
+def test_local_config_owner_changes_hash(monkeypatch, name):
+    """Changing an effective box_features binding must restamp feature data."""
+    import allocator.box_features as box_features
 
-    before = config_hash()
-    current = getattr(cfg, name)
+    before = box_features.config_hash()
+    current = getattr(box_features, name)
     if isinstance(current, (int, float)):
         mutated = current + 1
     else:
-        # The probe key MUST match the existing key type. CLASSIFICATION_FALLBACK
-        # is keyed by integer category IDs (allocator/config.py:207-209); adding a
-        # str key makes json.dumps(..., sort_keys=True) raise
-        # "TypeError: '<' not supported between instances of 'str' and 'int'"
-        # inside _digest, so the test would error rather than assert.
         sample = next(iter(current))
         probe = max(current) + 1 if isinstance(sample, int) else "zzz_probe"
-        assert probe not in current
         mutated = {**current, probe: 1}
-    monkeypatch.setattr(cfg, name, mutated)
-    assert config_hash() != before
+    monkeypatch.setattr(box_features, name, mutated)
+    assert box_features.config_hash() != before
 
 
-def test_config_hash_changes_with_canonical_default_classification(monkeypatch):
-    import allocator.categorizer as categorizer
-    from allocator.box_features import config_hash
+def test_default_classification_owner_changes_hash_and_snapshot(monkeypatch):
+    import allocator.box_features as box_features
 
-    before = config_hash()
+    before_hash = box_features.config_hash()
+    before_snapshot = box_features.config_snapshot()
     monkeypatch.setattr(
-        categorizer,
+        box_features,
         "DEFAULT_CLASSIFICATION",
-        ("reserved_other", "cooking", "green", "round"),
+        ("reserved_default", "cooking", "green", "round"),
     )
-    assert config_hash() != before
+    assert box_features.config_hash() != before_hash
+    assert (
+        box_features.config_snapshot()["default_classification_hash"]
+        != before_snapshot["default_classification_hash"]
+    )
 
 
-def test_config_hash_includes_target_percentage_through_box_tiers(monkeypatch):
-    import allocator.config as cfg
-    from allocator.box_features import config_hash
+def test_box_tier_owner_carries_target_percentage_into_hash(monkeypatch):
+    import allocator.box_features as box_features
 
-    before = config_hash()
-    tiers = {tier: dict(values) for tier, values in cfg.BOX_TIERS.items()}
+    before = box_features.config_hash()
+    tiers = {tier: dict(values) for tier, values in box_features.BOX_TIERS.items()}
     tiers["small"]["target_value"] += 1
-    monkeypatch.setattr(cfg, "BOX_TIERS", tiers)
-    assert config_hash() != before
+    monkeypatch.setattr(box_features, "BOX_TIERS", tiers)
+    assert box_features.config_hash() != before
 
 
 def test_config_snapshot_has_exactly_the_pinned_keys():
@@ -950,11 +968,11 @@ def test_config_snapshot_has_exactly_the_pinned_keys():
 
     snap = config_snapshot()
     assert set(snap) == {
-        "box_tiers", "box_target_pct", "value_sweet_from", "value_sweet_to",
-        "value_penalty_exponent", "group_allowances", "quantity_classes",
-        "qty_class_price_thresholds", "item_classifications_hash",
-        "fungible_groups_hash", "classification_fallback_hash",
-        "default_classification_hash",
+        "box_tiers", "box_target_pct", "category_fruit", "category_vegetables",
+        "value_sweet_from", "value_sweet_to", "value_penalty_exponent",
+        "group_allowances", "quantity_classes", "qty_class_price_thresholds",
+        "item_classifications_hash", "fungible_groups_hash",
+        "classification_fallback_hash", "default_classification_hash",
     }
 
 
@@ -984,41 +1002,126 @@ def test_config_snapshot_classification_structures_are_digests():
         assert len(snap[key]) == 16
 
 
-def test_config_snapshot_changes_with_classification_fallback(monkeypatch):
-    import allocator.config as cfg
-    from allocator.box_features import config_snapshot
+def test_classification_fallback_owner_changes_snapshot(monkeypatch):
+    import allocator.box_features as box_features
 
-    before = config_snapshot()
-    fallback = dict(cfg.CLASSIFICATION_FALLBACK)
+    before = box_features.config_snapshot()
+    fallback = dict(box_features.CLASSIFICATION_FALLBACK)
     category_id = next(iter(fallback))
     fallback[category_id] = ("reserved_fallback", *fallback[category_id][1:])
-    monkeypatch.setattr(cfg, "CLASSIFICATION_FALLBACK", fallback)
-
-    after = config_snapshot()
-    assert after != before
+    monkeypatch.setattr(box_features, "CLASSIFICATION_FALLBACK", fallback)
     assert (
-        after["classification_fallback_hash"]
+        box_features.config_snapshot()["classification_fallback_hash"]
         != before["classification_fallback_hash"]
     )
 
 
-def test_config_snapshot_changes_with_default_classification(monkeypatch):
+@pytest.mark.parametrize("name", ["CATEGORY_FRUIT", "CATEGORY_VEGETABLES"])
+def test_category_id_owner_changes_invalidate_both_identity_contracts(monkeypatch, name):
+    import allocator.box_features as box_features
+
+    before_hash = box_features.config_hash()
+    before_snapshot = box_features.config_snapshot()
+    monkeypatch.setattr(box_features, name, getattr(box_features, name) + 1000)
+    after_snapshot = box_features.config_snapshot()
+
+    assert box_features.config_hash() != before_hash
+    assert after_snapshot != before_snapshot
+    assert after_snapshot[
+        "category_fruit" if name == "CATEGORY_FRUIT" else "category_vegetables"
+    ] == getattr(box_features, name)
+
+
+def test_frozen_owner_ignores_live_config_and_categorizer_reassignment(
+    monkeypatch,
+):
+    import allocator.box_features as box_features
     import allocator.categorizer as categorizer
-    from allocator.box_features import config_snapshot
+    import allocator.config as config
 
-    before = config_snapshot()
+    before = (box_features.config_hash(), box_features.config_snapshot())
+    monkeypatch.setattr(config, "CATEGORY_FRUIT", config.CATEGORY_FRUIT + 1000)
     monkeypatch.setattr(
-        categorizer,
-        "DEFAULT_CLASSIFICATION",
-        ("reserved_default", *categorizer.DEFAULT_CLASSIFICATION[1:]),
+        config,
+        "BOX_TIERS",
+        {"changed": {"price": 1, "target_value": 1}},
+    )
+    monkeypatch.setattr(categorizer, "DEFAULT_CLASSIFICATION", ("changed",) * 4)
+    assert (box_features.config_hash(), box_features.config_snapshot()) == before
+
+
+def test_quantity_class_owner_changes_allowance_hash_and_snapshot(monkeypatch):
+    import allocator.box_features as box_features
+    import allocator.strategies._scoring as scoring
+
+    before_hash = box_features.config_hash()
+    before_snapshot = box_features.config_snapshot()
+    classes = {name: dict(values) for name, values in scoring.QUANTITY_CLASSES.items()}
+    classes["snack_piece"]["small"] += 7
+    monkeypatch.setattr(scoring, "QUANTITY_CLASSES", classes)
+
+    record = box_features.extract_box_features(
+        "x", {1: 1}, _item_lookup(), "small", _available_tags(), 1
+    )
+    assert record["item_quantities"][0][2] == classes["snack_piece"]["small"]
+    assert box_features.config_hash() != before_hash
+    assert box_features.config_snapshot() != before_snapshot
+
+
+def test_fungible_group_owner_changes_allowance_hash_and_snapshot(monkeypatch):
+    import allocator.box_features as box_features
+    import allocator.strategies._scoring as scoring
+
+    before_hash = box_features.config_hash()
+    before_snapshot = box_features.config_snapshot()
+    groups = dict(scoring.FUNGIBLE_GROUPS)
+    degree, prefixes, _quantity_class = groups["apple"]
+    groups["apple"] = (degree, prefixes, "cooking_piece")
+    monkeypatch.setattr(scoring, "FUNGIBLE_GROUPS", groups)
+
+    record = box_features.extract_box_features(
+        "x", {1: 1}, _item_lookup(), "small", _available_tags(), 1
+    )
+    assert record["item_quantities"][0][2] == scoring.QUANTITY_CLASSES[
+        "cooking_piece"
+    ]["small"]
+    assert box_features.config_hash() != before_hash
+    assert box_features.config_snapshot() != before_snapshot
+
+
+def test_price_threshold_owner_changes_allowance_hash_and_snapshot(monkeypatch):
+    import allocator.box_features as box_features
+    import allocator.strategies._scoring as scoring
+
+    lookup = _item_lookup()
+    original_threshold = scoring.QTY_CLASS_PRICE_THRESHOLDS["snacking_max"]
+    lookup[4] = {
+        **lookup[1],
+        "price": original_threshold - 1,
+        "fungible_group": None,
+        "fungible_degree": 0.0,
+    }
+    before_hash = box_features.config_hash()
+    before_snapshot = box_features.config_snapshot()
+    before_record = box_features.extract_box_features(
+        "x", {4: 1}, lookup, "small", _available_tags(), 1
     )
 
-    after = config_snapshot()
-    assert after != before
-    assert (
-        after["default_classification_hash"]
-        != before["default_classification_hash"]
+    thresholds = dict(scoring.QTY_CLASS_PRICE_THRESHOLDS)
+    thresholds["snacking_max"] -= 1
+    monkeypatch.setattr(scoring, "QTY_CLASS_PRICE_THRESHOLDS", thresholds)
+    after_record = box_features.extract_box_features(
+        "x", {4: 1}, lookup, "small", _available_tags(), 1
     )
+
+    assert before_record["item_quantities"][0][2] == scoring.QUANTITY_CLASSES[
+        "snack_piece"
+    ]["small"]
+    assert after_record["item_quantities"][0][2] == scoring.QUANTITY_CLASSES[
+        "cooking_piece"
+    ]["small"]
+    assert box_features.config_hash() != before_hash
+    assert box_features.config_snapshot() != before_snapshot
 
 
 def test_config_snapshot_is_json_serialisable_and_round_trips():

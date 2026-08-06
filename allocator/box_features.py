@@ -13,20 +13,21 @@ import hashlib
 import json
 import statistics
 
-import allocator.categorizer as _categorizer
-import allocator.config as _cfg
-
 from allocator.config import (
+    BOX_TARGET_PCT,
     BOX_TIERS,
     CATEGORY_FRUIT,
     CATEGORY_VEGETABLES,
     CLASSIFICATION_FALLBACK,
     GROUP_ALLOWANCES,
     ITEM_CLASSIFICATIONS,
+    VALUE_PENALTY_EXPONENT,
+    VALUE_SWEET_FROM,
+    VALUE_SWEET_TO,
 )
 from allocator.categorizer import DEFAULT_CLASSIFICATION
 from allocator.strategies._helpers import _effective_species
-from allocator.strategies._scoring import _resolve_item_allowance_from_lookup
+from allocator.strategies import _scoring
 
 
 _DIMENSIONS = ("sub_category", "usage", "colour", "shape")
@@ -78,7 +79,7 @@ def extract_box_features(
         total_value += price * qty
 
         # Per-item allowance
-        item_allowance = _resolve_item_allowance_from_lookup(info, tier)
+        item_allowance = _scoring._resolve_item_allowance_from_lookup(info, tier)
         item_quantities_map[item_id] = [qty, price, item_allowance]
 
         # Size points
@@ -299,36 +300,38 @@ def flatten(record: dict) -> dict[str, float]:
     return {name: columns[name] for name in sorted(columns)}
 
 
-# Enumerated, not described: the guard compares hashes for equality, so the
-# input list must be reproducible from this file alone.
-_HASH_INPUTS = (
-    "BOX_TIERS",
-    "GROUP_ALLOWANCES",
-    "ITEM_CLASSIFICATIONS",
-    "FUNGIBLE_GROUPS",
-    "CLASSIFICATION_FALLBACK",
-    "QUANTITY_CLASSES",
-    "QTY_CLASS_PRICE_THRESHOLDS",
-    "VALUE_SWEET_FROM",
-    "VALUE_SWEET_TO",
-    "VALUE_PENALTY_EXPONENT",
-)
-
-
 def _digest(obj) -> str:
     """First 16 hex chars of the SHA-256 of a sorted JSON rendering."""
     payload = json.dumps(obj, sort_keys=True, default=list)
     return hashlib.sha256(payload.encode()).hexdigest()[:16]
 
 
-def config_hash() -> str:
-    """Stamp for feature files over eleven pinned schema/scoring inputs.
+def _hash_inputs() -> dict:
+    """Return the effective schema/scoring inputs used by feature extraction."""
+    return {
+        "BOX_TIERS": BOX_TIERS,
+        "GROUP_ALLOWANCES": GROUP_ALLOWANCES,
+        "ITEM_CLASSIFICATIONS": ITEM_CLASSIFICATIONS,
+        "FUNGIBLE_GROUPS": _scoring.FUNGIBLE_GROUPS,
+        "CLASSIFICATION_FALLBACK": CLASSIFICATION_FALLBACK,
+        "QUANTITY_CLASSES": _scoring.QUANTITY_CLASSES,
+        "QTY_CLASS_PRICE_THRESHOLDS": _scoring.QTY_CLASS_PRICE_THRESHOLDS,
+        "VALUE_SWEET_FROM": VALUE_SWEET_FROM,
+        "VALUE_SWEET_TO": VALUE_SWEET_TO,
+        "VALUE_PENALTY_EXPONENT": VALUE_PENALTY_EXPONENT,
+        "CATEGORY_FRUIT": CATEGORY_FRUIT,
+        "CATEGORY_VEGETABLES": CATEGORY_VEGETABLES,
+        "DEFAULT_CLASSIFICATION": DEFAULT_CLASSIFICATION,
+    }
 
-    BOX_TARGET_PCT is represented by BOX_TIERS' derived target_value entries.
+
+def config_hash() -> str:
+    """Stamp over thirteen effective schema/scoring inputs.
+
+    BOX_TARGET_PCT is represented by BOX_TIERS' derived target_value entries;
+    config_snapshot() carries the frozen percentage directly.
     """
-    inputs = {name: getattr(_cfg, name) for name in _HASH_INPUTS}
-    inputs["DEFAULT_CLASSIFICATION"] = _categorizer.DEFAULT_CLASSIFICATION
-    return _digest(inputs)
+    return _digest(_hash_inputs())
 
 
 def config_snapshot() -> dict:
@@ -340,19 +343,19 @@ def config_snapshot() -> dict:
     return {
         "box_tiers": {
             tier: {"price": entry["price"], "target_value": entry["target_value"]}
-            for tier, entry in _cfg.BOX_TIERS.items()
+            for tier, entry in BOX_TIERS.items()
         },
-        "box_target_pct": _cfg.BOX_TARGET_PCT,
-        "value_sweet_from": _cfg.VALUE_SWEET_FROM,
-        "value_sweet_to": _cfg.VALUE_SWEET_TO,
-        "value_penalty_exponent": _cfg.VALUE_PENALTY_EXPONENT,
-        "group_allowances": _cfg.GROUP_ALLOWANCES,
-        "quantity_classes": _cfg.QUANTITY_CLASSES,
-        "qty_class_price_thresholds": _cfg.QTY_CLASS_PRICE_THRESHOLDS,
-        "item_classifications_hash": _digest(_cfg.ITEM_CLASSIFICATIONS),
-        "fungible_groups_hash": _digest(_cfg.FUNGIBLE_GROUPS),
-        "classification_fallback_hash": _digest(_cfg.CLASSIFICATION_FALLBACK),
-        "default_classification_hash": _digest(
-            _categorizer.DEFAULT_CLASSIFICATION
-        ),
+        "box_target_pct": BOX_TARGET_PCT,
+        "category_fruit": CATEGORY_FRUIT,
+        "category_vegetables": CATEGORY_VEGETABLES,
+        "value_sweet_from": VALUE_SWEET_FROM,
+        "value_sweet_to": VALUE_SWEET_TO,
+        "value_penalty_exponent": VALUE_PENALTY_EXPONENT,
+        "group_allowances": GROUP_ALLOWANCES,
+        "quantity_classes": _scoring.QUANTITY_CLASSES,
+        "qty_class_price_thresholds": _scoring.QTY_CLASS_PRICE_THRESHOLDS,
+        "item_classifications_hash": _digest(ITEM_CLASSIFICATIONS),
+        "fungible_groups_hash": _digest(_scoring.FUNGIBLE_GROUPS),
+        "classification_fallback_hash": _digest(CLASSIFICATION_FALLBACK),
+        "default_classification_hash": _digest(DEFAULT_CLASSIFICATION),
     }
