@@ -123,6 +123,7 @@ def test_strict_mode_follows_positive_selection_not_substring(expr, expected):
 def _use_synthetic_scoring_config(monkeypatch):
     """Keep box-feature expectations independent of ignored local config links."""
     import allocator.box_features as box_features
+    import allocator.config as allocator_config
     import allocator.strategies._scoring as scoring
 
     config = json.loads(
@@ -132,6 +133,23 @@ def _use_synthetic_scoring_config(monkeypatch):
     monkeypatch.setattr(box_features, "CATEGORY_VEGETABLES", config["category_vegetables"])
     monkeypatch.setattr(box_features, "BOX_TIERS", {"small": {"price": 2000}})
     monkeypatch.setattr(box_features, "GROUP_ALLOWANCES", config["group_allowances"])
+    monkeypatch.setattr(allocator_config, "GROUP_ALLOWANCES", config["group_allowances"])
+    classifications = {
+        key: (value[0], value[1], value[2], value[3], value[4])
+        for key, value in config["item_classifications"].items()
+    }
+    fallback = {
+        config["category_fruit"]: tuple(config["classification_fallback"]["fruit"]),
+        config["category_vegetables"]: tuple(config["classification_fallback"]["veg"]),
+    }
+    monkeypatch.setattr(
+        box_features, "ITEM_CLASSIFICATIONS", classifications, raising=False
+    )
+    monkeypatch.setattr(
+        box_features, "CLASSIFICATION_FALLBACK", fallback, raising=False
+    )
+    monkeypatch.setattr(allocator_config, "ITEM_CLASSIFICATIONS", classifications)
+    monkeypatch.setattr(allocator_config, "CLASSIFICATION_FALLBACK", fallback)
     monkeypatch.setattr(scoring, "FUNGIBLE_GROUPS", config["fungible_groups"])
     monkeypatch.setattr(scoring, "QUANTITY_CLASSES", config["quantity_classes"])
 
@@ -402,3 +420,127 @@ def test_an_unresolved_item_does_not_trigger_the_third_category_guard():
         available_tags=_available_tags(), offer_id=1,
     )
     assert sum(rec["category_value_share"].values()) == 1.0
+
+
+def test_tag_vocabulary_is_dimension_qualified_and_sorted():
+    from allocator.box_features import tag_vocabulary
+
+    vocab = tag_vocabulary()
+    assert vocab == sorted(vocab)
+    assert all("." in entry for entry in vocab)
+    assert len(vocab) == len(set(vocab))
+
+
+def test_tag_vocabulary_includes_all_three_fallback_sub_categories():
+    """Fallbacks reserve columns before an unclassified live item arrives."""
+    from allocator.box_features import tag_vocabulary
+
+    vocab = set(tag_vocabulary())
+    assert "sub_category.other_fruit" in vocab
+    assert "sub_category.other_veg" in vocab
+    assert "sub_category.other" in vocab
+    assert "colour.green" in vocab
+
+
+def test_tag_vocabulary_size_matches_config():
+    from allocator.box_features import tag_vocabulary
+    from allocator.categorizer import DEFAULT_CLASSIFICATION
+    from allocator.config import CLASSIFICATION_FALLBACK, ITEM_CLASSIFICATIONS
+
+    dims = ["sub_category", "usage", "colour", "shape"]
+    expected = {dimension: set() for dimension in dims}
+    for _prefixes, sub_cat, usage, colour, shape in ITEM_CLASSIFICATIONS.values():
+        for dimension, tag in zip(dims, (sub_cat, usage, colour, shape)):
+            expected[dimension].add(tag)
+    for fallback in list(CLASSIFICATION_FALLBACK.values()) + [DEFAULT_CLASSIFICATION]:
+        for dimension, tag in zip(dims, fallback):
+            expected[dimension].add(tag)
+
+    assert len(tag_vocabulary()) == sum(len(tags) for tags in expected.values())
+
+
+def test_flatten_column_count_derived_from_config():
+    from allocator.box_features import flatten, tag_vocabulary
+    from allocator.config import GROUP_ALLOWANCES
+
+    cols = flatten(_record())
+    expected = 3 + 8 + 3 + 5 + 1 + 2 * len(GROUP_ALLOWANCES) + len(tag_vocabulary())
+    assert len(cols) == expected
+
+
+def test_flatten_is_globally_name_sorted():
+    from allocator.box_features import flatten
+
+    names = list(flatten(_record()))
+    assert names == sorted(names)
+
+
+def test_flatten_column_set_is_identical_across_disjoint_boxes():
+    from allocator.box_features import extract_box_features, flatten
+
+    only_apple = extract_box_features(
+        box_name="a", allocations={1: 2}, item_lookup=_item_lookup(), tier="small",
+        available_tags=_available_tags(), offer_id=1,
+    )
+    only_tomato = extract_box_features(
+        box_name="b", allocations={3: 1}, item_lookup=_item_lookup(), tier="small",
+        available_tags=_available_tags(), offer_id=1,
+    )
+    apple, tomato = flatten(only_apple), flatten(only_tomato)
+    assert list(apple) == list(tomato)
+    assert apple["raw_group_totals.tomato"] == 0.0
+    assert tomato["raw_group_totals.apple"] == 0.0
+    assert apple["raw_tag_counts.sub_category.fruiting_veg"] == 0.0
+    assert tomato["raw_tag_counts.sub_category.pome_fruit"] == 0.0
+
+
+def test_flatten_tier_slices_value_pct():
+    from allocator.box_features import flatten
+
+    cols = flatten(_record())
+    assert cols["value_pct_small"] == _record()["value_pct"]
+    assert cols["value_pct_medium"] == 0.0
+    assert cols["value_pct_large"] == 0.0
+    assert "value_pct" not in cols
+
+
+def test_flatten_price_stats_are_item_weighted():
+    import statistics
+
+    from allocator.box_features import flatten
+
+    cols = flatten(_record())
+    assert cols["n_unique_items"] == 3.0
+    assert cols["total_qty"] == 6.0
+    assert cols["price_mean"] == 150.0
+    assert cols["price_max"] == 200.0
+    assert cols["price_sd"] == statistics.pstdev([100, 150, 200])
+
+
+def test_flatten_price_sd_is_zero_for_a_single_item_box():
+    from allocator.box_features import extract_box_features, flatten
+
+    record = extract_box_features(
+        box_name="a", allocations={1: 4}, item_lookup=_item_lookup(), tier="small",
+        available_tags=_available_tags(), offer_id=1,
+    )
+    assert flatten(record)["price_sd"] == 0.0
+
+
+def test_flatten_emits_one_category_column():
+    from allocator.box_features import flatten
+
+    cols = flatten(_record())
+    assert cols["fruit_value_share"] == 0.529412
+    assert "veg_value_share" not in cols
+    assert "category_value_share.veg" not in cols
+
+
+def test_flatten_excludes_config_parameter_columns():
+    from allocator.box_features import flatten
+
+    names = list(flatten(_record()))
+    assert not any(name.startswith("item_quantities") for name in names)
+    assert not any(name.startswith("group_totals") for name in names)
+    assert not any("allowance" in name for name in names)
+    assert not any("degree" in name for name in names)

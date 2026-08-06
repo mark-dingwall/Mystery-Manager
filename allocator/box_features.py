@@ -9,14 +9,22 @@ Hard constraint: no DB imports, no import-time side effects. `allocator.config`
 imports are expected — a feature builder consumes the import-time-frozen config when called.
 """
 
+import statistics
+
 from allocator.config import (
     BOX_TIERS,
     CATEGORY_FRUIT,
     CATEGORY_VEGETABLES,
+    CLASSIFICATION_FALLBACK,
     GROUP_ALLOWANCES,
+    ITEM_CLASSIFICATIONS,
 )
+from allocator.categorizer import DEFAULT_CLASSIFICATION
 from allocator.strategies._helpers import _effective_species
 from allocator.strategies._scoring import _resolve_item_allowance_from_lookup
+
+
+_DIMENSIONS = ("sub_category", "usage", "colour", "shape")
 
 
 def extract_box_features(
@@ -215,3 +223,72 @@ def extract_box_features(
         "category_value_share": category_value_share,
         "pref_violations": pref_violations,
     }
+
+
+def tag_vocabulary() -> list[str]:
+    """Return sorted, dimension-qualified tag names for the feature schema.
+
+    The union includes configured classifications, category-specific fallbacks,
+    and the categorizer's canonical default for unknown category IDs.
+    """
+    seen: set[str] = set()
+    for _prefixes, *tags in ITEM_CLASSIFICATIONS.values():
+        for dimension, tag in zip(_DIMENSIONS, tags):
+            seen.add(f"{dimension}.{tag}")
+    for tags in list(CLASSIFICATION_FALLBACK.values()) + [DEFAULT_CLASSIFICATION]:
+        for dimension, tag in zip(_DIMENSIONS, tags):
+            seen.add(f"{dimension}.{tag}")
+    return sorted(seen)
+
+
+def flatten(record: dict) -> dict[str, float]:
+    """Map one feature record to globally name-sorted numeric matrix columns.
+
+    Positional ``item_quantities`` and ``group_totals`` never become columns:
+    they have variable length and embed scoring configuration parameters.
+    """
+    columns: dict[str, float] = {}
+
+    for tier in ("small", "medium", "large"):
+        columns[f"value_pct_{tier}"] = (
+            float(record["value_pct"]) if record["tier"] == tier else 0.0
+        )
+
+    for dimension in _DIMENSIONS:
+        columns[f"dim_ratios.{dimension}"] = float(
+            record["dim_ratios"].get(dimension, 0.0)
+        )
+        columns[f"dim_available.{dimension}"] = float(
+            record["dim_available"].get(dimension, 0)
+        )
+
+    columns["max_value_share"] = float(record["max_value_share"])
+    columns["total_size_points"] = float(record["total_size_points"])
+    columns["pref_violations"] = float(record["pref_violations"])
+
+    prices = [price for _quantity, price, _allowance in record["item_quantities"]]
+    columns["n_unique_items"] = float(len(prices))
+    columns["total_qty"] = float(
+        sum(quantity for quantity, _price, _allowance in record["item_quantities"])
+    )
+    columns["price_mean"] = float(statistics.fmean(prices)) if prices else 0.0
+    columns["price_sd"] = float(statistics.pstdev(prices)) if len(prices) > 1 else 0.0
+    columns["price_max"] = float(max(prices)) if prices else 0.0
+
+    columns["fruit_value_share"] = float(record["category_value_share"]["fruit"])
+
+    for group in sorted(GROUP_ALLOWANCES):
+        columns[f"capped_group_totals.{group}"] = float(
+            record["capped_group_totals"].get(group, 0)
+        )
+        columns[f"raw_group_totals.{group}"] = float(
+            record["raw_group_totals"].get(group, 0)
+        )
+
+    for entry in tag_vocabulary():
+        dimension, tag = entry.split(".", 1)
+        columns[f"raw_tag_counts.{entry}"] = float(
+            record["raw_tag_counts"].get(dimension, {}).get(tag, 0)
+        )
+
+    return {name: columns[name] for name in sorted(columns)}
