@@ -12,10 +12,9 @@ import importlib
 from importlib import metadata as importlib_metadata
 import json
 import os
+import re
 import shutil
 from pathlib import Path
-
-from packaging.version import Version
 
 # ---------------------------------------------------------------------------
 # Module-level env var setup — MUST happen before any allocator import
@@ -266,16 +265,48 @@ def two_box_result(sample_items, make_box, make_result, make_charity):
 
 _STRICT = False
 
-_DIAGNOSTIC_DEPENDENCIES = {
-    # module name: (distribution name, minimum version)
-    "interpret": ("interpret", "0.6.0"),
-    "statsmodels": ("statsmodels", "0.14.0"),
-    "sklearn": ("scikit-learn", "1.3.0"),
-    "numpy": ("numpy", "1.24.0"),
-    "pandas": ("pandas", "2.0.0"),
-    "numexpr": ("numexpr", "2.8.4"),
-    "bottleneck": ("bottleneck", "1.3.6"),
-}
+_MODULE_NAME_OVERRIDES = {"scikit-learn": "sklearn"}
+_BOOTSTRAP_DEPENDENCIES = ("packaging", "pytest")
+_RUNNING_VERSION_MODULES = {"pytest"}
+_DIAGNOSTIC_REQUIREMENT = re.compile(
+    r"^(?P<distribution>[A-Za-z0-9][A-Za-z0-9._-]*)"
+    r">=(?P<minimum>[0-9]+(?:\.[0-9]+)*)$"
+)
+
+
+def _load_diagnostic_dependencies(
+    path: Path = _PROJECT_ROOT / "requirements-diagnostics.txt",
+    *,
+    strict: bool = False,
+) -> dict[str, tuple[str, str]]:
+    dependencies = {}
+    try:
+        lines = path.read_text().splitlines()
+    except FileNotFoundError as exc:
+        if strict:
+            raise ValueError(f"{path} does not exist") from exc
+        return {}
+    for line_number, raw_line in enumerate(lines, 1):
+        line = raw_line.partition("#")[0].strip()
+        if not line:
+            continue
+        match = _DIAGNOSTIC_REQUIREMENT.fullmatch(line)
+        if match is None:
+            if strict:
+                raise ValueError(
+                    f"{path}:{line_number}: expected distribution>=minimum"
+                )
+            continue
+        distribution = match.group("distribution")
+        minimum = match.group("minimum")
+        module = _MODULE_NAME_OVERRIDES.get(
+            distribution, distribution.replace("-", "_")
+        )
+        dependencies[module] = (distribution, minimum)
+    return dependencies
+
+
+_DIAGNOSTIC_DEPENDENCIES = _load_diagnostic_dependencies()
 
 
 def pytest_addoption(parser):
@@ -291,35 +322,80 @@ def pytest_addoption(parser):
 def pytest_configure(config):
     global _STRICT
     _STRICT = config.getoption("--strict-diagnostics-deps")
+    if _STRICT:
+        try:
+            dependencies = _load_diagnostic_dependencies(
+                _PROJECT_ROOT / "requirements-diagnostics.txt", strict=True
+            )
+        except ValueError as exc:
+            raise pytest.UsageError(str(exc)) from exc
+        _validate_bootstrap_dependencies(dependencies)
+
+
+def _unavailable(message: str, cause: BaseException | None = None):
+    if _STRICT:
+        raise ImportError(message) from cause
+    pytest.skip(message, allow_module_level=True)
+
+
+def _require_version(
+    distribution: str,
+    minimum: str,
+    *,
+    installed: str | None = None,
+) -> None:
+    if installed is None:
+        try:
+            installed = importlib_metadata.version(distribution)
+        except importlib_metadata.PackageNotFoundError as exc:
+            _unavailable(
+                f"required diagnostic distribution {distribution!r} is absent", exc
+            )
+    try:
+        from packaging.version import Version
+    except ImportError as exc:
+        _unavailable("required diagnostic dependency 'packaging' is not importable", exc)
+    if Version(installed) < Version(minimum):
+        _unavailable(
+            f"required diagnostic dependency {distribution}>={minimum}; found {installed}"
+        )
+
+
+def _running_version(name: str, module) -> str | None:
+    return module.__version__ if name in _RUNNING_VERSION_MODULES else None
+
+
+def _validate_bootstrap_dependencies(
+    dependencies: dict[str, tuple[str, str]],
+) -> None:
+    for name in _BOOTSTRAP_DEPENDENCIES:
+        requirement = dependencies.get(name)
+        if requirement is None:
+            raise pytest.UsageError(
+                f"bootstrap dependency {name!r} is missing from the requirements-diagnostics.txt manifest"
+            )
+        try:
+            module = importlib.import_module(name)
+            distribution, minimum = requirement
+            installed = _running_version(name, module)
+            _require_version(distribution, minimum, installed=installed)
+        except ImportError as exc:
+            raise pytest.UsageError(str(exc)) from exc
 
 
 def require_dep(name: str):
-    """Import `name` and enforce known floors; skip unless strict mode is armed."""
+    """Import `name` and enforce its manifest floor when one is declared."""
     try:
         module = importlib.import_module(name)
     except ImportError as exc:
-        message = f"required diagnostic dependency {name!r} is not importable"
-        if _STRICT:
-            raise ImportError(message) from exc
-        pytest.skip(message, allow_module_level=True)
+        _unavailable(
+            f"required diagnostic dependency {name!r} is not importable", exc
+        )
 
     requirement = _DIAGNOSTIC_DEPENDENCIES.get(name)
     if requirement is None:
         return module
     distribution, minimum = requirement
-    try:
-        installed = importlib_metadata.version(distribution)
-    except importlib_metadata.PackageNotFoundError as exc:
-        message = f"required diagnostic distribution {distribution!r} is absent"
-        if _STRICT:
-            raise ImportError(message) from exc
-        pytest.skip(message, allow_module_level=True)
-    if Version(installed) < Version(minimum):
-        message = (
-            f"required diagnostic dependency {distribution}>={minimum}; "
-            f"found {installed}"
-        )
-        if _STRICT:
-            raise ImportError(message)
-        pytest.skip(message, allow_module_level=True)
+    installed = _running_version(name, module)
+    _require_version(distribution, minimum, installed=installed)
     return module

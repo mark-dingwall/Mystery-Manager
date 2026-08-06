@@ -1,4 +1,5 @@
 pytest>=9.0.0
+packaging>=22
 interpret>=0.6.0
 statsmodels>=0.14.0
 scikit-learn>=1.3.0

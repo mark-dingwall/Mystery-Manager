@@ -25,15 +25,39 @@ _TEST_BOX_TIERS = {
 }
 
 
-def _collect_module_scope_dependency(tmp_path, *pytest_args):
+def _collect_module_scope_dependency(
+    tmp_path,
+    *pytest_args,
+    dependency="a_module_that_does_not_exist_xyz",
+    version_overrides=None,
+    absent_distributions=(),
+    running_pytest_version=None,
+):
+    sitecustomize = tmp_path / "sitecustomize.py"
+    sitecustomize.write_text(
+        "import json, os\n"
+        "from importlib import metadata\n"
+        "_real_version = metadata.version\n"
+        "_overrides = json.loads(os.environ.get('DIAGNOSTIC_VERSION_OVERRIDES', '{}'))\n"
+        "_absent = set(json.loads(os.environ.get('DIAGNOSTIC_ABSENT_DISTRIBUTIONS', '[]')))\n"
+        "_running_pytest = os.environ.get('DIAGNOSTIC_RUNNING_PYTEST_VERSION')\n"
+        "if _running_pytest:\n"
+        "    import pytest\n"
+        "    pytest.__version__ = _running_pytest\n"
+        "def _version(name):\n"
+        "    if name in _absent:\n"
+        "        raise metadata.PackageNotFoundError(name)\n"
+        "    return _overrides.get(name, _real_version(name))\n"
+        "metadata.version = _version\n"
+    )
     test_module = tmp_path / "test_diagnostic_dependency.py"
     test_module.write_text(
         "import pytest\n"
         "from tests.conftest import require_dep\n"
         "pytestmark = pytest.mark.diagnostics(reason='synthetic')\n"
-        "require_dep('a_module_that_does_not_exist_xyz')\n"
+        f"require_dep({dependency!r})\n"
         "def test_unreachable():\n"
-        "    raise AssertionError('missing dependency did not stop collection')\n"
+        "    raise AssertionError('dependency gate did not stop collection')\n"
     )
     (tmp_path / "test_sentinel.py").write_text(
         "import pytest\n"
@@ -42,7 +66,11 @@ def _collect_module_scope_dependency(tmp_path, *pytest_args):
         "    pass\n"
     )
     env = os.environ.copy()
-    env["PYTHONPATH"] = str(_PROJECT_ROOT)
+    env["PYTHONPATH"] = os.pathsep.join((str(tmp_path), str(_PROJECT_ROOT)))
+    env["DIAGNOSTIC_VERSION_OVERRIDES"] = json.dumps(version_overrides or {})
+    env["DIAGNOSTIC_ABSENT_DISTRIBUTIONS"] = json.dumps(absent_distributions)
+    if running_pytest_version is not None:
+        env["DIAGNOSTIC_RUNNING_PYTEST_VERSION"] = running_pytest_version
     return subprocess.run(
         [
             sys.executable,
@@ -111,18 +139,169 @@ def test_marker_keyword_selection_does_not_arm_dependency_strictness(tmp_path):
     assert "1 passed, 1 skipped" in proc.stdout
 
 
-def test_declared_dependency_floors_and_distribution_names_are_exact():
+def test_dependency_floors_are_loaded_from_the_manifest(tmp_path):
+    from tests.conftest import _load_diagnostic_dependencies
+
+    manifest = tmp_path / "requirements-diagnostics.txt"
+    manifest.write_text(
+        "# diagnostic stack\n"
+        "example-lib>=1.2.3\n"
+        "scikit-learn>=9.8.7\n"
+    )
+
+    assert _load_diagnostic_dependencies(manifest) == {
+        "example_lib": ("example-lib", "1.2.3"),
+        "sklearn": ("scikit-learn", "9.8.7"),
+    }
+
+
+def test_production_manifest_declares_every_diagnostic_module():
     from tests.conftest import _DIAGNOSTIC_DEPENDENCIES
 
-    assert _DIAGNOSTIC_DEPENDENCIES == {
-        "interpret": ("interpret", "0.6.0"),
-        "statsmodels": ("statsmodels", "0.14.0"),
-        "sklearn": ("scikit-learn", "1.3.0"),
-        "numpy": ("numpy", "1.24.0"),
-        "pandas": ("pandas", "2.0.0"),
-        "numexpr": ("numexpr", "2.8.4"),
-        "bottleneck": ("bottleneck", "1.3.6"),
+    assert set(_DIAGNOSTIC_DEPENDENCIES) == {
+        "pytest",
+        "packaging",
+        "interpret",
+        "statsmodels",
+        "sklearn",
+        "numpy",
+        "pandas",
+        "numexpr",
+        "bottleneck",
     }
+    assert _DIAGNOSTIC_DEPENDENCIES["sklearn"][0] == "scikit-learn"
+
+
+def test_manifest_parser_is_tolerant_for_plain_collection_but_strict_on_demand(
+    tmp_path,
+):
+    from tests.conftest import _load_diagnostic_dependencies
+
+    manifest = tmp_path / "requirements-diagnostics.txt"
+    manifest.write_text(
+        "valid>=1.0\n"
+        "conditional>=2; python_version >= '3.10'\n"
+        "pinned==3\n"
+    )
+
+    assert _load_diagnostic_dependencies(manifest) == {
+        "valid": ("valid", "1.0")
+    }
+    with pytest.raises(ValueError, match="expected distribution>=minimum"):
+        _load_diagnostic_dependencies(manifest, strict=True)
+
+
+def test_missing_manifest_is_empty_in_plain_mode_and_errors_in_strict_mode(
+    tmp_path,
+):
+    from tests.conftest import _load_diagnostic_dependencies
+
+    missing = tmp_path / "missing-requirements.txt"
+    assert _load_diagnostic_dependencies(missing) == {}
+    with pytest.raises(ValueError, match="missing-requirements.txt.*does not exist"):
+        _load_diagnostic_dependencies(missing, strict=True)
+
+
+def test_bootstrap_dependency_must_be_present_in_manifest():
+    from tests.conftest import _validate_bootstrap_dependencies
+
+    with pytest.raises(pytest.UsageError, match="packaging.*manifest"):
+        _validate_bootstrap_dependencies({
+            "pytest": ("pytest", "9.0.0"),
+        })
+
+
+def test_conftest_does_not_import_packaging_version_at_module_scope():
+    code = r'''\
+import importlib.abc
+import runpy
+import sys
+import packaging
+import pytest
+
+sys.modules.pop("packaging.version", None)
+if hasattr(packaging, "version"):
+    delattr(packaging, "version")
+
+class BlockPackagingVersion(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path, target=None):
+        if fullname == "packaging.version":
+            raise ModuleNotFoundError(fullname)
+        return None
+
+sys.meta_path.insert(0, BlockPackagingVersion())
+runpy.run_path("tests/conftest.py", run_name="conftest_import_probe")
+'''
+    provisioned_paths = [
+        _PROJECT_ROOT / "scoring_config.json",
+        _PROJECT_ROOT / "identifiers.json",
+    ]
+    absent_before = {path for path in provisioned_paths if not path.exists()}
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-c", code],
+            cwd=_PROJECT_ROOT,
+            capture_output=True,
+            text=True,
+        )
+    finally:
+        for path in absent_before:
+            if path.exists():
+                path.unlink()
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+
+
+def test_plain_pytest_skips_when_packaging_distribution_is_absent(tmp_path):
+    proc = _collect_module_scope_dependency(
+        tmp_path, dependency="packaging", absent_distributions=["packaging"]
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "1 skipped" in proc.stdout
+
+
+def test_strict_mode_rejects_absent_packaging_distribution(tmp_path):
+    proc = _collect_module_scope_dependency(
+        tmp_path,
+        "-m",
+        "diagnostics",
+        "--strict-diagnostics-deps",
+        dependency="json",
+        absent_distributions=["packaging"],
+    )
+    assert proc.returncode == pytest.ExitCode.USAGE_ERROR
+    assert "packaging" in proc.stdout + proc.stderr
+    assert "absent" in proc.stdout + proc.stderr
+
+
+def test_strict_mode_rejects_below_floor_packaging(tmp_path):
+    proc = _collect_module_scope_dependency(
+        tmp_path,
+        "-m",
+        "diagnostics",
+        "--strict-diagnostics-deps",
+        dependency="json",
+        version_overrides={"packaging": "21.9"},
+    )
+    assert proc.returncode == pytest.ExitCode.USAGE_ERROR
+    output = proc.stdout + proc.stderr
+    assert "packaging>=22" in output
+    assert "found 21.9" in output
+
+
+def test_strict_mode_checks_the_running_pytest_version(tmp_path):
+    proc = _collect_module_scope_dependency(
+        tmp_path,
+        "-m",
+        "diagnostics",
+        "--strict-diagnostics-deps",
+        dependency="json",
+        version_overrides={"pytest": "99.0.0"},
+        running_pytest_version="8.4.2",
+    )
+    assert proc.returncode == pytest.ExitCode.USAGE_ERROR
+    output = proc.stdout + proc.stderr
+    assert "pytest>=9.0.0" in output
+    assert "found 8.4.2" in output
 
 
 def test_require_dep_accepts_version_at_floor_without_diagnostic_stack(monkeypatch):
