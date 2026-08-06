@@ -37,13 +37,30 @@ numbers, identify edit locations after earlier tasks shift the files.
 - Consumes: `requirements-diagnostics.txt` lines in the exact form `distribution>=minimum`.
 - Produces:
   ```python
+  _MODULE_NAME_OVERRIDES = {"scikit-learn": "sklearn"}
+  _BOOTSTRAP_DEPENDENCIES = ("packaging", "pytest")
+  _RUNNING_VERSION_MODULES = {"pytest"}
+  _DIAGNOSTIC_REQUIREMENT: re.Pattern
+
   def _load_diagnostic_dependencies(
-      path: Path, *, strict: bool = False,
+      path: Path = _PROJECT_ROOT / "requirements-diagnostics.txt",
+      *, strict: bool = False,
   ) -> dict[str, tuple[str, str]]
+  def _unavailable(message: str, cause: BaseException | None = None): ...
+  def _require_version(
+      distribution: str, minimum: str, *, installed: str | None = None,
+  ) -> None
+  def _running_version(name: str, module) -> str | None
+  def _validate_bootstrap_dependencies(
+      dependencies: dict[str, tuple[str, str]],
+  ) -> None
   def require_dep(name: str):
       """Import a module and enforce its manifest floor when declared."""
   ```
 - `_DIAGNOSTIC_DEPENDENCIES` is derived once from the manifest. The only exceptional module mapping is `scikit-learn` to `sklearn`.
+- Because pytest becomes a declared manifest entry, `require_dep("pytest")`
+  changes from an import-only check to a floor-enforcing check against the
+  running module's `__version__`.
 
 - [ ] **Step 1: Add regression tests for manifest parsing and lazy version imports**
 
@@ -68,6 +85,16 @@ def test_dependency_floors_are_loaded_from_the_manifest(tmp_path):
     }
 
 
+def test_production_manifest_declares_every_diagnostic_module():
+    from tests.conftest import _DIAGNOSTIC_DEPENDENCIES
+
+    assert set(_DIAGNOSTIC_DEPENDENCIES) == {
+        "pytest", "packaging", "interpret", "statsmodels", "sklearn",
+        "numpy", "pandas", "numexpr", "bottleneck",
+    }
+    assert _DIAGNOSTIC_DEPENDENCIES["sklearn"][0] == "scikit-learn"
+
+
 def test_manifest_parser_is_tolerant_for_plain_collection_but_strict_on_demand(
     tmp_path,
 ):
@@ -85,6 +112,17 @@ def test_manifest_parser_is_tolerant_for_plain_collection_but_strict_on_demand(
     }
     with pytest.raises(ValueError, match="expected distribution>=minimum"):
         _load_diagnostic_dependencies(manifest, strict=True)
+
+
+def test_missing_manifest_is_empty_in_plain_mode_and_errors_in_strict_mode(
+    tmp_path,
+):
+    from tests.conftest import _load_diagnostic_dependencies
+
+    missing = tmp_path / "missing-requirements.txt"
+    assert _load_diagnostic_dependencies(missing) == {}
+    with pytest.raises(ValueError, match="missing-requirements.txt.*does not exist"):
+        _load_diagnostic_dependencies(missing, strict=True)
 
 
 def test_bootstrap_dependency_must_be_present_in_manifest():
@@ -123,12 +161,22 @@ class BlockPackagingVersion(importlib.abc.MetaPathFinder):
 sys.meta_path.insert(0, BlockPackagingVersion())
 runpy.run_path("tests/conftest.py", run_name="conftest_import_probe")
 '''
-    proc = subprocess.run(
-        [sys.executable, "-c", code],
-        cwd=_PROJECT_ROOT,
-        capture_output=True,
-        text=True,
-    )
+    provisioned_paths = [
+        _PROJECT_ROOT / "scoring_config.json",
+        _PROJECT_ROOT / "identifiers.json",
+    ]
+    absent_before = {path for path in provisioned_paths if not path.exists()}
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-c", code],
+            cwd=_PROJECT_ROOT,
+            capture_output=True,
+            text=True,
+        )
+    finally:
+        for path in absent_before:
+            if path.exists():
+                path.unlink()
     assert proc.returncode == 0, proc.stdout + proc.stderr
 ```
 
@@ -162,7 +210,8 @@ def _collect_module_scope_dependency(
         "from tests.conftest import require_dep\n"
         "pytestmark = pytest.mark.diagnostics(reason='synthetic')\n"
         f"require_dep({dependency!r})\n"
-        "def test_reached(): pass\n"
+        "def test_unreachable():\n"
+        "    raise AssertionError('dependency gate did not stop collection')\n"
     )
     (tmp_path / "test_sentinel.py").write_text(
         "import pytest\n"
@@ -258,11 +307,17 @@ floors.
 
 Add `packaging>=22` immediately after `pytest>=9.0.0` in `requirements-diagnostics.txt`.
 
-Remove `from packaging.version import Version` from module scope. Replace the hardcoded dependency dictionary with:
+Remove `from packaging.version import Version` from module scope, add `import re`,
+and replace the hardcoded dependency dictionary with:
 
 ```python
 _MODULE_NAME_OVERRIDES = {"scikit-learn": "sklearn"}
 _BOOTSTRAP_DEPENDENCIES = ("packaging", "pytest")
+_RUNNING_VERSION_MODULES = {"pytest"}
+_DIAGNOSTIC_REQUIREMENT = re.compile(
+    r"^(?P<distribution>[A-Za-z0-9][A-Za-z0-9._-]*)"
+    r">=(?P<minimum>[0-9]+(?:\.[0-9]+)*)$"
+)
 
 
 def _load_diagnostic_dependencies(
@@ -271,23 +326,25 @@ def _load_diagnostic_dependencies(
     strict: bool = False,
 ) -> dict[str, tuple[str, str]]:
     dependencies = {}
-    for line_number, raw_line in enumerate(path.read_text().splitlines(), 1):
+    try:
+        lines = path.read_text().splitlines()
+    except FileNotFoundError as exc:
+        if strict:
+            raise ValueError(f"{path} does not exist") from exc
+        return {}
+    for line_number, raw_line in enumerate(lines, 1):
         line = raw_line.partition("#")[0].strip()
         if not line:
             continue
-        distribution, separator, minimum = line.partition(">=")
-        distribution, minimum = distribution.strip(), minimum.strip()
-        valid = (
-            bool(separator and distribution and minimum)
-            and ";" not in minimum
-            and not any(token in distribution for token in "<>=!~[]")
-        )
-        if not valid:
+        match = _DIAGNOSTIC_REQUIREMENT.fullmatch(line)
+        if match is None:
             if strict:
                 raise ValueError(
                     f"{path}:{line_number}: expected distribution>=minimum"
                 )
             continue
+        distribution = match.group("distribution")
+        minimum = match.group("minimum")
         module = _MODULE_NAME_OVERRIDES.get(
             distribution, distribution.replace("-", "_")
         )
@@ -328,6 +385,10 @@ def _require_version(
         _unavailable(
             f"required diagnostic dependency {distribution}>={minimum}; found {installed}"
         )
+
+
+def _running_version(name: str, module) -> str | None:
+    return module.__version__ if name in _RUNNING_VERSION_MODULES else None
 ```
 
 Update `require_dep()` with the complete flow below. It returns immediately for
@@ -348,7 +409,7 @@ def require_dep(name: str):
     if requirement is None:
         return module
     distribution, minimum = requirement
-    installed = module.__version__ if name == "pytest" else None
+    installed = _running_version(name, module)
     _require_version(distribution, minimum, installed=installed)
     return module
 ```
@@ -373,7 +434,7 @@ def _validate_bootstrap_dependencies(
         try:
             module = importlib.import_module(name)
             distribution, minimum = requirement
-            installed = module.__version__ if name == "pytest" else None
+            installed = _running_version(name, module)
             _require_version(distribution, minimum, installed=installed)
         except ImportError as exc:
             raise pytest.UsageError(str(exc)) from exc
@@ -434,7 +495,105 @@ git commit -m "fix: derive diagnostic floors from manifest"
 
 - [ ] **Step 1: Write failing identity-owner and category tests**
 
-Update the exact key test to include `category_fruit` and `category_vegetables`. Replace mutation tests that patch `allocator.config` with tests against the effective owners:
+First extend `_use_synthetic_scoring_config` so every new direct binding receives
+synthetic data and no real ignored config value can reach test output:
+
+```python
+monkeypatch.setattr(
+    box_features, "BOX_TARGET_PCT", _TEST_ONLY_CONFIG["box_target_pct"]
+)
+monkeypatch.setattr(box_features, "VALUE_SWEET_FROM", value_band["sweet_from"])
+monkeypatch.setattr(box_features, "VALUE_SWEET_TO", value_band["sweet_to"])
+monkeypatch.setattr(
+    box_features, "VALUE_PENALTY_EXPONENT", value_band["penalty_exponent"]
+)
+```
+
+Keep the existing `allocator.config` fixture patches because config-loader tests
+still use them; the new local patches are additions, not replacements.
+
+The owner change invalidates these existing tests as written, so replace each
+explicitly rather than discovering them after GREEN:
+
+- `test_config_hash_changes_when_any_pinned_input_changes` (10 parameters)
+- `test_config_hash_changes_with_canonical_default_classification`
+- `test_config_hash_includes_target_percentage_through_box_tiers`
+- `test_config_snapshot_changes_with_classification_fallback`
+- `test_config_snapshot_changes_with_default_classification`
+
+Seven former config-module hash inputs now belong directly to
+`allocator.box_features`; cover every one with:
+
+```python
+@pytest.mark.parametrize("name", [
+    "BOX_TIERS",
+    "GROUP_ALLOWANCES",
+    "ITEM_CLASSIFICATIONS",
+    "CLASSIFICATION_FALLBACK",
+    "VALUE_SWEET_FROM",
+    "VALUE_SWEET_TO",
+    "VALUE_PENALTY_EXPONENT",
+])
+def test_local_config_owner_changes_hash(monkeypatch, name):
+    import allocator.box_features as box_features
+
+    before = box_features.config_hash()
+    current = getattr(box_features, name)
+    if isinstance(current, (int, float)):
+        mutated = current + 1
+    else:
+        sample = next(iter(current))
+        probe = max(current) + 1 if isinstance(sample, int) else "zzz_probe"
+        mutated = {**current, probe: 1}
+    monkeypatch.setattr(box_features, name, mutated)
+    assert box_features.config_hash() != before
+
+
+def test_default_classification_owner_changes_hash_and_snapshot(monkeypatch):
+    import allocator.box_features as box_features
+
+    before_hash = box_features.config_hash()
+    before_snapshot = box_features.config_snapshot()
+    monkeypatch.setattr(
+        box_features,
+        "DEFAULT_CLASSIFICATION",
+        ("reserved_default", "cooking", "green", "round"),
+    )
+    assert box_features.config_hash() != before_hash
+    assert (
+        box_features.config_snapshot()["default_classification_hash"]
+        != before_snapshot["default_classification_hash"]
+    )
+
+
+def test_box_tier_owner_carries_target_percentage_into_hash(monkeypatch):
+    import allocator.box_features as box_features
+
+    before = box_features.config_hash()
+    tiers = {tier: dict(values) for tier, values in box_features.BOX_TIERS.items()}
+    tiers["small"]["target_value"] += 1
+    monkeypatch.setattr(box_features, "BOX_TIERS", tiers)
+    assert box_features.config_hash() != before
+
+
+def test_classification_fallback_owner_changes_snapshot(monkeypatch):
+    import allocator.box_features as box_features
+
+    before = box_features.config_snapshot()
+    fallback = dict(box_features.CLASSIFICATION_FALLBACK)
+    category_id = next(iter(fallback))
+    fallback[category_id] = ("reserved_fallback", *fallback[category_id][1:])
+    monkeypatch.setattr(box_features, "CLASSIFICATION_FALLBACK", fallback)
+    assert (
+        box_features.config_snapshot()["classification_fallback_hash"]
+        != before["classification_fallback_hash"]
+    )
+```
+
+The box-tier test deliberately overlaps the parameterized owner test because it
+documents the indirect `BOX_TARGET_PCT -> BOX_TIERS.target_value -> hash`
+contract. Update the exact snapshot-key test to include `category_fruit` and
+`category_vegetables`, then add category-owner tests:
 
 ```python
 @pytest.mark.parametrize("name", ["CATEGORY_FRUIT", "CATEGORY_VEGETABLES"])
@@ -688,8 +847,33 @@ git commit -m "fix: hash effective box feature configuration"
   for an empty/unresolved box. Both outcomes are intentionally absent from the
   emitted feature list, so `n_manual` continues to count emitted manual records,
   not attempted boxes.
+- Importing `scripts.extract_features` for its pure batch helpers must not import
+  `compare` or `allocator.db`; DB-dependent imports move inside `main()`.
 
 - [ ] **Step 1: Write failing exception and batch-continuation tests**
+
+First add a fresh-process import boundary test so the three following tests do
+not depend on gitignored `queries.json`:
+
+```python
+def test_extract_features_batch_helpers_import_without_database():
+    code = (
+        "import sys\n"
+        "import scripts.extract_features\n"
+        "assert 'compare' not in sys.modules\n"
+        "assert 'allocator.db' not in sys.modules\n"
+    )
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(_PROJECT_ROOT)
+    proc = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=_PROJECT_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+```
 
 Strengthen the direct extractor test:
 
@@ -769,10 +953,12 @@ Before writing, name the mutations: raising base `ValueError` should fail the sp
 Run:
 
 ```bash
-python3 -m pytest tests/test_box_features.py -v -k "third_category or unsupported or batch_boundary or synthetic_generation"
+python3 -m pytest tests/test_box_features.py -v -k "third_category or unsupported or batch_boundary or synthetic_generation or batch_helpers"
 ```
 
-Expected failures: `UnsupportedCategoryError` and `_extract_or_skip` do not exist; synthetic generation propagates the injected error.
+Expected failures: importing the script loads `allocator.db` (or fails when
+`queries.json` is absent); `UnsupportedCategoryError` and `_extract_or_skip` do
+not exist; synthetic generation propagates the injected error.
 
 - [ ] **Step 3: Add the specific error and central batch wrapper**
 
@@ -817,6 +1003,26 @@ def _extract_or_skip(
         return None
 ```
 
+Remove the module-scope `compare` and `allocator.db` imports. Import only the
+names actually used by `main()` at the top of that function:
+
+```python
+def main():
+    import argparse
+
+    from compare import (
+        build_item_lookup,
+        compute_available_tags,
+        load_historical_csv,
+        load_summary,
+        read_xlsx_pack_overrides,
+    )
+    from allocator.db import fetch_mystery_box_buyers
+```
+
+Do not retain the already-unused `_discover_cleaned_offer_ids` or `_offer_tier`
+imports.
+
 Replace all five synthetic calls and the manual call with `_extract_or_skip`.
 Keep only `BOX_TIERS`, `DONATION_IDENTIFIERS`, `SKIP_COLUMN_IDENTIFIERS`, and
 `STAFF_IDENTIFIERS` in the config import block. Remove the five import-only
@@ -828,7 +1034,7 @@ names `CATEGORY_FRUIT`, `CATEGORY_VEGETABLES`, `FUNGIBLE_GROUPS`,
 Run:
 
 ```bash
-python3 -m pytest tests/test_box_features.py -v -k "third_category or unsupported or batch_boundary or synthetic_generation"
+python3 -m pytest tests/test_box_features.py -v -k "third_category or unsupported or batch_boundary or synthetic_generation or batch_helpers"
 ```
 
 Expected: all selected tests pass; captured output contains `[SKIP]`; unrelated `ValueError` still propagates.
@@ -852,16 +1058,13 @@ git commit -m "fix: skip unsupported category feature records"
 
 ---
 
-### Task 4: Current and Authoritative Documentation
+### Task 4: PR Documentation
 
 **Files:**
-- Modify in PR worktree: `CLAUDE.md:44-77,163-166`
-- Modify in planning workspace: `/home/mark/jointly/Mystery-Manager/docs/superpowers/specs/2026-08-03-ebm-ordinal-diagnostics-design.md`
-- Modify in planning workspace: `/home/mark/jointly/Mystery-Manager/docs/superpowers/plans/2026-08-04-diagnostics-foundation.md`
+- Modify: `CLAUDE.md` diagnostics and key-modules sections
 
 **Interfaces:**
 - The PR documentation describes only commands that exist now and the exact 14-key snapshot.
-- The planning documents enumerate the same 9-package manifest, 13-input hash, and 14-key snapshot as implementation.
 
 - [ ] **Step 1: Correct current repository documentation**
 
@@ -887,7 +1090,37 @@ requirements or missing/below-floor bootstrap dependencies fail startup with a
 concise pytest usage error. Change the key-module description from “exact
 12-key `config_snapshot()`” to “exact 14-key `config_snapshot()`”.
 
-- [ ] **Step 2: Synchronize the parent diagnostics design in the planning workspace**
+- [ ] **Step 2: Verify and commit PR documentation**
+
+Run:
+
+```bash
+rg -n "ebm_diagnostic.py|12-key|pytest>=9.0.0.*only" CLAUDE.md
+git diff --check
+```
+
+Expected: the search returns no matches and the diff check emits nothing. Then
+commit only the PR documentation:
+
+```bash
+git add CLAUDE.md
+git commit -m "docs: correct diagnostics foundation commands"
+```
+
+---
+
+### Task 5: Authoritative Planning-Workspace Documentation
+
+**Files:**
+- Modify: `/home/mark/jointly/Mystery-Manager/docs/superpowers/specs/2026-08-03-ebm-ordinal-diagnostics-design.md`
+- Modify: `/home/mark/jointly/Mystery-Manager/docs/superpowers/plans/2026-08-04-diagnostics-foundation.md`
+
+**Interfaces:**
+- These ignored planning-workspace documents enumerate the same 9-package
+  manifest, 13-input hash, and 14-key snapshot as implementation.
+- This task makes no PR-worktree edits and creates no PR commit.
+
+- [ ] **Step 1: Synchronize the parent diagnostics design**
 
 In the Part 4 dependency block, insert:
 
@@ -912,45 +1145,42 @@ In the snapshot JSON object, add:
 
 after `box_target_pct`, and change every exact twelve-key statement to fourteen keys. Replace the claim that `packaging.version.Version` is merely “available with pytest” with the explicit `packaging>=22` manifest/bootstrap contract.
 
-- [ ] **Step 3: Synchronize the foundation plan in the planning workspace**
+- [ ] **Step 2: Synchronize the foundation plan**
 
 Apply the same manifest, hash-input, snapshot-key, code-example, test-expectation, and prose-count changes throughout `2026-08-04-diagnostics-foundation.md`. Its Task 1 dependency file example must list `packaging>=22`; its Task 5 interfaces must say 13 inputs and 14 keys; its `_HASH_INPUTS` and snapshot examples must include both category IDs and effective-owner semantics.
 Its dependency-gating example must preserve the sentinel collection test, use
 the running pytest version, lazily import `Version`, enforce bootstrap manifest
 membership, and specify `pytest.UsageError` for strict startup failures.
 
-- [ ] **Step 4: Verify documentation consistency**
+- [ ] **Step 3: Verify planning-document consistency**
 
 Run:
 
 ```bash
-rg -n "ebm_diagnostic.py|12-key|twelve keys|eleven named inputs|11-input|packaging.version.Version \(available with pytest\)" CLAUDE.md
 rg -n "pytest>=9.0.0|packaging>=22|CATEGORY_FRUIT|CATEGORY_VEGETABLES|category_fruit|category_vegetables|13-input|14-key|fourteen keys" /home/mark/jointly/Mystery-Manager/docs/superpowers/specs/2026-08-03-ebm-ordinal-diagnostics-design.md /home/mark/jointly/Mystery-Manager/docs/superpowers/plans/2026-08-04-diagnostics-foundation.md
-git diff --check
 ```
 
-Expected: the first command returns no matches in `CLAUDE.md`; the planning documents show `packaging>=22`, both category IDs, 13-input hash wording, and 14-key snapshot wording. Review numeric matches such as dataset counts separately; do not mechanically replace unrelated numbers 11, 12, 13, or 14.
+Expected: the planning documents show `packaging>=22`, both category IDs,
+13-input hash wording, and 14-key snapshot wording. Review numeric matches such
+as dataset counts separately; do not mechanically replace unrelated numbers 11,
+12, 13, or 14.
 
-- [ ] **Step 5: Commit PR documentation and record planning-workspace state separately**
+- [ ] **Step 4: Record planning-workspace state separately**
 
-In the PR worktree:
-
-```bash
-git add CLAUDE.md
-git commit -m "docs: correct diagnostics foundation commands"
-```
-
-The two authoritative companion files are intentionally outside PR #1 and ignored by this repository. Preserve their edits in the planning workspace; do not force-add them to the PR branch. Report their exact paths in the final handoff so they are not mistaken for PR changes.
+The two authoritative companion files are intentionally outside PR #1 and
+ignored by this repository. Preserve their edits in the planning workspace; do
+not force-add them to the PR branch. Report their exact paths in the final
+handoff so they are not mistaken for PR changes.
 
 ---
 
-### Task 5: Final Verification and Review-Finding Audit
+### Task 6: Final Verification and Review-Finding Audit
 
 **Files:**
 - Verify only; no new implementation files.
 
 **Interfaces:**
-- Produces fresh evidence that each of the seven review findings is resolved or intentionally handled.
+- Produces fresh evidence that each review finding is resolved or intentionally handled.
 
 - [ ] **Step 1: Run focused diagnostics-foundation tests**
 
@@ -973,14 +1203,15 @@ Expected: zero failures and zero collection errors.
 ```bash
 python3 -m py_compile allocator/box_features.py scripts/extract_features.py tests/conftest.py tests/test_box_features.py
 python3 -c "import allocator.box_features; print('DB-free import passed')"
+python3 -c "import sys, scripts.extract_features; assert 'compare' not in sys.modules and 'allocator.db' not in sys.modules; print('batch-helper import passed')"
 git diff main...HEAD --check
 git status --short
 ```
 
-Expected: compilation and DB-free import exit zero; diff check emits nothing;
+Expected: compilation and both DB-free imports exit zero; diff check emits nothing;
 PR-worktree status is empty. The separately managed planning documents are
 gitignored files in another checkout and therefore cannot appear in this status;
-their contents are verified by Task 4's explicit `rg` command and reported by
+their contents are verified by Task 5's explicit `rg` command and reported by
 absolute path in the final handoff.
 
 - [ ] **Step 4: Audit each review item against the resulting diff**
@@ -995,6 +1226,7 @@ Confirm all seven outcomes explicitly:
 6. dependency floors occur only in the manifest, with code deriving them;
 7. all five import-only config names are removed from the script, including the
    three named by the original review.
+8. importing the script's batch helpers does not load DB configuration.
 
 - [ ] **Step 5: Request code review before integration**
 
