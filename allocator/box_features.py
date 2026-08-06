@@ -33,6 +33,10 @@ from allocator.strategies import _scoring
 _DIMENSIONS = ("sub_category", "usage", "colour", "shape")
 
 
+class UnsupportedCategoryError(ValueError):
+    """A resolved item cannot fit the two-category feature schema."""
+
+
 def extract_box_features(
     box_name: str,
     allocations: dict[int, int],
@@ -179,7 +183,7 @@ def extract_box_features(
             f"item {item_id} category {category_id}"
             for item_id, category_id in offending_items
         )
-        raise ValueError(
+        raise UnsupportedCategoryError(
             f"Box {box_name!r} (offer {offer_id}) has resolved positive-quantity "
             f"{offenders}; category is neither CATEGORY_FRUIT ({CATEGORY_FRUIT}) "
             f"nor CATEGORY_VEGETABLES ({CATEGORY_VEGETABLES}). category_value_share "

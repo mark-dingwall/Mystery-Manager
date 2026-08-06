@@ -555,6 +555,25 @@ def test_box_features_module_imports_from_isolated_root_without_db(tmp_path):
     assert "ok" in proc.stdout
 
 
+def test_extract_features_batch_helpers_import_without_database():
+    code = (
+        "import sys\n"
+        "import scripts.extract_features\n"
+        "assert 'compare' not in sys.modules\n"
+        "assert 'allocator.db' not in sys.modules\n"
+    )
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(_PROJECT_ROOT)
+    proc = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=_PROJECT_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+
+
 def test_extract_box_features_scalar_fields():
     rec = _record()
     assert rec["offer_id"] == 999
@@ -731,22 +750,68 @@ def test_category_value_share_is_zero_for_a_valueless_box():
     assert rec["category_value_share"] == {"fruit": 0.0, "veg": 0.0}
 
 
-def test_a_third_category_is_refused_rather_than_normalised_away():
+def test_a_third_category_raises_compatible_specific_error():
     """The pair sums to 1 only while every resolved item is fruit or veg —
     which is what lets flatten() drop the veg column. A third category is a
     schema event, not a data point: it needs a third column and a re-derived
     maxT family. Fail where it is introduced, not silently in the matrix."""
-    from allocator.box_features import extract_box_features
+    from allocator.box_features import UnsupportedCategoryError, extract_box_features
 
     lookup = _item_lookup()
     lookup[4] = {**lookup[1], "name": "Mystery Herb", "price": 500,
                  "category_id": 987654, "fungible_group": None,
                  "fungible_degree": 0.0}
-    with pytest.raises(ValueError, match="neither CATEGORY_FRUIT"):
+    with pytest.raises(UnsupportedCategoryError, match="neither CATEGORY_FRUIT") as exc:
         extract_box_features(
             box_name="x", allocations={1: 3, 3: 2, 4: 1}, item_lookup=lookup,
             tier="small", available_tags=_available_tags(), offer_id=1,
         )
+    assert isinstance(exc.value, ValueError)
+
+
+def test_batch_boundary_skips_unsupported_record_and_allows_next(capsys):
+    from scripts.extract_features import _extract_or_skip
+
+    lookup = _item_lookup()
+    lookup[4] = {**lookup[1], "category_id": 987654,
+                 "fungible_group": None, "fungible_degree": 0.0}
+    skipped = _extract_or_skip(
+        "bad", {4: 1}, lookup, "small", _available_tags(), 10
+    )
+    accepted = _extract_or_skip(
+        "good", {1: 1}, lookup, "small", _available_tags(), 10
+    )
+
+    assert skipped is None
+    assert accepted["box_name"] == "good"
+    assert "[SKIP]" in capsys.readouterr().out
+
+
+def test_synthetic_generation_continues_after_unsupported_candidate(monkeypatch):
+    import scripts.extract_features as script
+    from allocator.box_features import UnsupportedCategoryError
+
+    def selective_extract(box_name, *args, **kwargs):
+        if box_name == "synth_mono_small":
+            raise UnsupportedCategoryError("unsupported synthetic")
+        if box_name == "synth_random_small":
+            return {"box_name": box_name, "source": "synth_random"}
+        return None
+
+    monkeypatch.setattr(script, "extract_box_features", selective_extract)
+    features = script.generate_synthetic_boxes(1, _item_lookup(), _available_tags())
+    assert features == [{"box_name": "synth_random_small", "source": "synth_random"}]
+
+
+def test_batch_boundary_does_not_swallow_unrelated_value_error(monkeypatch):
+    import scripts.extract_features as script
+
+    def broken(*args, **kwargs):
+        raise ValueError("unrelated")
+
+    monkeypatch.setattr(script, "extract_box_features", broken)
+    with pytest.raises(ValueError, match="unrelated"):
+        script._extract_or_skip("x", {}, {}, "small", {}, 1)
 
 
 def test_a_zero_price_third_category_is_still_refused():

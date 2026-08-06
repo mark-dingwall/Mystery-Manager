@@ -28,32 +28,44 @@ logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(name)s: %(mes
 from allocator.box_parser import infer_box_tier
 from allocator.config import (
     BOX_TIERS,
-    CATEGORY_FRUIT,
-    CATEGORY_VEGETABLES,
     DONATION_IDENTIFIERS,
-    FUNGIBLE_GROUPS,
-    GROUP_ALLOWANCES,
-    QUANTITY_CLASSES,
     SKIP_COLUMN_IDENTIFIERS,
     STAFF_IDENTIFIERS,
 )
+from allocator.box_features import UnsupportedCategoryError
 from allocator.box_features import extract_box_features
-from compare import (
-    build_item_lookup,
-    compute_available_tags,
-    load_historical_csv,
-    load_summary,
-    read_xlsx_pack_overrides,
-    _build_offer_ids,
-    _discover_cleaned_offer_ids,
-    _offer_tier,
-)
-from allocator.db import fetch_mystery_box_buyers
 
 
 # ---------------------------------------------------------------------------
 # Feature extraction
 # ---------------------------------------------------------------------------
+
+
+def _extract_or_skip(
+    box_name: str,
+    allocations: dict[int, int],
+    item_lookup: dict[int, dict],
+    tier: str,
+    available_tags: dict[str, set[str]],
+    offer_id: int,
+    source: str = "manual",
+    preference: str | None = None,
+) -> dict | None:
+    try:
+        return extract_box_features(
+            box_name,
+            allocations,
+            item_lookup,
+            tier,
+            available_tags,
+            offer_id,
+            source=source,
+            preference=preference,
+        )
+    except UnsupportedCategoryError as exc:
+        print(f"  [SKIP] {exc}")
+        return None
+
 
 # ---------------------------------------------------------------------------
 # Synthetic box generation
@@ -102,7 +114,7 @@ def generate_synthetic_boxes(
         mono_target = int(target * 1.15)
         mono_qty = max(1, mono_target // cheapest_info["price"])
         mono_allocs = {cheapest_id: mono_qty}
-        f = extract_box_features(
+        f = _extract_or_skip(
             f"synth_mono_{tier}", mono_allocs, item_lookup, tier,
             available_tags, offer_id, source="synth_monoculture",
         )
@@ -111,7 +123,7 @@ def generate_synthetic_boxes(
 
         # 2. Random: uniform sample to target value
         random_allocs = _fill_to_target(sorted_items, int(target * 1.15), rng=rng)
-        f = extract_box_features(
+        f = _extract_or_skip(
             f"synth_random_{tier}", random_allocs, item_lookup, tier,
             available_tags, offer_id, source="synth_random",
         )
@@ -136,7 +148,7 @@ def generate_synthetic_boxes(
             if overfg_value >= int(target * 1.15):
                 break
         if overfg_allocs:
-            f = extract_box_features(
+            f = _extract_or_skip(
                 f"synth_overfg_{tier}", overfg_allocs, item_lookup, tier,
                 available_tags, offer_id, source="synth_over_fungible",
             )
@@ -145,7 +157,7 @@ def generate_synthetic_boxes(
 
         # 4. Value low: items to ~70% target
         low_allocs = _fill_to_target(sorted_items, int(target * 0.70))
-        f = extract_box_features(
+        f = _extract_or_skip(
             f"synth_low_{tier}", low_allocs, item_lookup, tier,
             available_tags, offer_id, source="synth_value_low",
         )
@@ -154,7 +166,7 @@ def generate_synthetic_boxes(
 
         # 5. Value high: items to ~160% target
         high_allocs = _fill_to_target(sorted_items, int(target * 1.60))
-        f = extract_box_features(
+        f = _extract_or_skip(
             f"synth_high_{tier}", high_allocs, item_lookup, tier,
             available_tags, offer_id, source="synth_value_high",
         )
@@ -170,6 +182,16 @@ def generate_synthetic_boxes(
 
 def main():
     import argparse
+
+    from compare import (
+        _build_offer_ids,
+        build_item_lookup,
+        compute_available_tags,
+        load_historical_csv,
+        load_summary,
+        read_xlsx_pack_overrides,
+    )
+    from allocator.db import fetch_mystery_box_buyers
 
     parser = argparse.ArgumentParser(
         description="Extract box features for Optuna parameter tuning"
@@ -243,7 +265,7 @@ def main():
                     box_allocs[item_id] = int(qty)
 
             pref = buyer_prefs.get(bn)
-            f = extract_box_features(
+            f = _extract_or_skip(
                 bn, box_allocs, manual_lookup, tier, avail_tags,
                 offer_id, source="manual", preference=pref,
             )
