@@ -114,9 +114,9 @@ def test_strict_mode_follows_positive_selection_not_substring(expr, expected):
 # Shared fixture data for the box-feature tests
 # ---------------------------------------------------------------------------
 #
-# Values come from tests/fixtures/scoring_config.json (synthetic) via conftest's
-# bootstrap: fungible groups apple/banana/tomato, quantity classes snack_piece
-# (small=2) and cooking_piece (small=1), box price small = BOX_PRICE_SMALL.
+# Values come from tests/fixtures/scoring_config.json (synthetic): fungible
+# groups apple/banana/tomato, quantity classes snack_piece (small=2) and
+# cooking_piece (small=1), and a test-pinned small-box price of 2000.
 
 
 @pytest.fixture(autouse=True)
@@ -263,3 +263,128 @@ def test_extract_features_script_reexports_the_same_object():
     assert "def extract_box_features(" not in src
     assert "def _effective_species(" not in src
     assert callable(bf.extract_box_features)
+
+
+def test_raw_group_totals_are_uncapped():
+    """Uncapped loads, over the same key space as group_totals."""
+    rec = _record()
+    # allocations 3 apple / 1 banana / 2 tomato; allowances 2 / 2 / 1
+    assert rec["raw_group_totals"] == {"apple": 3, "banana": 1, "tomato": 2}
+
+
+def test_capped_group_totals_match_group_totals_loads():
+    """capped_group_totals supplies the key that group_totals' positional
+    triples cannot — the aggregate each raw_group_totals column pairs with."""
+    rec = _record()
+    assert rec["capped_group_totals"] == {"apple": 2, "banana": 1, "tomato": 1}
+    assert sorted(rec["capped_group_totals"].values()) == sorted(
+        load for load, _degree, _allow in rec["group_totals"]
+    )
+
+
+def test_ungrouped_items_produce_no_group_columns():
+    """__item_N synthetic keys must not leak into either group dict."""
+    from allocator.box_features import extract_box_features
+
+    lookup = _item_lookup()
+    lookup[4] = {"name": "Kiwi - Green", "price": 90, "size": 1,
+                 "category_id": lookup[1]["category_id"], "fungible_group": None,
+                 "fungible_degree": 0.0, "sub_category": "tropical",
+                 "usage": "snacking", "colour": "green", "shape": "round"}
+    rec = extract_box_features(
+        box_name="x", allocations={1: 3, 4: 5}, item_lookup=lookup,
+        tier="small", available_tags=_available_tags(), offer_id=1,
+    )
+    assert set(rec["raw_group_totals"]) == {"apple"}
+    assert set(rec["capped_group_totals"]) == {"apple"}
+    assert not any(k.startswith("__item_") for k in rec["raw_group_totals"])
+
+
+def test_raw_tag_counts_are_quantity_weighted_and_sparse():
+    rec = _record()
+    assert rec["raw_tag_counts"] == {
+        "sub_category": {"pome_fruit": 3, "tropical": 1, "fruiting_veg": 2},
+        "usage": {"snacking": 4, "cooking": 2},
+        "colour": {"red": 5, "yellow": 1},
+        "shape": {"round": 5, "long": 1},
+    }
+    # Absent tags are omitted, not zero-filled.
+    assert "root_veg" not in rec["raw_tag_counts"]["sub_category"]
+
+
+def test_raw_tag_counts_each_dimension_sums_to_resolved_qty():
+    """assign_classification always returns all four tags and the loop adds qty
+    to exactly one tag per dimension per item, so every dimension block sums to
+    the box's resolved allocated quantity. Three exact linear dependencies —
+    stated here so a future change that breaks them fails loudly."""
+    rec = _record()
+    total_qty = 3 + 1 + 2
+    for dim, counts in rec["raw_tag_counts"].items():
+        assert sum(counts.values()) == total_qty, dim
+
+
+def test_category_value_share_has_exactly_two_keys():
+    rec = _record()
+    assert set(rec["category_value_share"]) == {"fruit", "veg"}
+    assert rec["category_value_share"]["fruit"] == 0.529412   # (300+150)/850
+    assert rec["category_value_share"]["veg"] == 0.470588     # 400/850
+    assert round(sum(rec["category_value_share"].values()), 6) == 1.0
+
+
+def test_category_value_share_is_zero_for_a_valueless_box():
+    from allocator.box_features import extract_box_features
+
+    lookup = _item_lookup()
+    lookup[1] = {**lookup[1], "price": 0}
+    rec = extract_box_features(
+        box_name="x", allocations={1: 2}, item_lookup=lookup, tier="small",
+        available_tags=_available_tags(), offer_id=1,
+    )
+    assert rec["category_value_share"] == {"fruit": 0.0, "veg": 0.0}
+
+
+def test_a_third_category_is_refused_rather_than_normalised_away():
+    """The pair sums to 1 only while every resolved item is fruit or veg —
+    which is what lets flatten() drop the veg column. A third category is a
+    schema event, not a data point: it needs a third column and a re-derived
+    maxT family. Fail where it is introduced, not silently in the matrix."""
+    from allocator.box_features import extract_box_features
+
+    lookup = _item_lookup()
+    lookup[4] = {**lookup[1], "name": "Mystery Herb", "price": 500,
+                 "category_id": 987654, "fungible_group": None,
+                 "fungible_degree": 0.0}
+    with pytest.raises(ValueError, match="neither CATEGORY_FRUIT"):
+        extract_box_features(
+            box_name="x", allocations={1: 3, 3: 2, 4: 1}, item_lookup=lookup,
+            tier="small", available_tags=_available_tags(), offer_id=1,
+        )
+
+
+def test_a_zero_price_third_category_is_still_refused():
+    """The guard is about the resolved category schema, not value truthiness."""
+    from allocator.box_features import extract_box_features
+
+    lookup = _item_lookup()
+    lookup[4] = {**lookup[1], "name": "Free Mystery Herb", "price": 0,
+                 "category_id": 987654, "fungible_group": None,
+                 "fungible_degree": 0.0}
+    with pytest.raises(ValueError, match="item 4.*category 987654"):
+        extract_box_features(
+            box_name="x", allocations={1: 3, 4: 1}, item_lookup=lookup,
+            tier="small", available_tags=_available_tags(), offer_id=1,
+        )
+
+
+def test_an_unresolved_item_does_not_trigger_the_third_category_guard():
+    """Items absent from item_lookup are skipped before the category check —
+    they contribute to neither total_value nor either numerator, so the sum
+    holds. Only *resolved* items in a third category are an error."""
+    from allocator.box_features import extract_box_features
+
+    rec = extract_box_features(
+        box_name="x", allocations={1: 3, 2: 1, 3: 2, 99: 5},
+        item_lookup=_item_lookup(), tier="small",
+        available_tags=_available_tags(), offer_id=1,
+    )
+    assert round(sum(rec["category_value_share"].values()), 6) == 1.0

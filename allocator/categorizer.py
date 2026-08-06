@@ -14,6 +14,8 @@ from allocator.config import (
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_CLASSIFICATION = ("other", "cooking", "green", "round")
+
 
 def assign_fungible_group(item_name: str) -> tuple[str | None, float]:
     """
@@ -44,7 +46,7 @@ def assign_classification(
             if item_name.startswith(prefix) or item_name.lower().startswith(prefix.lower()):
                 return sub_cat, usage, colour, shape
 
-    fallback = CLASSIFICATION_FALLBACK.get(category_id, ("other", "cooking", "green", "round"))
+    fallback = CLASSIFICATION_FALLBACK.get(category_id, DEFAULT_CLASSIFICATION)
     logger.warning(f"No classification match for {item_name!r} (cat={category_id}), using fallback: {fallback[0]}")
     return fallback
 

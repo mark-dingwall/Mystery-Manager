@@ -84,8 +84,9 @@ def extract_box_features(
         capped_qty = min(qty, item_allowance)
 
         if key not in group_items:
-            group_items[key] = {"load": 0, "degree": degree}
+            group_items[key] = {"load": 0, "raw_load": 0, "degree": degree}
         group_items[key]["load"] += capped_qty
+        group_items[key]["raw_load"] += qty
 
         # Diversity tags
         for dim, attr in [("sub_category", "sub_category"), ("usage", "usage"),
@@ -124,6 +125,62 @@ def extract_box_features(
             ga = GROUP_ALLOWANCES[key].get(tier, gdata["load"])
             group_totals.append([gdata["load"], gdata["degree"], ga])
 
+    # Keyed group loads — additional fields, never replacements. group_totals
+    # stays exactly as rescore_box() consumes it (capped, positional, key-less).
+    # Both dicts are filtered to GROUP_ALLOWANCES' key space, which excludes the
+    # synthetic __item_{id} keys assigned to ungrouped items.
+    raw_group_totals = {
+        key: gdata["raw_load"]
+        for key, gdata in group_items.items()
+        if key in GROUP_ALLOWANCES
+    }
+    capped_group_totals = {
+        key: gdata["load"]
+        for key, gdata in group_items.items()
+        if key in GROUP_ALLOWANCES
+    }
+
+    # Per-category value share, denominated in total_value exactly as specified.
+    # Both keys always present; both 0.0 when the box has no value.
+    # flatten() emits only the fruit column, which is sound *because* the pair
+    # sums to 1 — and that holds only while every resolved item is fruit or veg.
+    # An item in a third category would sit in the denominator while entering
+    # neither numerator, quietly breaking the sum and leaving real signal in a
+    # column that is never emitted. So refuse the box rather than encode it.
+    fruit_value = 0
+    veg_value = 0
+    offending_items: list[tuple[int, object]] = []
+    for item_id, qty in allocations.items():
+        if qty <= 0 or item_id not in item_lookup:
+            continue
+        info = item_lookup[item_id]
+        if info["category_id"] == CATEGORY_FRUIT:
+            fruit_value += info["price"] * qty
+        elif info["category_id"] == CATEGORY_VEGETABLES:
+            veg_value += info["price"] * qty
+        else:
+            offending_items.append((item_id, info["category_id"]))
+    if offending_items:
+        offenders = ", ".join(
+            f"item {item_id} category {category_id}"
+            for item_id, category_id in offending_items
+        )
+        raise ValueError(
+            f"Box {box_name!r} (offer {offer_id}) has resolved positive-quantity "
+            f"{offenders}; category is neither CATEGORY_FRUIT ({CATEGORY_FRUIT}) "
+            f"nor CATEGORY_VEGETABLES ({CATEGORY_VEGETABLES}). category_value_share "
+            "is a two-key contract whose keys must sum to 1; a third category "
+            "needs a third column and a re-derived multiple-testing family. "
+            "Add the category to scoring_config.json and rerun, or exclude the item."
+        )
+
+    category_value_share = {"fruit": 0.0, "veg": 0.0}
+    if total_value > 0:
+        category_value_share = {
+            "fruit": round(fruit_value / total_value, 6),
+            "veg": round(veg_value / total_value, 6),
+        }
+
     # Build dim_ratios and dim_available
     dim_ratios = {}
     dim_available = {}
@@ -151,5 +208,9 @@ def extract_box_features(
         "total_size_points": total_size_points,
         "dim_ratios": {k: round(v, 6) for k, v in dim_ratios.items()},
         "dim_available": dim_available,
+        "raw_group_totals": raw_group_totals,
+        "capped_group_totals": capped_group_totals,
+        "raw_tag_counts": {dim: dict(counts) for dim, counts in tag_counts.items()},
+        "category_value_share": category_value_share,
         "pref_violations": pref_violations,
     }
