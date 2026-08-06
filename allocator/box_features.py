@@ -9,7 +9,12 @@ Hard constraint: no DB imports, no import-time side effects. `allocator.config`
 imports are expected — a feature builder consumes the import-time-frozen config when called.
 """
 
+import hashlib
+import json
 import statistics
+
+import allocator.categorizer as _categorizer
+import allocator.config as _cfg
 
 from allocator.config import (
     BOX_TIERS,
@@ -292,3 +297,58 @@ def flatten(record: dict) -> dict[str, float]:
         )
 
     return {name: columns[name] for name in sorted(columns)}
+
+
+# Enumerated, not described: the guard compares hashes for equality, so the
+# input list must be reproducible from this file alone.
+_HASH_INPUTS = (
+    "BOX_TIERS",
+    "GROUP_ALLOWANCES",
+    "ITEM_CLASSIFICATIONS",
+    "FUNGIBLE_GROUPS",
+    "CLASSIFICATION_FALLBACK",
+    "QUANTITY_CLASSES",
+    "QTY_CLASS_PRICE_THRESHOLDS",
+    "VALUE_SWEET_FROM",
+    "VALUE_SWEET_TO",
+    "VALUE_PENALTY_EXPONENT",
+)
+
+
+def _digest(obj) -> str:
+    """First 16 hex chars of the SHA-256 of a sorted JSON rendering."""
+    payload = json.dumps(obj, sort_keys=True, default=list)
+    return hashlib.sha256(payload.encode()).hexdigest()[:16]
+
+
+def config_hash() -> str:
+    """Stamp for feature files over eleven pinned schema/scoring inputs.
+
+    BOX_TARGET_PCT is represented by BOX_TIERS' derived target_value entries.
+    """
+    inputs = {name: getattr(_cfg, name) for name in _HASH_INPUTS}
+    inputs["DEFAULT_CLASSIFICATION"] = _categorizer.DEFAULT_CLASSIFICATION
+    return _digest(inputs)
+
+
+def config_snapshot() -> dict:
+    """Stamp for scenario files, compared for equality by the ordinal analyser.
+
+    Enumerated rather than derived. The two large classification structures
+    enter as digests to keep the written file readable.
+    """
+    return {
+        "box_tiers": {
+            tier: {"price": entry["price"], "target_value": entry["target_value"]}
+            for tier, entry in _cfg.BOX_TIERS.items()
+        },
+        "box_target_pct": _cfg.BOX_TARGET_PCT,
+        "value_sweet_from": _cfg.VALUE_SWEET_FROM,
+        "value_sweet_to": _cfg.VALUE_SWEET_TO,
+        "value_penalty_exponent": _cfg.VALUE_PENALTY_EXPONENT,
+        "group_allowances": _cfg.GROUP_ALLOWANCES,
+        "quantity_classes": _cfg.QUANTITY_CLASSES,
+        "qty_class_price_thresholds": _cfg.QTY_CLASS_PRICE_THRESHOLDS,
+        "item_classifications_hash": _digest(_cfg.ITEM_CLASSIFICATIONS),
+        "fungible_groups_hash": _digest(_cfg.FUNGIBLE_GROUPS),
+    }

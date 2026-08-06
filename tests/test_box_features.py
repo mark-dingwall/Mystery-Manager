@@ -132,6 +132,12 @@ def _use_synthetic_scoring_config(monkeypatch):
     monkeypatch.setattr(box_features, "CATEGORY_FRUIT", config["category_fruit"])
     monkeypatch.setattr(box_features, "CATEGORY_VEGETABLES", config["category_vegetables"])
     monkeypatch.setattr(box_features, "BOX_TIERS", {"small": {"price": 2000}})
+    monkeypatch.setattr(allocator_config, "BOX_TARGET_PCT", 115)
+    monkeypatch.setattr(allocator_config, "BOX_TIERS", {
+        "small": {"price": 2000, "target_value": 2300},
+        "medium": {"price": 3500, "target_value": 4025},
+        "large": {"price": 5000, "target_value": 5750},
+    })
     monkeypatch.setattr(box_features, "GROUP_ALLOWANCES", config["group_allowances"])
     monkeypatch.setattr(allocator_config, "GROUP_ALLOWANCES", config["group_allowances"])
     classifications = {
@@ -150,6 +156,21 @@ def _use_synthetic_scoring_config(monkeypatch):
     )
     monkeypatch.setattr(allocator_config, "ITEM_CLASSIFICATIONS", classifications)
     monkeypatch.setattr(allocator_config, "CLASSIFICATION_FALLBACK", fallback)
+    monkeypatch.setattr(allocator_config, "FUNGIBLE_GROUPS", {
+        key: (value[0], value[1], value[2] if len(value) > 2 else "portioned")
+        for key, value in config["fungible_groups"].items()
+    })
+    monkeypatch.setattr(
+        allocator_config, "QUANTITY_CLASSES", config["quantity_classes"]
+    )
+    monkeypatch.setattr(
+        allocator_config,
+        "QTY_CLASS_PRICE_THRESHOLDS",
+        config["qty_class_price_thresholds"],
+    )
+    monkeypatch.setattr(allocator_config, "VALUE_SWEET_FROM", 114)
+    monkeypatch.setattr(allocator_config, "VALUE_SWEET_TO", 117)
+    monkeypatch.setattr(allocator_config, "VALUE_PENALTY_EXPONENT", 1.25)
     monkeypatch.setattr(scoring, "FUNGIBLE_GROUPS", config["fungible_groups"])
     monkeypatch.setattr(scoring, "QUANTITY_CLASSES", config["quantity_classes"])
 
@@ -544,3 +565,133 @@ def test_flatten_excludes_config_parameter_columns():
     assert not any(name.startswith("group_totals") for name in names)
     assert not any("allowance" in name for name in names)
     assert not any("degree" in name for name in names)
+
+
+def test_config_hash_is_sixteen_hex_chars_and_stable():
+    from allocator.box_features import config_hash
+
+    h = config_hash()
+    assert len(h) == 16
+    assert all(c in "0123456789abcdef" for c in h)
+    assert h == config_hash()
+
+
+@pytest.mark.parametrize("name", [
+    "BOX_TIERS", "GROUP_ALLOWANCES", "ITEM_CLASSIFICATIONS", "FUNGIBLE_GROUPS",
+    "CLASSIFICATION_FALLBACK", "QUANTITY_CLASSES", "QTY_CLASS_PRICE_THRESHOLDS",
+    "VALUE_SWEET_FROM", "VALUE_SWEET_TO", "VALUE_PENALTY_EXPONENT",
+])
+def test_config_hash_changes_when_any_pinned_input_changes(monkeypatch, name):
+    """All ten allocator.config inputs are load-bearing. QUANTITY_CLASSES and
+    QTY_CLASS_PRICE_THRESHOLDS were the original omission — they determine the
+    item_allowance persisted in every feature record."""
+    import allocator.config as cfg
+    from allocator.box_features import config_hash
+
+    before = config_hash()
+    current = getattr(cfg, name)
+    if isinstance(current, (int, float)):
+        mutated = current + 1
+    else:
+        # The probe key MUST match the existing key type. CLASSIFICATION_FALLBACK
+        # is keyed by integer category IDs (allocator/config.py:207-209); adding a
+        # str key makes json.dumps(..., sort_keys=True) raise
+        # "TypeError: '<' not supported between instances of 'str' and 'int'"
+        # inside _digest, so the test would error rather than assert.
+        sample = next(iter(current))
+        probe = max(current) + 1 if isinstance(sample, int) else "zzz_probe"
+        assert probe not in current
+        mutated = {**current, probe: 1}
+    monkeypatch.setattr(cfg, name, mutated)
+    assert config_hash() != before
+
+
+def test_config_hash_changes_with_canonical_default_classification(monkeypatch):
+    import allocator.categorizer as categorizer
+    from allocator.box_features import config_hash
+
+    before = config_hash()
+    monkeypatch.setattr(
+        categorizer,
+        "DEFAULT_CLASSIFICATION",
+        ("reserved_other", "cooking", "green", "round"),
+    )
+    assert config_hash() != before
+
+
+def test_config_hash_includes_target_percentage_through_box_tiers(monkeypatch):
+    import allocator.config as cfg
+    from allocator.box_features import config_hash
+
+    before = config_hash()
+    tiers = {tier: dict(values) for tier, values in cfg.BOX_TIERS.items()}
+    tiers["small"]["target_value"] += 1
+    monkeypatch.setattr(cfg, "BOX_TIERS", tiers)
+    assert config_hash() != before
+
+
+def test_config_snapshot_has_exactly_the_pinned_keys():
+    from allocator.box_features import config_snapshot
+
+    snap = config_snapshot()
+    assert set(snap) == {
+        "box_tiers", "box_target_pct", "value_sweet_from", "value_sweet_to",
+        "value_penalty_exponent", "group_allowances", "quantity_classes",
+        "qty_class_price_thresholds", "item_classifications_hash",
+        "fungible_groups_hash",
+    }
+
+
+def test_config_snapshot_box_tiers_carry_price_and_target_value():
+    from allocator.box_features import config_snapshot
+    from allocator.config import BOX_TIERS
+
+    snap = config_snapshot()
+    assert set(snap["box_tiers"]) == {"small", "medium", "large"}
+    for tier, entry in snap["box_tiers"].items():
+        assert set(entry) == {"price", "target_value"}
+        assert entry["price"] == BOX_TIERS[tier]["price"]
+        assert entry["target_value"] == BOX_TIERS[tier]["target_value"]
+
+
+def test_config_snapshot_classification_structures_are_digests():
+    from allocator.box_features import config_snapshot
+
+    snap = config_snapshot()
+    for key in ("item_classifications_hash", "fungible_groups_hash"):
+        assert isinstance(snap[key], str)
+        assert len(snap[key]) == 16
+
+
+def test_config_snapshot_is_json_serialisable_and_round_trips():
+    """The generator writes it to a file and the analyser compares the parsed
+    object for equality, so a tuple that survives in-process but becomes a list
+    on reload would make the guard fire on every run."""
+    import json
+
+    from allocator.box_features import config_snapshot
+
+    snap = config_snapshot()
+    assert json.loads(json.dumps(snap, sort_keys=True)) == snap
+
+
+def test_box_target_pct_constant_is_the_only_input_to_box_tiers(monkeypatch):
+    """The loader and snapshot share the same import-time-frozen value."""
+    import allocator.config as cfg
+
+    monkeypatch.setattr(cfg, "BOX_TARGET_PCT", 123)
+    monkeypatch.setenv("BOX_TARGET_PCT", "999")
+    monkeypatch.setenv("BOX_PRICE_SMALL", "1000")
+    tiers = cfg._load_box_tiers()
+    assert tiers["small"]["target_value"] == round(1000 * 123 / 100)
+
+
+def test_config_snapshot_ignores_environment_changes_after_import(monkeypatch):
+    """Never mix a live percentage with import-time-frozen BOX_TIERS."""
+    import allocator.config as cfg
+    from allocator.box_features import config_snapshot
+
+    before = config_snapshot()
+    monkeypatch.setenv("BOX_TARGET_PCT", str(cfg.BOX_TARGET_PCT + 7))
+    assert config_snapshot() == before
+    assert before["box_target_pct"] == cfg.BOX_TARGET_PCT
