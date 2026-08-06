@@ -8,10 +8,15 @@ Config bootstrap strategy:
 - This means `from allocator.config import VALUE_SWEET_FROM` gets test values
 """
 
+import importlib
+from importlib import metadata as importlib_metadata
+from itertools import product
 import json
 import os
 import shutil
 from pathlib import Path
+
+from packaging.version import Version
 
 # ---------------------------------------------------------------------------
 # Module-level env var setup — MUST happen before any allocator import
@@ -249,3 +254,96 @@ def two_box_result(sample_items, make_box, make_result, make_charity):
     ]
     charity = [make_charity()]
     return make_result(items=sample_items, boxes=boxes, charity=charity)
+
+
+# ---------------------------------------------------------------------------
+# Diagnostics dependency gating
+# ---------------------------------------------------------------------------
+#
+# Under `pytest -m diagnostics` a missing dependency must FAIL the run; a skip
+# would let the whole diagnostic suite vanish silently. Outside that selector it
+# skips as normal, so `python3 -m pytest` still passes on a plain checkout.
+
+_STRICT = False
+
+_DIAGNOSTIC_DEPENDENCIES = {
+    # module name: (distribution name, minimum version)
+    "interpret": ("interpret", "0.6.0"),
+    "statsmodels": ("statsmodels", "0.14.0"),
+    "sklearn": ("scikit-learn", "1.3.0"),
+    "numpy": ("numpy", "1.24.0"),
+    "pandas": ("pandas", "2.0.0"),
+    "numexpr": ("numexpr", "2.8.4"),
+    "bottleneck": ("bottleneck", "1.3.6"),
+}
+
+
+def _selects_diagnostics(m: str) -> bool:
+    """True when diagnostics is a positive, satisfiable influence on `m`.
+
+    Compile pytest's marker expression, enumerate truth assignments for every
+    marker name other than diagnostics, and arm strict mode iff at least one
+    assignment makes the expression change from false with diagnostics=False
+    to true with diagnostics=True. This handles conjunctions, exclusions,
+    contradictions and tautologies without inventing a second parser.
+    """
+    if "diagnostics" not in m:
+        return False
+    from _pytest.mark.expression import Expression
+
+    expression = Expression.compile(m)
+    names = {
+        encoded[1:] for encoded in expression._code.co_names
+        if encoded.startswith("$")
+    }
+    if "diagnostics" not in names:
+        return False
+    others = sorted(names - {"diagnostics"})
+    for values in product((False, True), repeat=len(others)):
+        assignment = dict(zip(others, values))
+
+        def selected(diagnostics: bool) -> bool:
+            return expression.evaluate(
+                lambda name: diagnostics if name == "diagnostics" else assignment[name]
+            )
+
+        if not selected(False) and selected(True):
+            return True
+    return False
+
+
+def pytest_configure(config):
+    global _STRICT
+    _STRICT = _selects_diagnostics(config.getoption("-m") or "")
+
+
+def require_dep(name: str):
+    """Import `name` and enforce known floors; skip unless strict mode is armed."""
+    try:
+        module = importlib.import_module(name)
+    except ImportError as exc:
+        message = f"required diagnostic dependency {name!r} is not importable"
+        if _STRICT:
+            raise ImportError(message) from exc
+        pytest.skip(message)
+
+    requirement = _DIAGNOSTIC_DEPENDENCIES.get(name)
+    if requirement is None:
+        return module
+    distribution, minimum = requirement
+    try:
+        installed = importlib_metadata.version(distribution)
+    except importlib_metadata.PackageNotFoundError as exc:
+        message = f"required diagnostic distribution {distribution!r} is absent"
+        if _STRICT:
+            raise ImportError(message) from exc
+        pytest.skip(message)
+    if Version(installed) < Version(minimum):
+        message = (
+            f"required diagnostic dependency {distribution}>={minimum}; "
+            f"found {installed}"
+        )
+        if _STRICT:
+            raise ImportError(message)
+        pytest.skip(message)
+    return module

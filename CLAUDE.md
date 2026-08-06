@@ -44,6 +44,33 @@ python3 -m pytest -k "test_value_penalty"                         # run by name 
 
 Tests use synthetic fixtures (no DB required). See `tests/conftest.py` for factory fixtures and config bootstrap. `tests/fixtures/desirability_items.csv` provides synthetic desirability data for test isolation.
 
+### Diagnostics (isolated dependency stack)
+
+```bash
+pip install --target .venv-diagnostics/lib -r requirements-diagnostics.txt
+PYTHONPATH=.venv-diagnostics/lib python3 scripts/ebm_diagnostic.py
+```
+
+`python3 -m venv` does not work on this machine — `ensurepip` is unavailable and
+`python3.10-venv` is not installed — so `pip install --target` is the documented
+form. If `python3-venv` is installed later, a real virtualenv is preferable and
+`--target` remains a working fallback.
+
+**Diagnostic tests run under their own command, which is the enforcement point:**
+
+```bash
+PYTHONPATH=.venv-diagnostics/lib python3 -m pytest -m diagnostics -W error::pytest.PytestUnhandledThreadExceptionWarning -rs
+# a skipped diagnostics test is a failure of this command, not a pass
+```
+
+Plain `python3 -m pytest` deliberately does **not** enforce this: without the
+isolated stack installed, every diagnostics module skips and the plain command
+still reports green. The `-m diagnostics` form arms `require_dep()`'s strict
+mode, so a missing or below-floor dependency raises instead of skipping. Exit code 5
+(`EXIT_NOTESTSCOLLECTED`) is also a failure of this command — it means the
+diagnostics suite collected nothing, which is the disappearance being guarded
+against.
+
 ### Utility scripts (scripts/)
 
 ```bash
