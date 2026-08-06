@@ -328,7 +328,21 @@ def test_category_value_share_has_exactly_two_keys():
     assert set(rec["category_value_share"]) == {"fruit", "veg"}
     assert rec["category_value_share"]["fruit"] == 0.529412   # (300+150)/850
     assert rec["category_value_share"]["veg"] == 0.470588     # 400/850
-    assert round(sum(rec["category_value_share"].values()), 6) == 1.0
+    assert sum(rec["category_value_share"].values()) == 1.0
+
+
+def test_category_value_share_sums_exactly_for_rounding_edge_case():
+    """Complementary rounded shares must retain the two-key sum invariant."""
+    from allocator.box_features import extract_box_features
+
+    lookup = _item_lookup()
+    lookup[1] = {**lookup[1], "price": 7}
+    lookup[3] = {**lookup[3], "price": 633}
+    rec = extract_box_features(
+        box_name="x", allocations={1: 1, 3: 1}, item_lookup=lookup,
+        tier="small", available_tags=_available_tags(), offer_id=1,
+    )
+    assert sum(rec["category_value_share"].values()) == 1.0
 
 
 def test_category_value_share_is_zero_for_a_valueless_box():
@@ -387,4 +401,4 @@ def test_an_unresolved_item_does_not_trigger_the_third_category_guard():
         item_lookup=_item_lookup(), tier="small",
         available_tags=_available_tags(), offer_id=1,
     )
-    assert round(sum(rec["category_value_share"].values()), 6) == 1.0
+    assert sum(rec["category_value_share"].values()) == 1.0

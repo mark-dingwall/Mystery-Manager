@@ -176,9 +176,10 @@ def extract_box_features(
 
     category_value_share = {"fruit": 0.0, "veg": 0.0}
     if total_value > 0:
+        fruit_share = round(fruit_value / total_value, 6)
         category_value_share = {
-            "fruit": round(fruit_value / total_value, 6),
-            "veg": round(veg_value / total_value, 6),
+            "fruit": fruit_share,
+            "veg": 1.0 - fruit_share,
         }
 
     # Build dim_ratios and dim_available
