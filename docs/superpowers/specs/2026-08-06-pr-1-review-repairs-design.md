@@ -54,4 +54,26 @@ Regression tests cover:
 - an unrelated `ValueError` at the batch extraction boundary propagating instead of being skipped;
 - the existing direct extractor `ValueError` invariant.
 
+## Second review-loop hardening
+
+The final review loop keeps the existing schema and dependency-gate design,
+but closes five fail-open edges:
+
+- `config_snapshot()` returns detached nested data. Mutating a returned stamp
+  cannot alter the live scoring bindings or a previously captured stamp.
+- the diagnostics manifest rejects duplicate canonical distribution names
+  instead of allowing a later, weaker floor to replace an earlier floor;
+- dependency floors prefer the version reported by the imported module and
+  fall back to distribution metadata only when the module exposes no version;
+- `flatten()` rejects a record whose tier is outside the fixed
+  small/medium/large matrix schema instead of emitting three zero value slices;
+- configuration loading rejects equal fruit and vegetable category IDs because
+  the two-category share and preference contracts require distinct identities.
+
+Full numeric validation is deliberately out of scope. The adversarial
+non-finite reproductions pass floats where the public allocation contract
+requires integers; production extraction converts CSV quantities and all price
+sources to integers before calling the extractor. No production source path to
+the reported state was found.
+
 Run the focused box-feature tests first, then the complete pytest suite.
