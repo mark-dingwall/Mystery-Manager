@@ -310,13 +310,18 @@ def _digest(obj) -> str:
     return hashlib.sha256(payload.encode()).hexdigest()[:16]
 
 
+def _ordered_rules(rules: dict) -> list[tuple[object, object]]:
+    """Encode a first-match mapping without losing its insertion order."""
+    return list(rules.items())
+
+
 def _hash_inputs() -> dict:
     """Return the effective schema/scoring inputs used by feature extraction."""
     return {
         "BOX_TIERS": BOX_TIERS,
         "GROUP_ALLOWANCES": GROUP_ALLOWANCES,
-        "ITEM_CLASSIFICATIONS": ITEM_CLASSIFICATIONS,
-        "FUNGIBLE_GROUPS": _scoring.FUNGIBLE_GROUPS,
+        "ITEM_CLASSIFICATIONS": _ordered_rules(ITEM_CLASSIFICATIONS),
+        "FUNGIBLE_GROUPS": _ordered_rules(_scoring.FUNGIBLE_GROUPS),
         "CLASSIFICATION_FALLBACK": CLASSIFICATION_FALLBACK,
         "QUANTITY_CLASSES": _scoring.QUANTITY_CLASSES,
         "QTY_CLASS_PRICE_THRESHOLDS": _scoring.QTY_CLASS_PRICE_THRESHOLDS,
@@ -358,8 +363,8 @@ def config_snapshot() -> dict:
         "group_allowances": GROUP_ALLOWANCES,
         "quantity_classes": _scoring.QUANTITY_CLASSES,
         "qty_class_price_thresholds": _scoring.QTY_CLASS_PRICE_THRESHOLDS,
-        "item_classifications_hash": _digest(ITEM_CLASSIFICATIONS),
-        "fungible_groups_hash": _digest(_scoring.FUNGIBLE_GROUPS),
+        "item_classifications_hash": _digest(_ordered_rules(ITEM_CLASSIFICATIONS)),
+        "fungible_groups_hash": _digest(_ordered_rules(_scoring.FUNGIBLE_GROUPS)),
         "classification_fallback_hash": _digest(CLASSIFICATION_FALLBACK),
         "default_classification_hash": _digest(DEFAULT_CLASSIFICATION),
     }

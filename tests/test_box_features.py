@@ -976,6 +976,42 @@ def test_config_hash_is_sixteen_hex_chars_and_stable():
     assert h == config_hash()
 
 
+@pytest.mark.parametrize(
+    ("owner", "rules"),
+    [
+        (
+            "ITEM_CLASSIFICATIONS",
+            [
+                ("broad", (["Apples -"], "broad", "cooking", "green", "round")),
+                (
+                    "specific",
+                    (["Apples - Royal Gala"], "specific", "snacking", "red", "round"),
+                ),
+            ],
+        ),
+        (
+            "FUNGIBLE_GROUPS",
+            [
+                ("broad", (0.5, ["Apples -"], "cooking_piece")),
+                ("specific", (1.0, ["Apples - Royal Gala"], "snack_piece")),
+            ],
+        ),
+    ],
+)
+def test_first_match_rule_order_changes_hash_and_snapshot(monkeypatch, owner, rules):
+    """Reordering overlapping rules changes classification/group behaviour."""
+    import allocator.box_features as box_features
+    import allocator.strategies._scoring as scoring
+
+    target = scoring if owner == "FUNGIBLE_GROUPS" else box_features
+    monkeypatch.setattr(target, owner, dict(rules))
+    before = (box_features.config_hash(), box_features.config_snapshot())
+
+    monkeypatch.setattr(target, owner, dict(reversed(rules)))
+
+    assert (box_features.config_hash(), box_features.config_snapshot()) != before
+
+
 @pytest.mark.parametrize("name", [
     "BOX_TIERS",
     "GROUP_ALLOWANCES",

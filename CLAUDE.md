@@ -47,13 +47,21 @@ Tests use synthetic fixtures (no DB required). See `tests/conftest.py` for facto
 ### Diagnostics (isolated dependency stack)
 
 ```bash
-pip install --target .venv-diagnostics/lib -r requirements-diagnostics.txt
+python3 -m venv .venv-diagnostics
+.venv-diagnostics/bin/python -m pip install -r requirements.txt -r requirements-diagnostics.txt
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 .venv-diagnostics/bin/python -m pytest -m diagnostics --strict-diagnostics-deps -W error::pytest.PytestUnhandledThreadExceptionWarning -rs
 ```
 
 `python3 -m venv` does not work on this machine — `ensurepip` is unavailable and
-`python3.10-venv` is not installed — so `pip install --target` is the documented
-form. If `python3-venv` is installed later, a real virtualenv is preferable and
-`--target` remains a working fallback.
+`python3.10-venv` is not installed. Until that package is available, use the
+hermetic `--target` fallback below. Python's `-S` flag excludes user and global
+site-packages, while `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1` prevents host-installed
+pytest plugins from entering the run.
+
+```bash
+python3 -m pip install --target .venv-diagnostics/lib -r requirements.txt -r requirements-diagnostics.txt
+PYTHONPATH=.venv-diagnostics/lib PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python3 -S -m pytest -m diagnostics --strict-diagnostics-deps -W error::pytest.PytestUnhandledThreadExceptionWarning -rs
+```
 
 `pytest>=9.0.0` and `packaging>=22` are bootstrap dependencies for diagnostic
 tests, not production runtime dependencies. Under
@@ -63,10 +71,9 @@ libraries remain demand-checked by `require_dep()` when their test modules load.
 
 **Diagnostic tests run under their own command, which is the enforcement point:**
 
-```bash
-PYTHONPATH=.venv-diagnostics/lib python3 -m pytest -m diagnostics --strict-diagnostics-deps -W error::pytest.PytestUnhandledThreadExceptionWarning -rs
-# a skipped diagnostics test is a failure of this command, not a pass
-```
+The checked-in diagnostics dependency test demand-checks every non-bootstrap
+distribution in the manifest at module scope. A skipped diagnostics test is a
+failure of the strict command, not a pass.
 
 Plain `python3 -m pytest` deliberately does **not** enforce this: without the
 isolated stack installed, every diagnostics module skips and the plain command
