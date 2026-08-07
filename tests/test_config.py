@@ -1,5 +1,12 @@
 """Tests for allocator/config.py — detect_pack_size, config loading."""
 
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+
 import pytest
 
 from allocator.config import (
@@ -77,6 +84,52 @@ class TestConfigLoading:
 
         with pytest.raises(ValueError, match="fruit and vegetable category IDs must differ"):
             config._validate_category_ids(7, 7)
+
+    @pytest.mark.parametrize(
+        ("fruit", "vegetables"),
+        [(True, 2), (1, False), (1.0, 2), (1, 2.0), ("1", 2), (1, "2")],
+    )
+    def test_category_ids_must_be_exact_integers(self, fruit, vegetables):
+        import allocator.config as config
+
+        with pytest.raises(ValueError, match="category IDs must be integers"):
+            config._validate_category_ids(fruit, vegetables)
+
+    def test_invalid_category_ids_fail_config_import(self, tmp_path):
+        project_root = Path(__file__).resolve().parent.parent
+        isolated_root = tmp_path / "isolated-project"
+        shutil.copytree(
+            project_root / "allocator",
+            isolated_root / "allocator",
+            ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+        )
+        scoring = json.loads(
+            (project_root / "tests" / "fixtures" / "scoring_config.json").read_text()
+        )
+        scoring["category_vegetables"] = scoring["category_fruit"]
+        (isolated_root / "scoring_config.json").write_text(json.dumps(scoring))
+        shutil.copy2(
+            project_root / "tests" / "fixtures" / "identifiers.json",
+            isolated_root / "identifiers.json",
+        )
+        env = os.environ.copy()
+        env.update({
+            "BOX_PRICE_SMALL": "2000",
+            "BOX_PRICE_MEDIUM": "3500",
+            "BOX_PRICE_LARGE": "5000",
+            "PYTHONPATH": str(isolated_root),
+        })
+
+        proc = subprocess.run(
+            [sys.executable, "-c", "import allocator.config"],
+            cwd=isolated_root,
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+
+        assert proc.returncode != 0
+        assert "fruit and vegetable category IDs must differ" in proc.stderr
 
     def test_diversity_weights_positive(self):
         total = sum(DIVERSITY_WEIGHTS.values())

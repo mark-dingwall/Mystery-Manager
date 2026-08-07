@@ -136,6 +136,8 @@ CHARITY_GIVING_MULTIPLIER = float(os.environ.get("CHARITY_GIVING_MULTIPLIER", "2
 
 # Category IDs
 def _validate_category_ids(fruit: int, vegetables: int) -> None:
+    if type(fruit) is not int or type(vegetables) is not int:
+        raise ValueError("fruit and vegetable category IDs must be integers")
     if fruit == vegetables:
         raise ValueError("fruit and vegetable category IDs must differ")
 

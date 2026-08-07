@@ -76,4 +76,12 @@ requires integers; production extraction converts CSV quantities and all price
 sources to integers before calling the extractor. No production source path to
 the reported state was found.
 
+The follow-up review tightens those same boundaries without widening scope.
+Plain manifest parsing retains the strongest floor when duplicate canonical or
+import-module names appear; strict parsing rejects either collision. Installed
+and running versions that cannot be parsed follow the ordinary skip/strict
+error policy instead of escaping as parser exceptions. Category IDs must be
+exact integers (not booleans, strings, or floats) as well as distinct, and an
+isolated import test proves that validation remains connected to config loading.
+
 Run the focused box-feature tests first, then the complete pytest suite.

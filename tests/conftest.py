@@ -278,6 +278,13 @@ def _canonical_distribution(name: str) -> str:
     return _DISTRIBUTION_SEPARATOR.sub("-", name).lower()
 
 
+def _minimum_key(minimum: str) -> tuple[int, ...]:
+    parts = [int(part) for part in minimum.split(".")]
+    while len(parts) > 1 and parts[-1] == 0:
+        parts.pop()
+    return tuple(parts)
+
+
 def _load_diagnostic_dependencies(
     path: Path = _PROJECT_ROOT / "requirements-diagnostics.txt",
     *,
@@ -313,6 +320,15 @@ def _load_diagnostic_dependencies(
         module = _MODULE_NAME_OVERRIDES.get(
             canonical_distribution, canonical_distribution.replace("-", "_")
         )
+        existing = dependencies.get(module)
+        if existing is not None:
+            if strict:
+                raise ValueError(
+                    f"{path}:{line_number}: duplicate import module {module!r} "
+                    f"for distributions {existing[0]!r} and {distribution!r}"
+                )
+            if _minimum_key(minimum) <= _minimum_key(existing[1]):
+                continue
         dependencies[module] = (distribution, minimum)
     return dependencies
 
@@ -362,18 +378,36 @@ def _require_version(
             f"required diagnostic distribution {distribution!r} is absent", exc
         )
     try:
-        from packaging.version import Version
+        from packaging.version import InvalidVersion, Version
     except ImportError as exc:
         _unavailable("required diagnostic dependency 'packaging' is not importable", exc)
-    if Version(installed) < Version(minimum):
+    minimum_version = Version(minimum)
+    try:
+        installed_version = Version(str(installed))
+    except (InvalidVersion, TypeError) as exc:
+        _unavailable(
+            f"required diagnostic dependency {distribution}>={minimum}; "
+            f"invalid installed distribution version {installed!r}",
+            exc,
+        )
+    if installed_version < minimum_version:
         _unavailable(
             f"required diagnostic dependency {distribution}>={minimum}; found {installed}"
         )
-    if running is not None and Version(running) < Version(minimum):
-        _unavailable(
-            f"required diagnostic dependency {distribution}>={minimum}; "
-            f"running module found {running}"
-        )
+    if running is not None:
+        try:
+            running_version = Version(str(running))
+        except (InvalidVersion, TypeError) as exc:
+            _unavailable(
+                f"required diagnostic dependency {distribution}>={minimum}; "
+                f"invalid running module version {running!r}",
+                exc,
+            )
+        if running_version < minimum_version:
+            _unavailable(
+                f"required diagnostic dependency {distribution}>={minimum}; "
+                f"running module found {running}"
+            )
 
 
 def _running_version(module) -> str | None:

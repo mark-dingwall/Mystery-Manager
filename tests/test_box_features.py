@@ -165,6 +165,27 @@ def test_strict_manifest_rejects_duplicate_canonical_distributions(tmp_path):
         _load_diagnostic_dependencies(manifest, strict=True)
 
 
+def test_plain_manifest_keeps_strongest_canonical_duplicate_floor(tmp_path):
+    from tests.conftest import _load_diagnostic_dependencies
+
+    manifest = tmp_path / "requirements-diagnostics.txt"
+    manifest.write_text("Example_Lib>=999.0\nexample-lib>=1\n")
+
+    assert _load_diagnostic_dependencies(manifest) == {
+        "example_lib": ("Example_Lib", "999.0")
+    }
+
+
+def test_strict_manifest_rejects_import_module_alias_collisions(tmp_path):
+    from tests.conftest import _load_diagnostic_dependencies
+
+    manifest = tmp_path / "requirements-diagnostics.txt"
+    manifest.write_text("scikit-learn>=999\nsklearn>=1\n")
+
+    with pytest.raises(ValueError, match="duplicate import module.*sklearn"):
+        _load_diagnostic_dependencies(manifest, strict=True)
+
+
 def test_production_manifest_declares_every_diagnostic_module():
     from tests.conftest import _DIAGNOSTIC_DEPENDENCIES
 
@@ -362,6 +383,50 @@ def test_require_dep_rejects_below_floor_running_module_despite_newer_metadata(
     monkeypatch.setattr(conftest.importlib_metadata, "version", lambda name: "99.0.0")
 
     with pytest.raises(ImportError, match="running module.*found 0.1.0"):
+        require_dep("sklearn")
+
+
+def test_require_dep_accepts_running_version_object_at_floor(monkeypatch):
+    from packaging.version import Version
+    from tests import conftest
+
+    class SklearnAtFloor:
+        __version__ = Version("1.3.0")
+
+    monkeypatch.setattr(conftest.importlib, "import_module", lambda name: SklearnAtFloor())
+    monkeypatch.setattr(conftest.importlib_metadata, "version", lambda name: "1.3.0")
+
+    assert isinstance(require_dep("sklearn"), SklearnAtFloor)
+
+
+def test_require_dep_skips_invalid_running_version_in_plain_mode(monkeypatch):
+    from tests import conftest
+
+    class InvalidSklearn:
+        __version__ = "not-a-version"
+
+    monkeypatch.setattr(conftest.importlib, "import_module", lambda name: InvalidSklearn())
+    monkeypatch.setattr(conftest.importlib_metadata, "version", lambda name: "99.0.0")
+
+    with pytest.raises(BaseException) as exc:
+        require_dep("sklearn")
+    assert exc.typename == "Skipped"
+    assert "running module version" in str(exc.value)
+
+
+def test_require_dep_rejects_invalid_installed_version_in_strict_mode(monkeypatch):
+    from tests import conftest
+
+    class CurrentSklearn:
+        __version__ = "99.0.0"
+
+    monkeypatch.setattr(conftest, "_STRICT", True)
+    monkeypatch.setattr(conftest.importlib, "import_module", lambda name: CurrentSklearn())
+    monkeypatch.setattr(
+        conftest.importlib_metadata, "version", lambda name: "not-a-version"
+    )
+
+    with pytest.raises(ImportError, match="installed distribution version"):
         require_dep("sklearn")
 
 
@@ -1273,9 +1338,18 @@ def test_config_snapshot_is_json_serialisable_and_round_trips():
     assert json.loads(json.dumps(snap, sort_keys=True)) == snap
 
 
-def test_config_snapshot_detaches_mutable_scoring_inputs():
+def test_config_snapshot_detaches_mutable_scoring_inputs(monkeypatch):
+    import copy
+
     import allocator.box_features as box_features
     import allocator.strategies._scoring as scoring
+
+    group_allowances = copy.deepcopy(box_features.GROUP_ALLOWANCES)
+    quantity_classes = copy.deepcopy(scoring.QUANTITY_CLASSES)
+    thresholds = copy.deepcopy(scoring.QTY_CLASS_PRICE_THRESHOLDS)
+    monkeypatch.setattr(box_features, "GROUP_ALLOWANCES", group_allowances)
+    monkeypatch.setattr(scoring, "QUANTITY_CLASSES", quantity_classes)
+    monkeypatch.setattr(scoring, "QTY_CLASS_PRICE_THRESHOLDS", thresholds)
 
     before_hash = box_features.config_hash()
     before_snapshot = box_features.config_snapshot()
@@ -1297,6 +1371,14 @@ def test_config_snapshot_detaches_mutable_scoring_inputs():
     assert returned["group_allowances"] is not box_features.GROUP_ALLOWANCES
     assert returned["quantity_classes"] is not scoring.QUANTITY_CLASSES
     assert returned["qty_class_price_thresholds"] is not scoring.QTY_CLASS_PRICE_THRESHOLDS
+
+    box_features.GROUP_ALLOWANCES[group][group_tier] += 200
+    scoring.QUANTITY_CLASSES[quantity_class][quantity_tier] += 200
+    scoring.QTY_CLASS_PRICE_THRESHOLDS[threshold] += 200
+    assert before_snapshot != box_features.config_snapshot()
+    assert before_snapshot["group_allowances"][group][group_tier] + 200 == (
+        box_features.GROUP_ALLOWANCES[group][group_tier]
+    )
 
 
 def test_box_target_pct_constant_is_the_only_input_to_box_tiers(monkeypatch):
