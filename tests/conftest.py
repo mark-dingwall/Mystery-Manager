@@ -267,6 +267,7 @@ _STRICT = False
 
 _MODULE_NAME_OVERRIDES = {"scikit-learn": "sklearn"}
 _BOOTSTRAP_DEPENDENCIES = ("packaging", "pytest")
+_MISSING_VERSION = object()
 _DIAGNOSTIC_REQUIREMENT = re.compile(
     r"^(?P<distribution>[A-Za-z0-9][A-Za-z0-9._-]*)"
     r">=(?P<minimum>[0-9]+(?:\.[0-9]+)*)$"
@@ -369,7 +370,7 @@ def _require_version(
     distribution: str,
     minimum: str,
     *,
-    running: str | None = None,
+    running=_MISSING_VERSION,
 ) -> None:
     try:
         installed = importlib_metadata.version(distribution)
@@ -394,7 +395,7 @@ def _require_version(
         _unavailable(
             f"required diagnostic dependency {distribution}>={minimum}; found {installed}"
         )
-    if running is not None:
+    if running is not _MISSING_VERSION:
         try:
             running_version = Version(str(running))
         except (InvalidVersion, TypeError) as exc:
@@ -410,8 +411,8 @@ def _require_version(
             )
 
 
-def _running_version(module) -> str | None:
-    return getattr(module, "__version__", None)
+def _running_version(module):
+    return getattr(module, "__version__", _MISSING_VERSION)
 
 
 def _validate_bootstrap_dependencies(

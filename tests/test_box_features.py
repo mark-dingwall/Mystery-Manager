@@ -414,6 +414,22 @@ def test_require_dep_skips_invalid_running_version_in_plain_mode(monkeypatch):
     assert "running module version" in str(exc.value)
 
 
+def test_require_dep_rejects_explicit_none_running_version_in_strict_mode(
+    monkeypatch,
+):
+    from tests import conftest
+
+    class InvalidSklearn:
+        __version__ = None
+
+    monkeypatch.setattr(conftest, "_STRICT", True)
+    monkeypatch.setattr(conftest.importlib, "import_module", lambda name: InvalidSklearn())
+    monkeypatch.setattr(conftest.importlib_metadata, "version", lambda name: "99.0.0")
+
+    with pytest.raises(ImportError, match="invalid running module version None"):
+        require_dep("sklearn")
+
+
 def test_require_dep_rejects_invalid_installed_version_in_strict_mode(monkeypatch):
     from tests import conftest
 

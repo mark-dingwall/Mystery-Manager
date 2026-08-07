@@ -83,5 +83,7 @@ and running versions that cannot be parsed follow the ordinary skip/strict
 error policy instead of escaping as parser exceptions. Category IDs must be
 exact integers (not booleans, strings, or floats) as well as distinct, and an
 isolated import test proves that validation remains connected to config loading.
+An explicit module `__version__ = None` is malformed; only a genuinely absent
+version attribute falls back to distribution metadata alone.
 
 Run the focused box-feature tests first, then the complete pytest suite.
