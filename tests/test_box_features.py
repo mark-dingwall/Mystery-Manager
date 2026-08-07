@@ -155,6 +155,16 @@ def test_dependency_floors_are_loaded_from_the_manifest(tmp_path):
     }
 
 
+def test_strict_manifest_rejects_duplicate_canonical_distributions(tmp_path):
+    from tests.conftest import _load_diagnostic_dependencies
+
+    manifest = tmp_path / "requirements-diagnostics.txt"
+    manifest.write_text("numpy>=999\nNumPy>=1\n")
+
+    with pytest.raises(ValueError, match="duplicate distribution.*NumPy"):
+        _load_diagnostic_dependencies(manifest, strict=True)
+
+
 def test_production_manifest_declares_every_diagnostic_module():
     from tests.conftest import _DIAGNOSTIC_DEPENDENCIES
 
@@ -336,6 +346,22 @@ def test_require_dep_raises_when_below_floor_and_strict(monkeypatch):
     monkeypatch.setattr(conftest.importlib, "import_module", lambda name: object())
     monkeypatch.setattr(conftest.importlib_metadata, "version", lambda name: "1.2.9")
     with pytest.raises(ImportError, match="scikit-learn>=1.3.0"):
+        require_dep("sklearn")
+
+
+def test_require_dep_rejects_below_floor_running_module_despite_newer_metadata(
+    monkeypatch,
+):
+    from tests import conftest
+
+    class StaleSklearn:
+        __version__ = "0.1.0"
+
+    monkeypatch.setattr(conftest, "_STRICT", True)
+    monkeypatch.setattr(conftest.importlib, "import_module", lambda name: StaleSklearn())
+    monkeypatch.setattr(conftest.importlib_metadata, "version", lambda name: "99.0.0")
+
+    with pytest.raises(ImportError, match="running module.*found 0.1.0"):
         require_dep("sklearn")
 
 
@@ -925,6 +951,16 @@ def test_flatten_tier_slices_value_pct():
     assert "value_pct" not in cols
 
 
+def test_flatten_rejects_tier_outside_fixed_matrix_schema():
+    from allocator.box_features import flatten
+
+    record = _record()
+    record["tier"] = "extra_large"
+
+    with pytest.raises(ValueError, match="unsupported tier.*extra_large"):
+        flatten(record)
+
+
 def test_flatten_price_stats_are_item_weighted():
     import statistics
 
@@ -1235,6 +1271,32 @@ def test_config_snapshot_is_json_serialisable_and_round_trips():
 
     snap = config_snapshot()
     assert json.loads(json.dumps(snap, sort_keys=True)) == snap
+
+
+def test_config_snapshot_detaches_mutable_scoring_inputs():
+    import allocator.box_features as box_features
+    import allocator.strategies._scoring as scoring
+
+    before_hash = box_features.config_hash()
+    before_snapshot = box_features.config_snapshot()
+    returned = box_features.config_snapshot()
+
+    group = next(iter(returned["group_allowances"]))
+    group_tier = next(iter(returned["group_allowances"][group]))
+    returned["group_allowances"][group][group_tier] += 100
+
+    quantity_class = next(iter(returned["quantity_classes"]))
+    quantity_tier = next(iter(returned["quantity_classes"][quantity_class]))
+    returned["quantity_classes"][quantity_class][quantity_tier] += 100
+
+    threshold = next(iter(returned["qty_class_price_thresholds"]))
+    returned["qty_class_price_thresholds"][threshold] += 100
+
+    assert box_features.config_hash() == before_hash
+    assert box_features.config_snapshot() == before_snapshot
+    assert returned["group_allowances"] is not box_features.GROUP_ALLOWANCES
+    assert returned["quantity_classes"] is not scoring.QUANTITY_CLASSES
+    assert returned["qty_class_price_thresholds"] is not scoring.QTY_CLASS_PRICE_THRESHOLDS
 
 
 def test_box_target_pct_constant_is_the_only_input_to_box_tiers(monkeypatch):

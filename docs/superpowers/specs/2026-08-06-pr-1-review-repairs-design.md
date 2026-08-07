@@ -63,8 +63,8 @@ but closes five fail-open edges:
   cannot alter the live scoring bindings or a previously captured stamp.
 - the diagnostics manifest rejects duplicate canonical distribution names
   instead of allowing a later, weaker floor to replace an earlier floor;
-- dependency floors prefer the version reported by the imported module and
-  fall back to distribution metadata only when the module exposes no version;
+- dependency floors always validate installed distribution metadata and also
+  validate the version reported by the imported module when it exposes one;
 - `flatten()` rejects a record whose tier is outside the fixed
   small/medium/large matrix schema instead of emitting three zero value slices;
 - configuration loading rejects equal fruit and vegetable category IDs because

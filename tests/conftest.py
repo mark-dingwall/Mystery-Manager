@@ -267,11 +267,15 @@ _STRICT = False
 
 _MODULE_NAME_OVERRIDES = {"scikit-learn": "sklearn"}
 _BOOTSTRAP_DEPENDENCIES = ("packaging", "pytest")
-_RUNNING_VERSION_MODULES = {"pytest"}
 _DIAGNOSTIC_REQUIREMENT = re.compile(
     r"^(?P<distribution>[A-Za-z0-9][A-Za-z0-9._-]*)"
     r">=(?P<minimum>[0-9]+(?:\.[0-9]+)*)$"
 )
+_DISTRIBUTION_SEPARATOR = re.compile(r"[-_.]+")
+
+
+def _canonical_distribution(name: str) -> str:
+    return _DISTRIBUTION_SEPARATOR.sub("-", name).lower()
 
 
 def _load_diagnostic_dependencies(
@@ -280,6 +284,7 @@ def _load_diagnostic_dependencies(
     strict: bool = False,
 ) -> dict[str, tuple[str, str]]:
     dependencies = {}
+    seen_distributions: set[str] = set()
     try:
         lines = path.read_text().splitlines()
     except FileNotFoundError as exc:
@@ -299,8 +304,14 @@ def _load_diagnostic_dependencies(
             continue
         distribution = match.group("distribution")
         minimum = match.group("minimum")
+        canonical_distribution = _canonical_distribution(distribution)
+        if strict and canonical_distribution in seen_distributions:
+            raise ValueError(
+                f"{path}:{line_number}: duplicate distribution {distribution!r}"
+            )
+        seen_distributions.add(canonical_distribution)
         module = _MODULE_NAME_OVERRIDES.get(
-            distribution, distribution.replace("-", "_")
+            canonical_distribution, canonical_distribution.replace("-", "_")
         )
         dependencies[module] = (distribution, minimum)
     return dependencies
@@ -342,15 +353,14 @@ def _require_version(
     distribution: str,
     minimum: str,
     *,
-    installed: str | None = None,
+    running: str | None = None,
 ) -> None:
-    if installed is None:
-        try:
-            installed = importlib_metadata.version(distribution)
-        except importlib_metadata.PackageNotFoundError as exc:
-            _unavailable(
-                f"required diagnostic distribution {distribution!r} is absent", exc
-            )
+    try:
+        installed = importlib_metadata.version(distribution)
+    except importlib_metadata.PackageNotFoundError as exc:
+        _unavailable(
+            f"required diagnostic distribution {distribution!r} is absent", exc
+        )
     try:
         from packaging.version import Version
     except ImportError as exc:
@@ -359,10 +369,15 @@ def _require_version(
         _unavailable(
             f"required diagnostic dependency {distribution}>={minimum}; found {installed}"
         )
+    if running is not None and Version(running) < Version(minimum):
+        _unavailable(
+            f"required diagnostic dependency {distribution}>={minimum}; "
+            f"running module found {running}"
+        )
 
 
-def _running_version(name: str, module) -> str | None:
-    return module.__version__ if name in _RUNNING_VERSION_MODULES else None
+def _running_version(module) -> str | None:
+    return getattr(module, "__version__", None)
 
 
 def _validate_bootstrap_dependencies(
@@ -377,8 +392,8 @@ def _validate_bootstrap_dependencies(
         try:
             module = importlib.import_module(name)
             distribution, minimum = requirement
-            installed = _running_version(name, module)
-            _require_version(distribution, minimum, installed=installed)
+            running = _running_version(module)
+            _require_version(distribution, minimum, running=running)
         except ImportError as exc:
             raise pytest.UsageError(str(exc)) from exc
 
@@ -396,6 +411,6 @@ def require_dep(name: str):
     if requirement is None:
         return module
     distribution, minimum = requirement
-    installed = _running_version(name, module)
-    _require_version(distribution, minimum, installed=installed)
+    running = _running_version(module)
+    _require_version(distribution, minimum, running=running)
     return module

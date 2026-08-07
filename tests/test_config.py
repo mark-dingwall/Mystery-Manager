@@ -72,6 +72,12 @@ class TestConfigLoading:
         assert isinstance(CATEGORY_FRUIT, int)
         assert isinstance(CATEGORY_VEGETABLES, int)
 
+    def test_category_ids_must_be_distinct(self):
+        import allocator.config as config
+
+        with pytest.raises(ValueError, match="fruit and vegetable category IDs must differ"):
+            config._validate_category_ids(7, 7)
+
     def test_diversity_weights_positive(self):
         total = sum(DIVERSITY_WEIGHTS.values())
         assert total > 0.0

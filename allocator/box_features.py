@@ -9,6 +9,7 @@ Hard constraint: no DB imports, no import-time side effects. `allocator.config`
 imports are expected — a feature builder consumes the import-time-frozen config when called.
 """
 
+import copy
 import hashlib
 import json
 import statistics
@@ -31,6 +32,7 @@ from allocator.strategies import _scoring
 
 
 _DIMENSIONS = ("sub_category", "usage", "colour", "shape")
+_TIERS = ("small", "medium", "large")
 
 
 class UnsupportedCategoryError(ValueError):
@@ -259,7 +261,10 @@ def flatten(record: dict) -> dict[str, float]:
     """
     columns: dict[str, float] = {}
 
-    for tier in ("small", "medium", "large"):
+    if record["tier"] not in _TIERS:
+        raise ValueError(f"unsupported tier for feature matrix: {record['tier']!r}")
+
+    for tier in _TIERS:
         columns[f"value_pct_{tier}"] = (
             float(record["value_pct"]) if record["tier"] == tier else 0.0
         )
@@ -360,9 +365,11 @@ def config_snapshot() -> dict:
         "value_sweet_from": VALUE_SWEET_FROM,
         "value_sweet_to": VALUE_SWEET_TO,
         "value_penalty_exponent": VALUE_PENALTY_EXPONENT,
-        "group_allowances": GROUP_ALLOWANCES,
-        "quantity_classes": _scoring.QUANTITY_CLASSES,
-        "qty_class_price_thresholds": _scoring.QTY_CLASS_PRICE_THRESHOLDS,
+        "group_allowances": copy.deepcopy(GROUP_ALLOWANCES),
+        "quantity_classes": copy.deepcopy(_scoring.QUANTITY_CLASSES),
+        "qty_class_price_thresholds": copy.deepcopy(
+            _scoring.QTY_CLASS_PRICE_THRESHOLDS
+        ),
         "item_classifications_hash": _digest(_ordered_rules(ITEM_CLASSIFICATIONS)),
         "fungible_groups_hash": _digest(_ordered_rules(_scoring.FUNGIBLE_GROUPS)),
         "classification_fallback_hash": _digest(CLASSIFICATION_FALLBACK),

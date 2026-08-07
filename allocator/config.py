@@ -135,8 +135,14 @@ CHARITY_BASE_PERCENT = float(os.environ.get("CHARITY_BASE_PERCENT", "0.0"))
 CHARITY_GIVING_MULTIPLIER = float(os.environ.get("CHARITY_GIVING_MULTIPLIER", "2.0"))
 
 # Category IDs
+def _validate_category_ids(fruit: int, vegetables: int) -> None:
+    if fruit == vegetables:
+        raise ValueError("fruit and vegetable category IDs must differ")
+
+
 CATEGORY_FRUIT = _SCORING["category_fruit"]
 CATEGORY_VEGETABLES = _SCORING["category_vegetables"]
+_validate_category_ids(CATEGORY_FRUIT, CATEGORY_VEGETABLES)
 
 # Structured preference keywords
 PREFERENCE_FRUIT_ONLY = _SCORING["preference_fruit_only"]
