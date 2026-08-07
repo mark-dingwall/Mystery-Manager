@@ -1,2 +1,4 @@
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+strict_markers = true
+markers = ["diagnostics: requires requirements-diagnostics.txt"]

@@ -44,6 +44,47 @@ python3 -m pytest -k "test_value_penalty"                         # run by name 
 
 Tests use synthetic fixtures (no DB required). See `tests/conftest.py` for factory fixtures and config bootstrap. `tests/fixtures/desirability_items.csv` provides synthetic desirability data for test isolation.
 
+### Diagnostics (isolated dependency stack)
+
+```bash
+python3 -m venv .venv-diagnostics
+.venv-diagnostics/bin/python -m pip install -r requirements.txt -r requirements-diagnostics.txt
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 .venv-diagnostics/bin/python -m pytest -m diagnostics --strict-diagnostics-deps -W error::pytest.PytestUnhandledThreadExceptionWarning -rs
+```
+
+`python3 -m venv` does not work on this machine — `ensurepip` is unavailable and
+`python3.10-venv` is not installed. Until that package is available, use the
+hermetic `--target` fallback below. Python's `-S` flag excludes user and global
+site-packages, while `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1` prevents host-installed
+pytest plugins from entering the run.
+
+```bash
+python3 -m pip install --target .venv-diagnostics/lib -r requirements.txt -r requirements-diagnostics.txt
+PYTHONPATH=.venv-diagnostics/lib PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python3 -S -m pytest -m diagnostics --strict-diagnostics-deps -W error::pytest.PytestUnhandledThreadExceptionWarning -rs
+```
+
+`pytest>=9.0.0` and `packaging>=22` are bootstrap dependencies for diagnostic
+tests, not production runtime dependencies. Under
+`--strict-diagnostics-deps`, pytest validates `packaging` and the running
+pytest's `__version__` against those floors before collection. Other diagnostic
+libraries remain demand-checked by `require_dep()` when their test modules load.
+
+**Diagnostic tests run under their own command, which is the enforcement point:**
+
+The checked-in diagnostics dependency test demand-checks every non-bootstrap
+distribution in the manifest at module scope. A skipped diagnostics test is a
+failure of the strict command, not a pass.
+
+Plain `python3 -m pytest` deliberately does **not** enforce this: without the
+isolated stack installed, every diagnostics module skips and the plain command
+still reports green. The `-m diagnostics` expression selects the diagnostic
+tests only; `--strict-diagnostics-deps` independently arms `require_dep()` so a
+missing or below-floor dependency raises instead of skipping. Malformed
+bootstrap requirements, or missing or below-floor bootstrap dependencies, fail
+startup with a concise pytest usage error. Exit code 5 (`EXIT_NOTESTSCOLLECTED`)
+is also a failure of this command — it means the diagnostics suite collected
+nothing, which is the disappearance being guarded against.
+
 ### Utility scripts (scripts/)
 
 ```bash
@@ -131,6 +172,7 @@ To add a baseline benchmark: create `allocator/strategies/my_strat.py` with a `r
 
 - **`strategies/`** — pluggable allocation strategies. `__init__.py` has the registry; `ilp_optimal.py` is the canonical strategy; `deal_topup.py` is a baseline. `_scoring.py` provides shared penalty functions used by strategies and compare.py. `_helpers.py` has shared constraint checks and diversity scoring.
 - **`tuning.py`** — pure re-scoring module for parameter tuning. Precomputed box features + params dict → composite score. No DB imports, no config imports, no side effects. Used by `scripts/tune_scoring.py`.
+- **`box_features.py`** — pure box-feature extraction (relocated from `scripts/extract_features.py`), plus the four contracts downstream diagnostics compare for equality: `tag_vocabulary()`, `flatten()`, `config_hash()`, and the exact 14-key `config_snapshot()`. No DB imports, no import-time side effects.
 - **`models.py`** — `Item`, `MysteryBox`, `CharityBox`, `AllocationResult`, `ExclusionRule`. All prices in cents.
 - **`config.py`** — tier definitions (from `.env`), identifier sets (from `identifiers.json`), scoring/classification config (from `scoring_config.json`, gitignored). Exposes `BOX_TIERS`, `FUNGIBLE_GROUPS`, `ITEM_CLASSIFICATIONS`, and composite scoring constants (full model in `docs/SCORING.md`).
 - **`desirability.py`** — item desirability scores from historical packing (used by `scripts/analyze_desirability.py`, not a scoring dimension). Loads `diagnostics/desirability_items.csv`, applies Bayesian shrinkage, normalises to [0,1].

@@ -8,8 +8,11 @@ Config bootstrap strategy:
 - This means `from allocator.config import VALUE_SWEET_FROM` gets test values
 """
 
+import importlib
+from importlib import metadata as importlib_metadata
 import json
 import os
+import re
 import shutil
 from pathlib import Path
 
@@ -249,3 +252,200 @@ def two_box_result(sample_items, make_box, make_result, make_charity):
     ]
     charity = [make_charity()]
     return make_result(items=sample_items, boxes=boxes, charity=charity)
+
+
+# ---------------------------------------------------------------------------
+# Diagnostics dependency gating
+# ---------------------------------------------------------------------------
+#
+# Under ``--strict-diagnostics-deps`` a missing dependency must FAIL the run; a
+# skip would let the whole diagnostic suite vanish silently. Outside explicit
+# strict mode it skips normally, so plain pytest still passes on a checkout that
+# does not have the isolated diagnostics stack installed.
+
+_STRICT = False
+
+_MODULE_NAME_OVERRIDES = {"scikit-learn": "sklearn"}
+_BOOTSTRAP_DEPENDENCIES = ("packaging", "pytest")
+_MISSING_VERSION = object()
+_DIAGNOSTIC_REQUIREMENT = re.compile(
+    r"^(?P<distribution>[A-Za-z0-9][A-Za-z0-9._-]*)"
+    r">=(?P<minimum>[0-9]+(?:\.[0-9]+)*)$"
+)
+_DISTRIBUTION_SEPARATOR = re.compile(r"[-_.]+")
+
+
+def _canonical_distribution(name: str) -> str:
+    return _DISTRIBUTION_SEPARATOR.sub("-", name).lower()
+
+
+def _minimum_key(minimum: str) -> tuple[int, ...]:
+    parts = [int(part) for part in minimum.split(".")]
+    while len(parts) > 1 and parts[-1] == 0:
+        parts.pop()
+    return tuple(parts)
+
+
+def _load_diagnostic_dependencies(
+    path: Path = _PROJECT_ROOT / "requirements-diagnostics.txt",
+    *,
+    strict: bool = False,
+) -> dict[str, tuple[str, str]]:
+    dependencies = {}
+    seen_distributions: set[str] = set()
+    try:
+        lines = path.read_text().splitlines()
+    except FileNotFoundError as exc:
+        if strict:
+            raise ValueError(f"{path} does not exist") from exc
+        return {}
+    for line_number, raw_line in enumerate(lines, 1):
+        line = raw_line.partition("#")[0].strip()
+        if not line:
+            continue
+        match = _DIAGNOSTIC_REQUIREMENT.fullmatch(line)
+        if match is None:
+            if strict:
+                raise ValueError(
+                    f"{path}:{line_number}: expected distribution>=minimum"
+                )
+            continue
+        distribution = match.group("distribution")
+        minimum = match.group("minimum")
+        canonical_distribution = _canonical_distribution(distribution)
+        if strict and canonical_distribution in seen_distributions:
+            raise ValueError(
+                f"{path}:{line_number}: duplicate distribution {distribution!r}"
+            )
+        seen_distributions.add(canonical_distribution)
+        module = _MODULE_NAME_OVERRIDES.get(
+            canonical_distribution, canonical_distribution.replace("-", "_")
+        )
+        existing = dependencies.get(module)
+        if existing is not None:
+            if strict:
+                raise ValueError(
+                    f"{path}:{line_number}: duplicate import module {module!r} "
+                    f"for distributions {existing[0]!r} and {distribution!r}"
+                )
+            if _minimum_key(minimum) <= _minimum_key(existing[1]):
+                continue
+        dependencies[module] = (distribution, minimum)
+    return dependencies
+
+
+_DIAGNOSTIC_DEPENDENCIES = _load_diagnostic_dependencies()
+
+
+def pytest_addoption(parser):
+    diagnostics = parser.getgroup("diagnostics")
+    diagnostics.addoption(
+        "--strict-diagnostics-deps",
+        action="store_true",
+        default=False,
+        help="fail collection when a diagnostic dependency is absent or too old",
+    )
+
+
+def pytest_configure(config):
+    global _STRICT
+    _STRICT = config.getoption("--strict-diagnostics-deps")
+    if _STRICT:
+        try:
+            dependencies = _load_diagnostic_dependencies(
+                _PROJECT_ROOT / "requirements-diagnostics.txt", strict=True
+            )
+        except ValueError as exc:
+            raise pytest.UsageError(str(exc)) from exc
+        _validate_bootstrap_dependencies(dependencies)
+
+
+def _unavailable(message: str, cause: BaseException | None = None):
+    if _STRICT:
+        raise ImportError(message) from cause
+    pytest.skip(message, allow_module_level=True)
+
+
+def _require_version(
+    distribution: str,
+    minimum: str,
+    *,
+    running=_MISSING_VERSION,
+) -> None:
+    try:
+        installed = importlib_metadata.version(distribution)
+    except importlib_metadata.PackageNotFoundError as exc:
+        _unavailable(
+            f"required diagnostic distribution {distribution!r} is absent", exc
+        )
+    try:
+        from packaging.version import InvalidVersion, Version
+    except ImportError as exc:
+        _unavailable("required diagnostic dependency 'packaging' is not importable", exc)
+    minimum_version = Version(minimum)
+    try:
+        installed_version = Version(str(installed))
+    except (InvalidVersion, TypeError) as exc:
+        _unavailable(
+            f"required diagnostic dependency {distribution}>={minimum}; "
+            f"invalid installed distribution version {installed!r}",
+            exc,
+        )
+    if installed_version < minimum_version:
+        _unavailable(
+            f"required diagnostic dependency {distribution}>={minimum}; found {installed}"
+        )
+    if running is not _MISSING_VERSION:
+        try:
+            running_version = Version(str(running))
+        except (InvalidVersion, TypeError) as exc:
+            _unavailable(
+                f"required diagnostic dependency {distribution}>={minimum}; "
+                f"invalid running module version {running!r}",
+                exc,
+            )
+        if running_version < minimum_version:
+            _unavailable(
+                f"required diagnostic dependency {distribution}>={minimum}; "
+                f"running module found {running}"
+            )
+
+
+def _running_version(module):
+    return getattr(module, "__version__", _MISSING_VERSION)
+
+
+def _validate_bootstrap_dependencies(
+    dependencies: dict[str, tuple[str, str]],
+) -> None:
+    for name in _BOOTSTRAP_DEPENDENCIES:
+        requirement = dependencies.get(name)
+        if requirement is None:
+            raise pytest.UsageError(
+                f"bootstrap dependency {name!r} is missing from the requirements-diagnostics.txt manifest"
+            )
+        try:
+            module = importlib.import_module(name)
+            distribution, minimum = requirement
+            running = _running_version(module)
+            _require_version(distribution, minimum, running=running)
+        except ImportError as exc:
+            raise pytest.UsageError(str(exc)) from exc
+
+
+def require_dep(name: str):
+    """Import `name` and enforce its manifest floor when one is declared."""
+    try:
+        module = importlib.import_module(name)
+    except ImportError as exc:
+        _unavailable(
+            f"required diagnostic dependency {name!r} is not importable", exc
+        )
+
+    requirement = _DIAGNOSTIC_DEPENDENCIES.get(name)
+    if requirement is None:
+        return module
+    distribution, minimum = requirement
+    running = _running_version(module)
+    _require_version(distribution, minimum, running=running)
+    return module

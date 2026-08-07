@@ -30,6 +30,7 @@ __pycache__/
 *.pyc
 .pytest_cache/
 pytest-of-*/
+.venv-diagnostics/
 
 # Claude Code local settings
 .claude/

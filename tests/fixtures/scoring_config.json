@@ -1,4 +1,14 @@
 {
+  "test_only": {
+    "box_prices": {"small": 1733, "medium": 2867, "large": 4099},
+    "box_target_pct": 108,
+    "value_band": {
+      "sweet_from": 101,
+      "sweet_to": 106,
+      "penalty_exponent": 1.6
+    }
+  },
+
   "category_fruit": 10,
   "category_vegetables": 20,
 

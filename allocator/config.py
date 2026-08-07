@@ -21,6 +21,9 @@ def detect_pack_size(name: str) -> int:
 
 
 # Box size tiers (all values in cents, loaded from .env)
+BOX_TARGET_PCT = int(os.environ.get("BOX_TARGET_PCT", "115"))
+
+
 def _load_box_tiers() -> dict:
     """Build BOX_TIERS from environment variables."""
     missing = [v for v in ("BOX_PRICE_SMALL", "BOX_PRICE_MEDIUM", "BOX_PRICE_LARGE")
@@ -30,7 +33,7 @@ def _load_box_tiers() -> dict:
             f"Missing required pricing env vars: {', '.join(missing)}. "
             "Copy .env.example to .env and fill in the real values."
         )
-    target_pct = int(os.environ.get("BOX_TARGET_PCT", "115")) / 100
+    target_pct = BOX_TARGET_PCT / 100
     tiers = {}
     for size, env_key in [("small", "BOX_PRICE_SMALL"),
                           ("medium", "BOX_PRICE_MEDIUM"),
@@ -132,8 +135,16 @@ CHARITY_BASE_PERCENT = float(os.environ.get("CHARITY_BASE_PERCENT", "0.0"))
 CHARITY_GIVING_MULTIPLIER = float(os.environ.get("CHARITY_GIVING_MULTIPLIER", "2.0"))
 
 # Category IDs
+def _validate_category_ids(fruit: int, vegetables: int) -> None:
+    if type(fruit) is not int or type(vegetables) is not int:
+        raise ValueError("fruit and vegetable category IDs must be integers")
+    if fruit == vegetables:
+        raise ValueError("fruit and vegetable category IDs must differ")
+
+
 CATEGORY_FRUIT = _SCORING["category_fruit"]
 CATEGORY_VEGETABLES = _SCORING["category_vegetables"]
+_validate_category_ids(CATEGORY_FRUIT, CATEGORY_VEGETABLES)
 
 # Structured preference keywords
 PREFERENCE_FRUIT_ONLY = _SCORING["preference_fruit_only"]
@@ -208,4 +219,3 @@ CLASSIFICATION_FALLBACK = {
     CATEGORY_FRUIT:      tuple(_cf["fruit"]),
     CATEGORY_VEGETABLES: tuple(_cf["veg"]),
 }
-
