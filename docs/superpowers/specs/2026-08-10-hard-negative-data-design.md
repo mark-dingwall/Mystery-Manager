@@ -35,8 +35,9 @@ empirical value-band result, and to corroborate or challenge EBM hypotheses.
 - No EBM model, InterpretML import, model finding, or score/config change.
 - No ordinal-regression code or survey-file change.
 - No item/config-drift audit; that remains a separate backlog item.
-- No changes to `scripts/extract_features.py`'s tuning output or its use of
-  XLSX pack-price overrides.
+- No behavior change to `scripts/extract_features.py`'s tuning output or its
+  use of XLSX pack-price overrides. PR #2 may refactor its synthetic builder
+  behind a backwards-compatible interface so the diagnostic path can reuse it.
 - No Tier B–D inputs. The generator supports only the existing Tier-A offer set
   (64–109); `--only-offers` must resolve to a non-empty subset of that set.
   Historical name matching and its `include_deleted=True` fallback are not part
@@ -123,12 +124,19 @@ population, tier, and preference distribution.
 ### Generator
 
 Create `scripts/generate_hard_negatives.py` as the only DB-backed entry point.
-It accepts the existing Tier-A offer range syntax, `--workers`, `--out`, and
-`--report-out`. Defaults are: all Tier-A offers for `--only-offers`, `4` for
-`--workers`, `diagnostics/hard_negatives.json` for `--out`, and
+It accepts the existing Tier-A offer range syntax, `--out`, and `--report-out`.
+Defaults are: all Tier-A offers for `--only-offers`,
+`diagnostics/hard_negatives.json` for `--out`, and
 `diagnostics/hard_negatives_report.json` for `--report-out`.
 
-Each top-level, picklable per-offer worker:
+The MVP is deliberately sequential: it processes offers in resolved ID order
+in the one parent process and does not create a `ProcessPoolExecutor` or a
+`ThreadPoolExecutor`. That avoids forking a live Paramiko/MySQL tunnel and lets
+the existing process-scoped `TunnelManager` reuse one SSH tunnel. Runtime is a
+one-off diagnostic cost; parallel generation can be considered only after this
+path has a measured need.
+
+Each per-offer pass:
 
 1. Validates that the offer is Tier A, then resolves the source XLSX and DB item
    lookup using the production non-deleted lookup path.
@@ -146,6 +154,13 @@ Each top-level, picklable per-offer worker:
    preference distribution exactly; synthetics are not an unrestricted,
    class-specific denominator population.
 
+The per-box synthetic path extends the existing `generate_synthetic_boxes()`
+behind a backwards-compatible interface: shared allocation construction remains
+in one builder, while a template supplies the target box name, tier, preference,
+and tag variant. Its existing no-template call retains the current five
+synthetics-per-tier behavior used by `tuning_features.json`; the diagnostic path
+passes selected-box templates and does not copy the synthetic recipes.
+
 The output therefore supports the three later EBM rungs:
 
 | Rung | Positive source | Negative sources |
@@ -160,12 +175,20 @@ a systematic class marker, and it predates the PR #1 feature schema.
 
 ## Artifact and validation rules
 
-`allocator.box_features` defines and exports `FEATURE_SCHEMA_VERSION = 2`; the
-generator stamps that constant rather than an unowned literal. The usable
+PR #2 adds and exports `FEATURE_SCHEMA_VERSION = 2` from
+`allocator.box_features`; the generator stamps that constant rather than an
+unowned literal. The usable
 artifact has that PR #1 schema version, the current `config_hash`, and a
 separate `roster_config_hash` over `PER_OFFER_BOX_SIZE_OVERRIDES`. The separate
 roster hash preserves PR #1's documented 13-input feature hash while detecting
 changes to the generator's tier-correction input.
+
+`roster_config_hash` is the first 16 hexadecimal characters of SHA-256 over the
+UTF-8 bytes of a canonical JSON rendering of
+`PER_OFFER_BOX_SIZE_OVERRIDES` (`sort_keys=True`, compact separators). It is
+computed in `allocator.hard_negative_roster`, which is the sole consumer of
+that override mapping; PR #3 recomputes it through that module rather than
+reimplementing the digest.
 
 Its required top-level shape is:
 
@@ -180,8 +203,8 @@ counts. `attrition` contains only numeric sample-loss accounting: roster
 intersection counts, solver-status counts, and paired-cell/final counts for
 **each** EBM rung. `exclusions` is the per-offer event list, with a reason and
 detail for each skipped offer or discarded source. `run_metadata` records the
-requested offer IDs, resolved offer IDs, worker count, and deterministic
-generator version.
+requested offer IDs, resolved offer IDs, sequential execution mode, and
+deterministic generator version.
 
 Each rung's coverage is computed after matching its manual and negative rows by
 `(offer_id, tier)` and dropping cells that lack either class. A loose count of
@@ -198,6 +221,18 @@ all manual rows must never satisfy any rung's gate.
    roster config hash; each must match its live value. Every required family is
    represented: `manual`, at least one `synth_*` source, all three named
    `baseline_*` sources, and `ilp_optimal`.
+
+No fill-to-target floor applies to baseline or synthetic records. They are
+deliberately negative classes, so an underfilled but feature-extractable box is
+valid evidence rather than a corrupt row. Empty/unextractable boxes contribute
+no record and therefore reduce the relevant paired-rung coverage; the existing
+all-rung gates catch any material loss.
+
+All three rung gates are deliberately mandatory. `hard_negatives.json` is one
+complete input contract for PR #3, not a partial artifact whose missing rung is
+discovered only after model code is written. A failure report preserves the
+usable synth/baseline counts for diagnosis without weakening the primary
+manual-vs-ILP evidence requirement.
 
 On a failed gate, the command exits non-zero, does not create or replace the
 normal artifact, and writes the audit-only report. If a prior successful normal
@@ -226,8 +261,8 @@ avoid a class-specific row loss. Unexpected worker or code errors also fail the
 run and identify the exception; they must not be silently converted into
 ordinary attrition.
 
-Workers are collected in deterministic offer order. Records have a stable
-sorting order before output so changing `--workers` cannot change the artifact.
+Offers, strategies, selected boxes, and output records are iterated in stable
+sorted order before atomic output.
 
 ## Testing and verification
 
@@ -243,7 +278,9 @@ The test suite remains DB-free and uses synthetic fixtures only. It covers:
   attrition/exclusion separation, feature/roster config stamps, and Tier-A-only
   argument validation;
 - failure reports and atomic non-emission when any validation gate fails;
-- deterministic aggregation order and unexpected-worker-error reporting.
+- preservation of the existing no-template synthetic output and deterministic
+  selected-template output; and
+- sequential aggregation order and unexpected per-offer error reporting.
 
 Operator validation, with live DB access, runs first on an explicit offer subset
 and then across Tier A. The review checks the attrition report, roster mismatch
