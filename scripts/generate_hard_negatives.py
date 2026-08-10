@@ -632,9 +632,10 @@ def process_offer(offer_id: int) -> OfferOutcome:
     try:
         for csv_name, box in selected:
             manual_allocations = {
-                item_id: allocations[csv_name]
+                item_id: int(quantity)
                 for item_id, allocations in historical_allocations.items()
                 if csv_name in allocations
+                and (quantity := allocations[csv_name]) > 0
             }
             extract_and_append(box, manual_allocations, "manual")
 

@@ -95,6 +95,7 @@ def _items_by_value(item_lookup: dict[int, dict]) -> list[tuple[int, dict]]:
 def _fill_to_target(items: list[tuple[int, dict]], target_value: int,
                      rng: Random | None = None) -> dict[int, int]:
     """Greedily fill allocations to reach target_value."""
+    items = [(item_id, info) for item_id, info in items if info["price"] > 0]
     allocs: dict[int, int] = {}
     current = 0
     if rng:
@@ -123,7 +124,10 @@ def _synthetic_allocations(
     item_lookup: dict[int, dict], tier: str, rng: Random,
 ) -> list[tuple[str, str, dict[int, int]]]:
     """Return source, legacy name fragment, and allocations for applicable recipes."""
-    sorted_items = _items_by_value(item_lookup)
+    priced_lookup = {
+        item_id: info for item_id, info in item_lookup.items() if info["price"] > 0
+    }
+    sorted_items = _items_by_value(priced_lookup)
     if not sorted_items:
         return []
 
@@ -142,7 +146,7 @@ def _synthetic_allocations(
 
     # 3. Over-fungible: max items from largest fungible groups
     fg_items: dict[str, list] = {}
-    for iid, info in item_lookup.items():
+    for iid, info in priced_lookup.items():
         fg = info.get("fungible_group")
         if fg:
             fg_items.setdefault(fg, []).append((iid, info))
@@ -223,11 +227,12 @@ def generate_synthetic_boxes(
             rng = Random(f"{offer_id}:{template.box_name.casefold()}:{template.tier}")
             allowed_lookup = {
                 item_id: info for item_id, info in item_lookup.items()
-                if _matches_preference(info, template.preference)
+                if _matches_preference(info, template.preference) and info["price"] > 0
             }
             if not allowed_lookup:
                 raise EmptyPreferenceItemPoolError(
-                    f"{template.box_name!r} has no items for {template.preference!r}"
+                    f"{template.box_name!r} has no positive-priced items "
+                    f"for {template.preference!r}"
                 )
             for source, _fragment, allocations in _synthetic_allocations(
                 allowed_lookup, template.tier, rng

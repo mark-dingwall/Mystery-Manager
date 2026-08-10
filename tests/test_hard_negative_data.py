@@ -135,6 +135,19 @@ def test_correct_box_tiers_rejects_casefolded_override_collisions(make_box, monk
         roster.correct_box_tiers(80, [make_box(name="case@example.com", tier="medium")])
 
 
+def test_correct_box_tiers_rejects_invalid_applicable_override(make_box, monkeypatch):
+    import pytest
+    import allocator.hard_negative_roster as roster
+
+    monkeypatch.setattr(
+        roster, "PER_OFFER_BOX_SIZE_OVERRIDES", {"80": {"box@example.com": "tiny"}}
+    )
+    with pytest.raises(ValueError, match="invalid tier override"):
+        roster.correct_box_tiers(
+            80, [make_box(name="BOX@example.com", tier="medium")]
+        )
+
+
 def test_roster_hash_uses_shared_feature_digest(monkeypatch):
     import allocator.hard_negative_roster as roster
     from allocator.box_features import stable_hash
@@ -235,6 +248,36 @@ def test_synthetic_recipe_is_absent_when_its_required_fungible_group_is_missing(
     assert {source for source, _fragment, _allocations in recipes} == {
         "synth_monoculture", "synth_random", "synth_value_low", "synth_value_high",
     }
+
+
+def test_synthetic_recipes_ignore_zero_priced_items():
+    from random import Random
+
+    from scripts.extract_features import _synthetic_allocations
+
+    recipes = _synthetic_allocations(
+        {
+            1: {"price": 0, "fungible_group": "free"},
+            2: {"price": 100, "fungible_group": "paid"},
+        },
+        "small",
+        Random(1),
+    )
+    assert recipes
+    assert all(1 not in allocations for _source, _fragment, allocations in recipes)
+
+
+def test_selected_synthetic_template_rejects_free_only_pool():
+    import pytest
+    from allocator.config import CATEGORY_FRUIT
+    from scripts.extract_features import (
+        EmptyPreferenceItemPoolError, SyntheticTemplate, generate_synthetic_boxes,
+    )
+
+    lookup = {1: {"price": 0, "category_id": CATEGORY_FRUIT}}
+    template = SyntheticTemplate("fruit@example.com", "small", "fruit_only", {})
+    with pytest.raises(EmptyPreferenceItemPoolError, match="positive-priced"):
+        generate_synthetic_boxes(80, lookup, {}, templates=[template])
 
 
 def test_selected_synthetic_template_rejects_an_empty_preference_pool():
@@ -791,7 +834,7 @@ def test_process_offer_uses_only_the_selected_customer_roster(
     monkeypatch.setattr(
         compare,
         "load_historical_csv",
-        lambda _offer_id: (raw_csv_names, {1: {csv_name: 1}}),
+        lambda _offer_id: (raw_csv_names, {1: {csv_name: 1.0}}),
     )
     monkeypatch.setattr(
         allocator_module,
@@ -828,6 +871,7 @@ def test_process_offer_uses_only_the_selected_customer_roster(
         "greedy-best-fit",
     ]
     assert manual_inputs == [(db_name, {1: 1})]
+    assert type(manual_inputs[0][1][1]) is int
     assert outcome.exclusion is None
     assert outcome.error is None
     assert outcome.roster_entry == {

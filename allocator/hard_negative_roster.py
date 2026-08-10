@@ -52,7 +52,12 @@ def correct_box_tiers(offer_id: int, boxes: Sequence[MysteryBox]) -> list[Myster
     for box in corrected_boxes:
         original_override_name = override_names.get(box.name.casefold())
         tier = overrides.get(original_override_name) if original_override_name else None
-        if tier in BOX_TIERS:
+        if original_override_name:
+            if tier not in BOX_TIERS:
+                raise ValueError(
+                    f"invalid tier override for offer {offer_id}, "
+                    f"{original_override_name!r}: {tier!r}"
+                )
             box.tier = tier
             box.target_value = BOX_TIERS[tier]["target_value"]
     return sorted(
