@@ -107,7 +107,10 @@ side effects.
   box-tier resolution layers are keyed by standalone CSV names and cannot be
   reached safely from email-named DB boxes.
 - `intersect_roster(csv_box_names, db_box_names)` case-normalises names and
-  returns retained email matches plus CSV-only and DB-only differences.
+  returns retained email matches plus CSV-only and DB-only differences. A
+  duplicate identity within either source after case-normalisation is ambiguous:
+  it must never be silently de-duplicated and excludes the offer with an
+  `ambiguous_roster_identity` event.
 
 The manual class contains only the CSV/DB email intersection. Standalone CSV
 names have no reliable email bridge, and their preferences cannot be resolved
@@ -254,15 +257,16 @@ counts.
 
 Offer-level eligibility is atomic across source families. A missing XLSX, no
 item lookup, empty CSV/DB email-roster intersection, non-optimal ILP status, or
-an unsupported category excludes the entire offer from manual, baseline, ILP,
-and synthetic records (any provisional records are discarded). An unsupported
-category means `extract_box_features()` raised `UnsupportedCategoryError`
-because a positive-quantity resolved item is neither the configured fruit nor
-vegetable category. A non-empty roster difference by itself is audit-only: the
-generator retains and uses the non-empty intersection, while `roster_check`
-reports its CSV-only and DB-only identities. Unexpected worker or code errors
-also fail the run and identify the exception; they must not be silently
-converted into ordinary attrition.
+an unsupported category, or an ambiguous case-normalised roster identity
+excludes the entire offer from manual, baseline, ILP, and synthetic records (any
+provisional records are discarded). An unsupported category means
+`extract_box_features()` raised `UnsupportedCategoryError` because a
+positive-quantity resolved item is neither the configured fruit nor vegetable
+category. A non-empty roster difference by itself is audit-only: the generator
+retains and uses the non-empty intersection, while `roster_check` reports its
+CSV-only and DB-only identities. Unexpected worker or code errors also fail the
+run and identify the exception; they must not be silently converted into ordinary
+attrition.
 
 Offers, strategies, selected boxes, and output records are iterated in stable
 sorted order before atomic output.

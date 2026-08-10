@@ -19,6 +19,7 @@
 - Preserve config_hash()'s thirteen input contract. Promote its existing digest behavior to public stable_hash() and call it from roster_config_hash(); do not create a second JSON/hash recipe.
 - Export FEATURE_SCHEMA_VERSION = 2. Rebuild manual rows with plain DB prices, never XLSX pack-price overrides.
 - A non-empty CSV-only/DB-only roster difference is audit-only. Missing XLSX/historical CSV/item lookup, empty roster intersection, non-optimal ILP, or UnsupportedCategoryError excludes the whole offer from every family.
+- A duplicate CSV or DB identity after case-normalisation is ambiguous, never silently de-duplicated, and excludes that whole offer as `ambiguous_roster_identity`.
 - Only the solution status "Optimal Solution Found" admits an ILP row. "Solution Found" and both fallback labels are non-optimal.
 - Do not impose a fill floor on baseline or synthetic records. Empty/unextractable individual boxes reduce paired coverage instead.
 - A normal artifact is all-or-nothing: each rung requires at least 150 paired manual rows across 20 offers. Failure never replaces --out and always writes an audit report.
@@ -144,6 +145,17 @@ def test_import_fallback_records_its_distinct_provenance(monkeypatch, make_resul
     result = make_result()
     ilp.run(result)
     assert result.solver_status == "FallbackImportError"
+
+
+def test_ilp_no_work_keeps_the_existing_early_return(monkeypatch, make_result):
+    import allocator.strategies.ilp_optimal as ilp
+
+    result = make_result()
+    result.boxes = []
+    called = []
+    monkeypatch.setattr(ilp, "_solve_ilp", lambda *_args: called.append(True))
+    ilp.run(result)
+    assert called == []
 ~~~
 
 Append to tests/test_box_features.py:
@@ -232,16 +244,21 @@ Modify run() in this order:
     except ImportError:
         result.solver_status = "FallbackImportError"
         from allocator.strategies import FALLBACK_STRATEGY, get_strategy
+        logger.warning(f"PuLP not installed, falling back to {FALLBACK_STRATEGY}")
         get_strategy(FALLBACK_STRATEGY)(result)
+        return
+
+    if not result.boxes or not result.items:
         return
 
     try:
         _solve_ilp(result, pulp)
-    except Exception:
+    except Exception as exc:
+        from allocator.strategies import FALLBACK_STRATEGY, get_strategy
+        logger.warning(f"ILP solver failed ({exc}), falling back to {FALLBACK_STRATEGY}")
         for box in result.boxes:
             box.allocations.clear()
         _record_fallback_solver_error(result)
-        from allocator.strategies import FALLBACK_STRATEGY, get_strategy
         get_strategy(FALLBACK_STRATEGY)(result)
 ~~~
 
@@ -297,6 +314,8 @@ class RosterIntersection:
     csv_only: tuple[str, ...]
     db_only: tuple[str, ...]
 
+class AmbiguousRosterIdentityError(ValueError): pass
+
 def correct_box_tiers(offer_id: int, boxes: Sequence[MysteryBox]) -> list[MysteryBox]: pass
 def intersect_roster(csv_box_names: Iterable[str], db_box_names: Iterable[str]) -> RosterIntersection: pass
 def roster_config_hash() -> str: pass
@@ -305,6 +324,9 @@ def roster_config_hash() -> str: pass
 RosterMatch preserves both names: csv_name retrieves manual allocations from the
 historical row map, while db_name retrieves the canonical email, preference, and
 corrected tier. Output is ordered by casefolded identity for deterministic JSON.
+Each source must be one-to-one under that identity: a duplicate (including a
+case-only duplicate) raises `AmbiguousRosterIdentityError` rather than causing a
+dictionary overwrite and an incorrectly selected box.
 
 - [ ] **Step 1: Write failing roster and import-boundary tests**
 
@@ -331,25 +353,39 @@ def test_correct_box_tiers_copies_refreshes_and_resorts(make_box, monkeypatch):
     assert corrected[1].target_value == BOX_TIERS["small"]["target_value"]
 
 
-def test_intersect_roster_retains_csv_and_db_spelling_case_insensitively():
+def test_intersect_roster_retains_spelling_and_sorts_casefolded_identities():
     from allocator.hard_negative_roster import RosterMatch, intersect_roster
 
     intersection = intersect_roster(
-        ["Karen@Example.com", "Standalone Name", "csv-only@example.com"],
-        ["karen@example.com", "db-only@example.com"],
+        ["z@example.com", "C-only", "a@example.com", "B-only"],
+        ["d-only", "A@example.com", "Z@example.com"],
     )
     assert intersection.matches == (
-        RosterMatch(csv_name="Karen@Example.com", db_name="karen@example.com"),
+        RosterMatch(csv_name="a@example.com", db_name="A@example.com"),
+        RosterMatch(csv_name="z@example.com", db_name="Z@example.com"),
     )
-    assert intersection.csv_only == ("Standalone Name", "csv-only@example.com")
-    assert intersection.db_only == ("db-only@example.com",)
+    assert intersection.csv_only == ("B-only", "C-only")
+    assert intersection.db_only == ("d-only",)
+
+
+def test_intersect_roster_rejects_casefold_collisions():
+    import pytest
+    from allocator.hard_negative_roster import (
+        AmbiguousRosterIdentityError, intersect_roster,
+    )
+
+    with pytest.raises(AmbiguousRosterIdentityError, match="case-normalized"):
+        intersect_roster(["Case@Example.com", "case@example.com"], [])
 
 
 def test_roster_hash_uses_shared_feature_digest(monkeypatch):
     import allocator.hard_negative_roster as roster
     from allocator.box_features import stable_hash
 
-    mapping = {"80": {"a@example.com": "small"}}
+    mapping = {
+        "80": {"a@example.com": "small"},
+        "110": {"not-selected@example.com": "medium"},
+    }
     monkeypatch.setattr(roster, "PER_OFFER_BOX_SIZE_OVERRIDES", mapping)
     assert roster.roster_config_hash() == stable_hash(mapping)
 ~~~
@@ -389,14 +425,27 @@ def correct_box_tiers(offer_id: int, boxes: Sequence[MysteryBox]) -> list[Myster
 
 
 def roster_config_hash() -> str:
+    # Stamp the complete source mapping; irrelevant changes only conservatively
+    # invalidate an artifact and avoid a second, Tier-A-specific hash contract.
     return stable_hash(PER_OFFER_BOX_SIZE_OVERRIDES)
 ~~~
 
-For intersect_roster(), build CSV and DB maps keyed by name.casefold(), take the
-shared keys for RosterMatch objects, and report the non-shared original names as
-CSV-only and DB-only. Do not call infer_box_tier: its CSV/summary/name-matching
+For intersect_roster(), first build one-to-one CSV and DB maps keyed by
+`name.casefold()`. If a map would contain a second entry under the same key,
+raise `AmbiguousRosterIdentityError` with the source, normalised identity, and
+both original names. Otherwise, construct matches and each difference by sorted
+casefolded keys, preserving the original spelling in every `RosterMatch` and
+difference tuple. Do not call infer_box_tier: its CSV/summary/name-matching
 layers do not safely apply to DB email boxes. Do not reject a non-empty
 difference: the generator must preserve a non-empty valid intersection.
+
+`PER_OFFER_BOX_SIZE_OVERRIDES` is shared historical configuration. Some current
+entries (offers 65 and 67) are standalone CSV labels, not DB emails, so they
+cannot safely match the email-named `MysteryBox` objects and remain inapplicable
+here. `correct_box_tiers()` deliberately uses exact DB-email keys only; it must
+not add historical name matching. `roster_config_hash()` deliberately stamps the
+full mapping, rather than a Tier-A projection: a non-Tier-A edit may cause a
+harmless conservative regeneration but can never make an artifact stale.
 
 - [ ] **Step 4: Verify this slice**
 
@@ -640,6 +689,24 @@ def test_paired_coverage_drops_unmatched_manual_cells():
     }
 
 
+def test_preference_tags_and_ilp_admission_are_exact():
+    from scripts.generate_hard_negatives import admits_to_ilp_class, tags_for_preference
+
+    variants = {
+        "all": {"marker": {"all"}},
+        "fruit_only": {"marker": {"fruit"}},
+        "veg_only": {"marker": {"veg"}},
+    }
+    assert tags_for_preference(None, variants) is variants["all"]
+    assert tags_for_preference("fruit_only", variants) is variants["fruit_only"]
+    assert tags_for_preference("veg_only", variants) is variants["veg_only"]
+    assert tags_for_preference("unrecognised", variants) is variants["all"]
+    assert admits_to_ilp_class("Optimal Solution Found")
+    assert not admits_to_ilp_class("Solution Found")
+    assert not admits_to_ilp_class("FallbackSolverError")
+    assert not admits_to_ilp_class(None)
+
+
 def test_validation_rejects_nonoptimal_ilp_and_missing_baseline_source():
     from scripts.generate_hard_negatives import validation_failures
 
@@ -733,7 +800,19 @@ Expected: ModuleNotFoundError for scripts.generate_hard_negatives.
 Create scripts/generate_hard_negatives.py with only stdlib,
 allocator.box_features, and allocator.hard_negative_roster imports at module
 scope. Its stdlib imports include argparse, Callable, Counter, dataclass, json,
-os, Path, Sequence, tempfile, and copy. Define the three rungs as:
+os, Path, Sequence, tempfile, and copy. Import the roster names needed by both
+pure assembly and runtime processing here:
+
+~~~python
+from allocator.hard_negative_roster import (
+    AmbiguousRosterIdentityError,
+    correct_box_tiers,
+    intersect_roster,
+    roster_config_hash,
+)
+~~~
+
+Define the three rungs as:
 
 ~~~python
 RUNG_NEGATIVE_SELECTORS = {
@@ -769,6 +848,14 @@ def paired_rung_coverage(records, negative_selector):
         "offers": len({r["offer_id"] for r in paired_manual}),
     }
 ~~~
+
+`tags_for_preference()` returns `variants["fruit_only"]` or
+`variants["veg_only"]` for those exact preferences; `None` and any unexpected
+value return `variants["all"]`, matching `parse_preference()`'s unrestricted
+fallback. It returns the selected variant itself, never a merged tag set.
+`admits_to_ilp_class()` is exactly `status == ADMITTING_ILP_STATUS`; use it for
+both ILP admission and the ILP-status validation gate so no near-optimal or
+fallback status can leak into the ILP class.
 
 validation_failures() returns every failure, rather than stopping at the first:
 
@@ -858,6 +945,7 @@ class OfferOutcome:
     exclusion: dict | None = None
     error: dict | None = None
 
+def empty_roster_entry(offer_id: int) -> dict: pass
 def process_offer(offer_id: int) -> OfferOutcome: pass
 def execute(
     offer_ids: list[int],
@@ -874,7 +962,10 @@ def main(argv: Sequence[str] | None = None) -> int: pass
 execute() is the DB-free orchestration seam: tests supply a fake process_one.
 process_offer() is the sole function that imports DB-backed code. main() resolves
 offers, processes them in sorted order, and calls execute() directly; it does not
-submit anything to an executor.
+submit anything to an executor. `empty_roster_entry()` returns exactly
+`{"offer_id": offer_id, "csv_only": [], "db_only": [], "selected_count": 0}`;
+process_offer() creates it before its first early-exit condition and returns that
+same complete shape for every exclusion path.
 
 - [ ] **Step 1: Write failing orchestration tests**
 
@@ -916,6 +1007,14 @@ def test_execute_discards_every_source_for_nonoptimal_offer(tmp_path):
     assert report["source_counts"] == {}
 
 
+def test_empty_roster_entry_keeps_early_exclusions_aggregateable():
+    from scripts.generate_hard_negatives import empty_roster_entry
+
+    assert empty_roster_entry(64) == {
+        "offer_id": 64, "csv_only": [], "db_only": [], "selected_count": 0,
+    }
+
+
 def test_generator_module_import_does_not_import_compare_or_db():
     import os
     import subprocess
@@ -955,7 +1054,8 @@ from scripts.extract_features import SyntheticTemplate, generate_synthetic_boxes
 
 Perform this exact sequence for every offer:
 
-1. Resolve xlsx_path = compare._find_xlsx_path(offer_id). If absent, return a
+1. Start with `roster_entry = empty_roster_entry(offer_id)`. Resolve
+   xlsx_path = compare._find_xlsx_path(offer_id). If absent, return a
    missing_xlsx exclusion and no records. Use this and every DB lookup through
    the existing production non-deleted path; do not add historical name matching
    or call fetch_offer_parts_by_name(include_deleted=True).
@@ -965,8 +1065,11 @@ Perform this exact sequence for every offer:
    missing_historical_csv.
 3. Build db_boxes = correct_box_tiers(offer_id, build_boxes_from_db(offer_id)).
    Intersect its email names with CSV names. Put CSV-only, DB-only, and selected
-   count in roster_entry. If there are no matches, return
-   empty_roster_intersection; a non-empty difference continues normally.
+   count in roster_entry. Catch `AmbiguousRosterIdentityError` here and return an
+   `ambiguous_roster_identity` exclusion whose detail is its message. If there
+   are no matches, return empty_roster_intersection; a non-empty difference
+   continues normally. Every later early exclusion returns this complete
+   roster_entry rather than `{}` or `None`.
 4. Build selected boxes in RosterMatch order. Retain the pair of csv_name and a
    copied DB box so manual reconstruction uses the real historical column while
    allocation uses DB tier/preference.
