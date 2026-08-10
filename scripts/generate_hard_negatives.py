@@ -18,8 +18,10 @@ import sys
 import tempfile
 from typing import Literal
 
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
 if __package__ in (None, ""):
-    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 from allocator.box_features import FEATURE_SCHEMA_VERSION, config_hash
 from allocator.config import (
@@ -815,12 +817,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--out",
         type=Path,
-        default=Path("diagnostics/hard_negatives.json"),
+        default=PROJECT_ROOT / "diagnostics" / "hard_negatives.json",
     )
     parser.add_argument(
         "--report-out",
         type=Path,
-        default=Path("diagnostics/hard_negatives_report.json"),
+        default=PROJECT_ROOT / "diagnostics" / "hard_negatives_report.json",
     )
     return parser
 

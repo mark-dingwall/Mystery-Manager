@@ -777,6 +777,15 @@ def test_generator_parser_exposes_only_mvp_options():
     assert "--workers" not in options
 
 
+def test_generator_defaults_use_repository_diagnostics_directory():
+    from scripts.generate_hard_negatives import build_parser
+
+    root = Path(__file__).resolve().parent.parent
+    args = build_parser().parse_args([])
+    assert args.out == root / "diagnostics" / "hard_negatives.json"
+    assert args.report_out == root / "diagnostics" / "hard_negatives_report.json"
+
+
 def test_process_offer_uses_only_the_selected_customer_roster(
     monkeypatch, make_box, tmp_path
 ):
