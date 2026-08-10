@@ -98,6 +98,8 @@ class AllocationResult:
     charity: list[CharityBox]
     stock: dict[int, int]  # item_id -> qty (leftover for next week)
     items: dict[int, Item]  # item_id -> Item (reference)
+    # None means ilp-optimal was never invoked for this result.
+    solver_status: str | None = None
 
     def box_value(self, box: MysteryBox) -> int:
         """Compute total allocated value for a box."""
