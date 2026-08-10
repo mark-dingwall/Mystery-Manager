@@ -198,3 +198,75 @@ def test_hard_negative_roster_imports_from_isolated_root_without_db(tmp_path):
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "ok" in proc.stdout
+
+
+def test_selected_synthetic_template_keeps_box_tier_and_tag_denominator():
+    from allocator.config import CATEGORY_FRUIT, CATEGORY_VEGETABLES
+    from scripts.extract_features import SyntheticTemplate, generate_synthetic_boxes
+
+    lookup = {
+        1: {"name": "Apple", "price": 100, "category_id": CATEGORY_FRUIT, "fungible_group": "apple",
+            "fungible_degree": 0.7, "sub_category": "pome", "usage": "snacking",
+            "colour": "red", "shape": "round", "size": 1},
+        2: {"name": "Carrot", "price": 100, "category_id": CATEGORY_VEGETABLES, "fungible_group": None,
+            "fungible_degree": 0.0, "sub_category": "root", "usage": "cooking",
+            "colour": "orange", "shape": "long", "size": 1},
+    }
+    tags = {"sub_category": {"pome"}, "usage": {"snacking"},
+            "colour": {"red"}, "shape": {"round"}}
+    template = SyntheticTemplate("fruit@example.com", "small", "fruit_only", tags)
+
+    records = generate_synthetic_boxes(80, lookup, tags, templates=[template])
+    assert len(records) == 5
+    assert {(record["box_name"], record["tier"]) for record in records} == {
+        ("fruit@example.com", "small"),
+    }
+    assert all(record["dim_available"]["sub_category"] == 1 for record in records)
+    assert all(record["pref_violations"] == 0 for record in records)
+    assert all(record["category_value_share"]["veg"] == 0.0 for record in records)
+
+
+def test_synthetic_recipe_is_absent_when_its_required_fungible_group_is_missing():
+    from random import Random
+    from scripts.extract_features import _synthetic_allocations
+
+    lookup = {1: {"price": 100, "fungible_group": None}}
+    recipes = _synthetic_allocations(lookup, "small", Random(1))
+    assert {source for source, _fragment, _allocations in recipes} == {
+        "synth_monoculture", "synth_random", "synth_value_low", "synth_value_high",
+    }
+
+
+def test_selected_synthetic_template_rejects_an_empty_preference_pool():
+    import pytest
+    from allocator.config import CATEGORY_VEGETABLES
+    from scripts.extract_features import (
+        EmptyPreferenceItemPoolError, SyntheticTemplate, generate_synthetic_boxes,
+    )
+
+    lookup = {1: {"price": 100, "category_id": CATEGORY_VEGETABLES}}
+    template = SyntheticTemplate("fruit@example.com", "small", "fruit_only", {})
+    with pytest.raises(EmptyPreferenceItemPoolError, match="fruit@example.com"):
+        generate_synthetic_boxes(80, lookup, {}, templates=[template])
+
+
+def test_synthetic_recipe_helper_preserves_the_empty_item_guard():
+    from random import Random
+    from scripts.extract_features import _synthetic_allocations
+
+    assert _synthetic_allocations({}, "small", Random(1)) == []
+
+
+def test_template_synthetics_propagate_unsupported_categories_but_legacy_skips(monkeypatch):
+    import pytest
+    import scripts.extract_features as extractor
+
+    def raise_unsupported(*_args, **_kwargs):
+        raise extractor.UnsupportedCategoryError("test category")
+
+    monkeypatch.setattr(extractor, "extract_box_features", raise_unsupported)
+    lookup = {1: {"price": 100}}
+    assert extractor.generate_synthetic_boxes(80, lookup, {}) == []
+    template = extractor.SyntheticTemplate("box@example.com", "small", None, {})
+    with pytest.raises(extractor.UnsupportedCategoryError, match="test category"):
+        extractor.generate_synthetic_boxes(80, lookup, {}, templates=[template])

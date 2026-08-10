@@ -900,6 +900,28 @@ class TestSyntheticBoxes:
             assert isinstance(s["total_size_points"], int)
 
 
+def test_legacy_synthetic_sequence_remains_five_per_tier(monkeypatch):
+    import hashlib
+    import json
+
+    import scripts.extract_features as extractor
+
+    # Earlier box-feature tests import this module while temporarily replacing
+    # allocator.config.BOX_TIERS. Restore the suite's normal tier fixture so
+    # the legacy compatibility digest is independent of test collection order.
+    monkeypatch.setattr(extractor, "BOX_TIERS", BOX_TIERS)
+
+    records = extractor.generate_synthetic_boxes(
+        100, TestSyntheticBoxes()._item_lookup(),
+        {"sub_category": set(), "usage": set(), "colour": set(), "shape": set()},
+    )
+    payload = json.dumps(records, sort_keys=True, separators=(",", ":"))
+    assert len(records) == 15
+    assert hashlib.sha256(payload.encode()).hexdigest() == (
+        "b1bb474118ce9f873d07e11493d59dc254c4e25af4a4aee362a838de6c8896e8"
+    )
+
+
 # ── CV split helpers ────────────────────────────────────────────────────────
 
 
