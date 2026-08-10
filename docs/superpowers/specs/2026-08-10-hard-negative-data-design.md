@@ -177,18 +177,19 @@ a systematic class marker, and it predates the PR #1 feature schema.
 
 PR #2 adds and exports `FEATURE_SCHEMA_VERSION = 2` from
 `allocator.box_features`; the generator stamps that constant rather than an
-unowned literal. The usable
+unowned literal. It also exposes that module's existing stable digest helper as
+public `stable_hash()` and refactors `config_hash()` to call it. The usable
 artifact has that PR #1 schema version, the current `config_hash`, and a
 separate `roster_config_hash` over `PER_OFFER_BOX_SIZE_OVERRIDES`. The separate
 roster hash preserves PR #1's documented 13-input feature hash while detecting
 changes to the generator's tier-correction input.
 
-`roster_config_hash` is the first 16 hexadecimal characters of SHA-256 over the
-UTF-8 bytes of a canonical JSON rendering of
-`PER_OFFER_BOX_SIZE_OVERRIDES` (`sort_keys=True`, compact separators). It is
-computed in `allocator.hard_negative_roster`, which is the sole consumer of
-that override mapping; PR #3 recomputes it through that module rather than
-reimplementing the digest.
+`roster_config_hash` is
+`stable_hash(PER_OFFER_BOX_SIZE_OVERRIDES)`. It is computed in
+`allocator.hard_negative_roster`, which is the sole consumer of that override
+mapping; PR #3 recomputes it through that module rather than reimplementing the
+digest. This intentionally shares the established configuration-stamp behavior
+instead of creating a second hash recipe.
 
 Its required top-level shape is:
 
@@ -202,9 +203,8 @@ source_counts, roster_check, attrition, exclusions, run_metadata
 counts. `attrition` contains only numeric sample-loss accounting: roster
 intersection counts, solver-status counts, and paired-cell/final counts for
 **each** EBM rung. `exclusions` is the per-offer event list, with a reason and
-detail for each skipped offer or discarded source. `run_metadata` records the
-requested offer IDs, resolved offer IDs, sequential execution mode, and
-deterministic generator version.
+detail for each offer removed from the artifact. `run_metadata` records the
+requested offer IDs, resolved offer IDs, and deterministic generator version.
 
 Each rung's coverage is computed after matching its manual and negative rows by
 `(offer_id, tier)` and dropping cells that lack either class. A loose count of
@@ -252,14 +252,17 @@ an unexpected worker/code error. A `validation_failed` report has one or more
 worker/data exclusions, non-optimal solver statuses by cause, and paired-rung
 counts.
 
-Known data exclusions (missing XLSX, no item lookup, roster mismatch,
-and non-optimal solver status) are reported per offer. An unsupported category
-feature means `extract_box_features()` raised `UnsupportedCategoryError` because
-a positive-quantity resolved item is neither the configured fruit nor vegetable
-category; the generator excludes that entire offer from every source family to
-avoid a class-specific row loss. Unexpected worker or code errors also fail the
-run and identify the exception; they must not be silently converted into
-ordinary attrition.
+Offer-level eligibility is atomic across source families. A missing XLSX, no
+item lookup, empty CSV/DB email-roster intersection, non-optimal ILP status, or
+an unsupported category excludes the entire offer from manual, baseline, ILP,
+and synthetic records (any provisional records are discarded). An unsupported
+category means `extract_box_features()` raised `UnsupportedCategoryError`
+because a positive-quantity resolved item is neither the configured fruit nor
+vegetable category. A non-empty roster difference by itself is audit-only: the
+generator retains and uses the non-empty intersection, while `roster_check`
+reports its CSV-only and DB-only identities. Unexpected worker or code errors
+also fail the run and identify the exception; they must not be silently
+converted into ordinary attrition.
 
 Offers, strategies, selected boxes, and output records are iterated in stable
 sorted order before atomic output.
