@@ -721,6 +721,19 @@ def test_generator_cli_help_runs_from_project_root():
     assert "--report-out" in proc.stdout
 
 
+def test_generator_parser_exposes_only_mvp_options():
+    from scripts.generate_hard_negatives import build_parser
+
+    parser = build_parser()
+    options = {
+        option
+        for action in parser._actions
+        for option in action.option_strings
+    }
+    assert {"--only-offers", "--out", "--report-out"} <= options
+    assert "--workers" not in options
+
+
 def test_process_offer_uses_only_the_selected_customer_roster(
     monkeypatch, make_box, tmp_path
 ):
