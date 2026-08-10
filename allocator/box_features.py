@@ -33,6 +33,7 @@ from allocator.strategies import _scoring
 
 _DIMENSIONS = ("sub_category", "usage", "colour", "shape")
 _TIERS = ("small", "medium", "large")
+FEATURE_SCHEMA_VERSION = 2
 
 
 class UnsupportedCategoryError(ValueError):
@@ -309,8 +310,8 @@ def flatten(record: dict) -> dict[str, float]:
     return {name: columns[name] for name in sorted(columns)}
 
 
-def _digest(obj) -> str:
-    """First 16 hex chars of the SHA-256 of a sorted JSON rendering."""
+def stable_hash(obj: object) -> str:
+    """Return the established 16-hex configuration digest for JSON-like data."""
     payload = json.dumps(obj, sort_keys=True, default=list)
     return hashlib.sha256(payload.encode()).hexdigest()[:16]
 
@@ -345,7 +346,7 @@ def config_hash() -> str:
     BOX_TARGET_PCT is represented by BOX_TIERS' derived target_value entries;
     config_snapshot() carries the frozen percentage directly.
     """
-    return _digest(_hash_inputs())
+    return stable_hash(_hash_inputs())
 
 
 def config_snapshot() -> dict:
@@ -370,8 +371,8 @@ def config_snapshot() -> dict:
         "qty_class_price_thresholds": copy.deepcopy(
             _scoring.QTY_CLASS_PRICE_THRESHOLDS
         ),
-        "item_classifications_hash": _digest(_ordered_rules(ITEM_CLASSIFICATIONS)),
-        "fungible_groups_hash": _digest(_ordered_rules(_scoring.FUNGIBLE_GROUPS)),
-        "classification_fallback_hash": _digest(CLASSIFICATION_FALLBACK),
-        "default_classification_hash": _digest(DEFAULT_CLASSIFICATION),
+        "item_classifications_hash": stable_hash(_ordered_rules(ITEM_CLASSIFICATIONS)),
+        "fungible_groups_hash": stable_hash(_ordered_rules(_scoring.FUNGIBLE_GROUPS)),
+        "classification_fallback_hash": stable_hash(CLASSIFICATION_FALLBACK),
+        "default_classification_hash": stable_hash(DEFAULT_CLASSIFICATION),
     }

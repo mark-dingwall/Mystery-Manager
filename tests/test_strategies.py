@@ -159,3 +159,4 @@ def test_ilp_falls_back_to_local_search(two_box_result, monkeypatch, caplog):
     assert any("falling back to local-search" in r.message for r in caplog.records)
     for box in two_box_result.boxes:
         assert sum(box.allocations.values()) > 0
+    assert two_box_result.solver_status == "FallbackSolverError"

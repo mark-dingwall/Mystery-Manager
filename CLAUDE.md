@@ -104,6 +104,8 @@ python3 scripts/analyze_desirability.py --csv --no-plots          # export CSV, 
 python3 scripts/extract_features.py                               # extract box features for tuning (needs DB)
 python3 scripts/extract_features.py --only-offers 85-106          # post-85 only
 python3 scripts/extract_features.py --no-synthetics               # manual boxes only
+python3 scripts/generate_hard_negatives.py                       # Tier-A EBM input; needs DB
+python3 scripts/generate_hard_negatives.py --only-offers 85-86   # smoke test; writes failure report below gates
 python3 scripts/tune_scoring.py                                   # parameter tuning (needs features JSON)
 python3 scripts/tune_scoring.py --trials 200 --folds 3            # quick run
 python3 scripts/tune_scoring.py --trials 3000 --repeats 25        # overnight stability run
@@ -112,6 +114,10 @@ python3 scripts/generate_survey_scenarios.py                      # generate pac
 python3 scripts/generate_survey_scenarios.py --seed 42            # reproducible
 python3 scripts/process_survey_results.py responses.json          # analyze survey responses vs scoring function
 ```
+
+`hard_negatives.json` is replaced only after all three paired EBM rungs pass;
+inspect `diagnostics/hard_negatives_report.json` after any non-zero generation
+run.
 
 `compare.py` is the primary validation tool — it compares algorithm output against cleaned historical CSVs and prints per-box and aggregate metrics with a composite score. Default run uses Tier A offers only; use `--only-offers` for others.
 

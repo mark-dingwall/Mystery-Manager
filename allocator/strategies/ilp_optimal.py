@@ -88,11 +88,23 @@ def _compute_value_lines():
 _VALUE_LINES = _compute_value_lines()
 
 
+def _record_solution_status(result: AllocationResult, pulp, prob) -> None:
+    """Persist the solution-status evidence before validation can raise."""
+    result.solver_status = pulp.LpSolution[prob.sol_status]
+
+
+def _record_fallback_solver_error(result: AllocationResult) -> None:
+    """Label an exception fallback without losing a non-optimal cause."""
+    if result.solver_status in (None, "Optimal Solution Found"):
+        result.solver_status = "FallbackSolverError"
+
+
 def run(result: AllocationResult) -> None:
     """ILP allocation: optimal assignment via mixed-integer programming."""
     try:
         import pulp
     except ImportError:
+        result.solver_status = "FallbackImportError"
         from allocator.strategies import FALLBACK_STRATEGY, get_strategy
         logger.warning(f"PuLP not installed, falling back to {FALLBACK_STRATEGY}")
         get_strategy(FALLBACK_STRATEGY)(result)
@@ -103,12 +115,12 @@ def run(result: AllocationResult) -> None:
 
     try:
         _solve_ilp(result, pulp)
-    except Exception as e:
+    except Exception as exc:
         from allocator.strategies import FALLBACK_STRATEGY, get_strategy
-        logger.warning(f"ILP solver failed ({e}), falling back to {FALLBACK_STRATEGY}")
-        # Clear any partial allocations
+        logger.warning(f"ILP solver failed ({exc}), falling back to {FALLBACK_STRATEGY}")
         for box in result.boxes:
             box.allocations.clear()
+        _record_fallback_solver_error(result)
         get_strategy(FALLBACK_STRATEGY)(result)
 
 
@@ -462,6 +474,7 @@ def _solve_ilp(result: AllocationResult, pulp) -> None:
     except Exception:
         solver = pulp.PULP_CBC_CMD(msg=0, timeLimit=TIME_LIMIT)
     status = prob.solve(solver)
+    _record_solution_status(result, pulp, prob)
 
     if pulp.LpStatus[status] not in ("Optimal", "Not Solved"):
         if pulp.LpStatus[status] == "Infeasible":

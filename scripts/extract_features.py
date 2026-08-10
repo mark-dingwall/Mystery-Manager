@@ -17,8 +17,10 @@ Usage:
 import json
 import logging
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from random import Random
+from typing import Sequence
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -28,6 +30,8 @@ logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(name)s: %(mes
 from allocator.box_parser import infer_box_tier
 from allocator.config import (
     BOX_TIERS,
+    CATEGORY_FRUIT,
+    CATEGORY_VEGETABLES,
     DONATION_IDENTIFIERS,
     SKIP_COLUMN_IDENTIFIERS,
     STAFF_IDENTIFIERS,
@@ -71,6 +75,18 @@ def _extract_or_skip(
 # Synthetic box generation
 # ---------------------------------------------------------------------------
 
+
+@dataclass(frozen=True)
+class SyntheticTemplate:
+    box_name: str
+    tier: str
+    preference: str | None
+    available_tags: dict[str, set[str]]
+
+
+class EmptyPreferenceItemPoolError(ValueError):
+    pass
+
 def _items_by_value(item_lookup: dict[int, dict]) -> list[tuple[int, dict]]:
     """Return items sorted by price ascending."""
     return sorted(item_lookup.items(), key=lambda x: x[1]["price"])
@@ -79,6 +95,7 @@ def _items_by_value(item_lookup: dict[int, dict]) -> list[tuple[int, dict]]:
 def _fill_to_target(items: list[tuple[int, dict]], target_value: int,
                      rng: Random | None = None) -> dict[int, int]:
     """Greedily fill allocations to reach target_value."""
+    items = [(item_id, info) for item_id, info in items if info["price"] > 0]
     allocs: dict[int, int] = {}
     current = 0
     if rng:
@@ -93,85 +110,137 @@ def _fill_to_target(items: list[tuple[int, dict]], target_value: int,
     return allocs
 
 
+def _matches_preference(info: dict, preference: str | None) -> bool:
+    if preference is None:
+        return True
+    if preference == "fruit_only":
+        return info["category_id"] == CATEGORY_FRUIT
+    if preference == "veg_only":
+        return info["category_id"] == CATEGORY_VEGETABLES
+    return True
+
+
+def _synthetic_allocations(
+    item_lookup: dict[int, dict], tier: str, rng: Random,
+) -> list[tuple[str, str, dict[int, int]]]:
+    """Return source, legacy name fragment, and allocations for applicable recipes."""
+    priced_lookup = {
+        item_id: info for item_id, info in item_lookup.items() if info["price"] > 0
+    }
+    sorted_items = _items_by_value(priced_lookup)
+    if not sorted_items:
+        return []
+
+    target = BOX_TIERS[tier]["target_value"]
+    recipes: list[tuple[str, str, dict[int, int]]] = []
+
+    # 1. Monoculture: cheapest item, fill to ~115% target
+    cheapest_id, cheapest_info = sorted_items[0]
+    mono_target = int(target * 1.15)
+    mono_qty = max(1, mono_target // cheapest_info["price"])
+    recipes.append(("synth_monoculture", "mono", {cheapest_id: mono_qty}))
+
+    # 2. Random: uniform sample to target value
+    random_allocs = _fill_to_target(sorted_items, int(target * 1.15), rng=rng)
+    recipes.append(("synth_random", "random", random_allocs))
+
+    # 3. Over-fungible: max items from largest fungible groups
+    fg_items: dict[str, list] = {}
+    for iid, info in priced_lookup.items():
+        fg = info.get("fungible_group")
+        if fg:
+            fg_items.setdefault(fg, []).append((iid, info))
+    overfg_allocs: dict[int, int] = {}
+    overfg_value = 0
+    for fg_name in sorted(fg_items, key=lambda g: len(fg_items[g]), reverse=True):
+        for iid, info in fg_items[fg_name]:
+            while overfg_value < int(target * 1.15):
+                overfg_allocs[iid] = overfg_allocs.get(iid, 0) + 1
+                overfg_value += info["price"]
+            if overfg_value >= int(target * 1.15):
+                break
+        if overfg_value >= int(target * 1.15):
+            break
+    if overfg_allocs:
+        recipes.append(("synth_over_fungible", "overfg", overfg_allocs))
+
+    # 4. Value low: items to ~70% target
+    low_allocs = _fill_to_target(sorted_items, int(target * 0.70))
+    recipes.append(("synth_value_low", "low", low_allocs))
+
+    # 5. Value high: items to ~160% target
+    high_allocs = _fill_to_target(sorted_items, int(target * 1.60))
+    recipes.append(("synth_value_high", "high", high_allocs))
+
+    return recipes
+
+
 def generate_synthetic_boxes(
     offer_id: int,
     item_lookup: dict[int, dict],
     available_tags: dict[str, set[str]],
+    templates: Sequence[SyntheticTemplate] | None = None,
 ) -> list[dict]:
-    """Generate 5 synthetic bad boxes per tier for a single offer."""
+    """Generate synthetic bad boxes for a single offer."""
     synthetics = []
-    sorted_items = _items_by_value(item_lookup)
-    if not sorted_items:
-        return []
 
-    rng = Random(offer_id)
-
-    for tier in ["small", "medium", "large"]:
-        target = BOX_TIERS[tier]["target_value"]
-
-        # 1. Monoculture: cheapest item, fill to ~115% target
-        cheapest_id, cheapest_info = sorted_items[0]
-        mono_target = int(target * 1.15)
-        mono_qty = max(1, mono_target // cheapest_info["price"])
-        mono_allocs = {cheapest_id: mono_qty}
-        f = _extract_or_skip(
-            f"synth_mono_{tier}", mono_allocs, item_lookup, tier,
-            available_tags, offer_id, source="synth_monoculture",
+    def emit_legacy(
+        box_name: str,
+        tier: str,
+        source: str,
+        preference: str | None,
+        tags: dict[str, set[str]],
+        allocations: dict[int, int],
+    ) -> None:
+        feature = _extract_or_skip(
+            box_name, allocations, item_lookup, tier, tags, offer_id,
+            source=source, preference=preference,
         )
-        if f:
-            synthetics.append(f)
+        if feature:
+            synthetics.append(feature)
 
-        # 2. Random: uniform sample to target value
-        random_allocs = _fill_to_target(sorted_items, int(target * 1.15), rng=rng)
-        f = _extract_or_skip(
-            f"synth_random_{tier}", random_allocs, item_lookup, tier,
-            available_tags, offer_id, source="synth_random",
+    def emit_template(
+        box_name: str,
+        tier: str,
+        source: str,
+        preference: str | None,
+        tags: dict[str, set[str]],
+        allocations: dict[int, int],
+    ) -> None:
+        feature = extract_box_features(
+            box_name, allocations, item_lookup, tier, tags, offer_id,
+            source=source, preference=preference,
         )
-        if f:
-            synthetics.append(f)
+        if feature is not None:
+            synthetics.append(feature)
 
-        # 3. Over-fungible: max items from largest fungible groups
-        fg_items: dict[str, list] = {}
-        for iid, info in item_lookup.items():
-            fg = info.get("fungible_group")
-            if fg:
-                fg_items.setdefault(fg, []).append((iid, info))
-        overfg_allocs: dict[int, int] = {}
-        overfg_value = 0
-        for fg_name in sorted(fg_items, key=lambda g: len(fg_items[g]), reverse=True):
-            for iid, info in fg_items[fg_name]:
-                while overfg_value < int(target * 1.15):
-                    overfg_allocs[iid] = overfg_allocs.get(iid, 0) + 1
-                    overfg_value += info["price"]
-                if overfg_value >= int(target * 1.15):
-                    break
-            if overfg_value >= int(target * 1.15):
-                break
-        if overfg_allocs:
-            f = _extract_or_skip(
-                f"synth_overfg_{tier}", overfg_allocs, item_lookup, tier,
-                available_tags, offer_id, source="synth_over_fungible",
-            )
-            if f:
-                synthetics.append(f)
-
-        # 4. Value low: items to ~70% target
-        low_allocs = _fill_to_target(sorted_items, int(target * 0.70))
-        f = _extract_or_skip(
-            f"synth_low_{tier}", low_allocs, item_lookup, tier,
-            available_tags, offer_id, source="synth_value_low",
-        )
-        if f:
-            synthetics.append(f)
-
-        # 5. Value high: items to ~160% target
-        high_allocs = _fill_to_target(sorted_items, int(target * 1.60))
-        f = _extract_or_skip(
-            f"synth_high_{tier}", high_allocs, item_lookup, tier,
-            available_tags, offer_id, source="synth_value_high",
-        )
-        if f:
-            synthetics.append(f)
+    if templates is None:
+        rng = Random(offer_id)
+        for tier in ("small", "medium", "large"):
+            for source, fragment, allocations in _synthetic_allocations(item_lookup, tier, rng):
+                emit_legacy(
+                    f"synth_{fragment}_{tier}", tier, source, None, available_tags,
+                    allocations,
+                )
+    else:
+        for template in templates:
+            rng = Random(f"{offer_id}:{template.box_name.casefold()}:{template.tier}")
+            allowed_lookup = {
+                item_id: info for item_id, info in item_lookup.items()
+                if _matches_preference(info, template.preference) and info["price"] > 0
+            }
+            if not allowed_lookup:
+                raise EmptyPreferenceItemPoolError(
+                    f"{template.box_name!r} has no positive-priced items "
+                    f"for {template.preference!r}"
+                )
+            for source, _fragment, allocations in _synthetic_allocations(
+                allowed_lookup, template.tier, rng
+            ):
+                emit_template(
+                    template.box_name, template.tier, source, template.preference,
+                    template.available_tags, allocations,
+                )
 
     return synthetics
 

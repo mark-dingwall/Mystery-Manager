@@ -1093,6 +1093,16 @@ def test_config_hash_is_sixteen_hex_chars_and_stable():
     assert h == config_hash()
 
 
+def test_feature_schema_version_and_public_stable_hash():
+    import allocator.box_features as features
+
+    assert features.FEATURE_SCHEMA_VERSION == 2
+    assert features.stable_hash({"b": [2], "a": {1}}) == (
+        features.stable_hash({"a": {1}, "b": [2]})
+    )
+    assert features.config_hash() == features.stable_hash(features._hash_inputs())
+
+
 @pytest.mark.parametrize(
     ("owner", "rules"),
     [
