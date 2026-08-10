@@ -37,6 +37,10 @@ empirical value-band result, and to corroborate or challenge EBM hypotheses.
 - No item/config-drift audit; that remains a separate backlog item.
 - No changes to `scripts/extract_features.py`'s tuning output or its use of
   XLSX pack-price overrides.
+- No Tier B–D inputs. The generator supports only the existing Tier-A offer set
+  (64–109); `--only-offers` must resolve to a non-empty subset of that set.
+  Historical name matching and its `include_deleted=True` fallback are not part
+  of this MVP.
 - No change to allocation strategy selection or production allocator results,
   apart from recording solver provenance on `AllocationResult`.
 
@@ -80,9 +84,16 @@ The generator admits an `ilp_optimal` record only for:
 
 It rejects and reports all other solution statuses, including time-limited
 `"Solution Found"`, no-solution states, `FallbackImportError`, and
-`FallbackSolverError`. A fallback after a post-solve exception must not retain
-an earlier optimal status, because the result's boxes have been replaced by the
-fallback allocation.
+`FallbackSolverError`.
+
+`run()` sets `FallbackImportError` before invoking the no-PuLP fallback. Its
+solver-exception path clears partial allocations, calls
+`_record_fallback_solver_error(result)`, then invokes the fallback strategy.
+That helper replaces `None` or `"Optimal Solution Found"` with
+`FallbackSolverError`; it preserves any other recorded non-optimal solution
+status so the attrition report retains its cause. The optimal status must be
+cleared because a post-solve extraction error replaces the ILP allocation with
+fallback boxes.
 
 ### Pure roster reconciliation
 
@@ -102,27 +113,38 @@ names have no reliable email bridge, and their preferences cannot be resolved
 against the email-keyed DB roster; retaining them would create class-dependent
 diversity denominators.
 
+For each offer, the generator first builds and tier-corrects the DB roster,
+intersects it with historical email columns, and creates one selected roster
+from those matched boxes. Every allocation strategy receives a fresh copy of
+that selected roster. Manual rows use the matched box's corrected tier and DB
+preference directly. This gives manual, baseline, and ILP rows the same box
+population, tier, and preference distribution.
+
 ### Generator
 
 Create `scripts/generate_hard_negatives.py` as the only DB-backed entry point.
 It accepts the existing Tier-A offer range syntax, `--workers`, `--out`, and
-`--report-out`. Their defaults are respectively
-`diagnostics/hard_negatives.json` and
-`diagnostics/hard_negatives_report.json`.
+`--report-out`. Defaults are: all Tier-A offers for `--only-offers`, `4` for
+`--workers`, `diagnostics/hard_negatives.json` for `--out`, and
+`diagnostics/hard_negatives_report.json` for `--report-out`.
 
 Each top-level, picklable per-offer worker:
 
-1. Resolves the source XLSX and DB item lookup.
+1. Validates that the offer is Tier A, then resolves the source XLSX and DB item
+   lookup using the production non-deleted lookup path.
 2. Builds three `available_tags` variants: unrestricted, fruit-only, and
    veg-only. Preference-less sources use the unrestricted variant.
-3. Builds and tier-corrects a fresh DB roster for each strategy, then calls
-   `allocate()` directly for `ilp-optimal`, `deal-topup`, `minmax-deficit`, and
-   `greedy-best-fit`.
+3. Builds, tier-corrects, and intersects the selected roster once; passes a
+   fresh copy of it to `allocate()` for `ilp-optimal`, `deal-topup`,
+   `minmax-deficit`, and `greedy-best-fit`.
 4. Emits `ilp_optimal` rows only from a proven-optimal ILP run and emits the
    three baseline source labels for their respective allocation results.
 5. Rebuilds the retained manual boxes using **plain DB prices**, not XLSX
-   overrides, and the same preference/tag denominator rule as allocation rows.
-6. Regenerates the existing `synth_*` records with the unrestricted tag set.
+   overrides, and the selected roster's matching preference/tag denominator.
+6. Generates every standard `synth_*` negative for every selected box, using
+   that box's tier and matching preference/tag variant. This mirrors the manual
+   preference distribution exactly; synthetics are not an unrestricted,
+   class-specific denominator population.
 
 The output therefore supports the three later EBM rungs:
 
@@ -138,35 +160,44 @@ a systematic class marker, and it predates the PR #1 feature schema.
 
 ## Artifact and validation rules
 
-The usable artifact has the PR #1 feature schema version and current
-`config_hash`, plus normalised records, source counts, roster differences, and
-per-cause attrition. Its required top-level shape is:
+`allocator.box_features` defines and exports `FEATURE_SCHEMA_VERSION = 2`; the
+generator stamps that constant rather than an unowned literal. The usable
+artifact has that PR #1 schema version, the current `config_hash`, and a
+separate `roster_config_hash` over `PER_OFFER_BOX_SIZE_OVERRIDES`. The separate
+roster hash preserves PR #1's documented 13-input feature hash while detecting
+changes to the generator's tier-correction input.
+
+Its required top-level shape is:
 
 ```text
-feature_schema_version, config_hash, records, source_counts,
-roster_check, attrition, run_metadata
+feature_schema_version, config_hash, roster_config_hash, records,
+source_counts, roster_check, attrition, exclusions, run_metadata
 ```
 
 `source_counts` maps each concrete source label to its record count.
 `roster_check` holds per-offer CSV-only and DB-only identities plus aggregate
-counts. `attrition` holds per-cause solver-status counts, offer-level exclusions,
-and paired manual-vs-ILP counts. `run_metadata` records the requested offer IDs,
-resolved offer IDs, worker count, and deterministic generator version.
+counts. `attrition` contains only numeric sample-loss accounting: roster
+intersection counts, solver-status counts, and paired-cell/final counts for
+**each** EBM rung. `exclusions` is the per-offer event list, with a reason and
+detail for each skipped offer or discarded source. `run_metadata` records the
+requested offer IDs, resolved offer IDs, worker count, and deterministic
+generator version.
 
-The primary rung's coverage is computed only after matching manual and ILP rows
-by `(offer_id, tier)` and dropping cells that lack either class. A loose count of
-all manual rows must never satisfy this gate.
+Each rung's coverage is computed after matching its manual and negative rows by
+`(offer_id, tier)` and dropping cells that lack either class. A loose count of
+all manual rows must never satisfy any rung's gate.
 
 `hard_negatives.json` is written atomically and only when every gate passes:
 
 1. Every included ILP row has `solver_status == "Optimal Solution Found"`.
-2. The paired manual-vs-ILP rung retains at least **150 manual boxes** across at
-   least **20 offers**.
+2. Each paired rung—manual-vs-synth, manual-vs-baseline, and manual-vs-ILP—
+   retains at least **150 manual boxes** across at least **20 offers**.
 3. All retained manual rows come from the case-normalised email roster
    intersection and use the matching preference/tag variant.
-4. The run carries the current PR #1 schema version and config hash, and each
-   required family is represented: `manual`, at least one `synth_*` source, all
-   three named `baseline_*` sources, and `ilp_optimal`.
+4. The run carries the current PR #1 schema version, feature config hash, and
+   roster config hash; each must match its live value. Every required family is
+   represented: `manual`, at least one `synth_*` source, all three named
+   `baseline_*` sources, and `ilp_optimal`.
 
 On a failed gate, the command exits non-zero, does not create or replace the
 normal artifact, and writes the audit-only report. If a prior successful normal
@@ -180,15 +211,20 @@ run_metadata, exclusions, errors
 ```
 
 `status` is `"validation_failed"` or `"execution_failed"`; the latter identifies
-an unexpected worker/code error. `failed_gates` is empty only on a successful
-run. The report lists each failed gate, source counts, roster differences,
+an unexpected worker/code error. A `validation_failed` report has one or more
+`failed_gates`; an `execution_failed` report may have none, but has one or more
+`errors`. The report lists each failed gate, source counts, roster differences,
 worker/data exclusions, non-optimal solver statuses by cause, and paired-rung
 counts.
 
 Known data exclusions (missing XLSX, no item lookup, roster mismatch,
-unsupported category feature, and non-optimal solver status) are reported per
-offer. Unexpected worker or code errors also fail the run and identify the
-exception; they must not be silently converted into ordinary attrition.
+and non-optimal solver status) are reported per offer. An unsupported category
+feature means `extract_box_features()` raised `UnsupportedCategoryError` because
+a positive-quantity resolved item is neither the configured fruit nor vegetable
+category; the generator excludes that entire offer from every source family to
+avoid a class-specific row loss. Unexpected worker or code errors also fail the
+run and identify the exception; they must not be silently converted into
+ordinary attrition.
 
 Workers are collected in deterministic offer order. Records have a stable
 sorting order before output so changing `--workers` cannot change the artifact.
@@ -201,8 +237,11 @@ The test suite remains DB-free and uses synthetic fixtures only. It covers:
 - strict ILP admission status;
 - tier correction, target-value refresh, resorting, and case-insensitive roster
   intersection;
-- plain helper behavior for source labels, tag variants, paired-rung counting,
-  attrition, and schema/config stamps;
+- selected-roster copying and identical per-box preference/tag variants across
+  manual, generated, and synthetic rows;
+- plain helper behavior for source labels, all three paired-rung gates,
+  attrition/exclusion separation, feature/roster config stamps, and Tier-A-only
+  argument validation;
 - failure reports and atomic non-emission when any validation gate fails;
 - deterministic aggregation order and unexpected-worker-error reporting.
 
@@ -213,7 +252,8 @@ counts, and that the output is accepted by the future PR #3 schema guard.
 ## Handoff to PR #3
 
 PR #3 accepts only `hard_negatives.json`; it never consumes a failure report.
-Its loader hard-fails on an unsupported feature schema version or a config-hash
-mismatch. PR #3 will fit separate balanced, leave-offer-out EBM models for the
-three rungs and report findings as hypotheses only. No score or ILP change is
-authorised from EBM output before survey evidence is available for review.
+Its loader hard-fails on an unsupported feature schema version, feature-config
+hash mismatch, or roster-config hash mismatch. PR #3 will fit separate balanced,
+leave-offer-out EBM models for the three rungs and report findings as hypotheses
+only. No score or ILP change is authorised from EBM output before survey evidence
+is available for review.
