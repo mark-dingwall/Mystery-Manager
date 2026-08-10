@@ -179,7 +179,7 @@ PR #2 adds and exports `FEATURE_SCHEMA_VERSION = 2` from
 `allocator.box_features`; the generator stamps that constant rather than an
 unowned literal. It also exposes that module's existing stable digest helper as
 public `stable_hash()` and refactors `config_hash()` to call it. The usable
-artifact has that PR #1 schema version, the current `config_hash`, and a
+artifact has that feature schema version, the current `config_hash`, and a
 separate `roster_config_hash` over `PER_OFFER_BOX_SIZE_OVERRIDES`. The separate
 roster hash preserves PR #1's documented 13-input feature hash while detecting
 changes to the generator's tier-correction input.
@@ -217,7 +217,7 @@ all manual rows must never satisfy any rung's gate.
    retains at least **150 manual boxes** across at least **20 offers**.
 3. All retained manual rows come from the case-normalised email roster
    intersection and use the matching preference/tag variant.
-4. The run carries the current PR #1 schema version, feature config hash, and
+4. The run carries the current feature schema version, feature config hash, and
    roster config hash; each must match its live value. Every required family is
    represented: `manual`, at least one `synth_*` source, all three named
    `baseline_*` sources, and `ilp_optimal`.
@@ -277,9 +277,9 @@ The test suite remains DB-free and uses synthetic fixtures only. It covers:
   intersection;
 - selected-roster copying and identical per-box preference/tag variants across
   manual, generated, and synthetic rows;
-- plain helper behavior for source labels, all three paired-rung gates,
-  attrition/exclusion separation, feature/roster config stamps, and Tier-A-only
-  argument validation;
+- plain helper behavior for source labels, all three paired-rung gates, atomic
+  offer-level exclusions, feature/roster config stamps, and Tier-A-only argument
+  validation;
 - failure reports and atomic non-emission when any validation gate fails;
 - preservation of the existing no-template synthetic output and deterministic
   selected-template output; and
