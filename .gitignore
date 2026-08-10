@@ -40,3 +40,6 @@ docs/
 
 # GSD workspace
 .planning/
+
+# Isolated local Git worktrees
+.worktrees/
