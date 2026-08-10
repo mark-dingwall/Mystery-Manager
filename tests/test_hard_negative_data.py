@@ -452,6 +452,29 @@ def test_execution_error_short_circuits_success_artifact_build(tmp_path):
     assert payload["source_counts"] == {"manual": 1}
 
 
+def test_execution_error_report_omits_unlabeled_partial_records(tmp_path):
+    import json
+
+    from scripts.generate_hard_negatives import finalize_run
+
+    report = tmp_path / "hard_negatives_report.json"
+    assert finalize_run(
+        records=[{}], requested_offer_ids=[64], resolved_offer_ids=[64],
+        roster_check={"offers": [], "totals": {}}, attrition={}, exclusions=[],
+        errors=[{"offer_id": 64, "type": "RuntimeError", "message": "boom"}],
+        roster_contract_failures=[],
+        out_path=tmp_path / "hard_negatives.json", report_path=report,
+    ) == 1
+
+    payload = json.loads(report.read_text())
+    assert set(payload) == {
+        "status", "failed_gates", "source_counts", "roster_check", "attrition",
+        "run_metadata", "exclusions", "errors",
+    }
+    assert payload["status"] == "execution_failed"
+    assert payload["source_counts"] == {}
+
+
 def test_finalize_run_rejects_aliased_artifact_and_report_paths(tmp_path):
     import pytest
 

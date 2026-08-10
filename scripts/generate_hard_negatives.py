@@ -367,10 +367,12 @@ def finalize_run(
     if out_path.resolve() == report_path.resolve():
         raise ValueError("artifact and failure-report paths must be distinct")
 
-    source_counts = dict(sorted(Counter(
-        record["source"] for record in records
-    ).items()))
     if errors:
+        source_counts = dict(sorted(Counter(
+            record["source"]
+            for record in records
+            if isinstance(record.get("source"), str)
+        ).items()))
         report = build_failure_report(
             "execution_failed",
             [],
@@ -385,6 +387,9 @@ def finalize_run(
         write_json_atomically(report_path, report)
         return 1
 
+    source_counts = dict(sorted(Counter(
+        record["source"] for record in records
+    ).items()))
     failed_gates = validation_failures(
         records, source_counts, roster_contract_failures
     )
