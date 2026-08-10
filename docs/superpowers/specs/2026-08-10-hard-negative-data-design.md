@@ -223,6 +223,11 @@ event list, with a reason and detail for each offer removed from the artifact.
 `run_metadata` records the requested offer IDs, resolved offer IDs, and
 deterministic generator version.
 
+For a feature-extraction `None`, `empty` means all allocation quantities are
+non-positive; `unextractable` means at least one allocation quantity is positive
+but none of those positive IDs is in the item lookup. Those are the only two
+possibilities after the extractor returns `None`.
+
 Each rung's coverage is computed after matching its manual and negative rows by
 `(offer_id, tier)` and dropping cells that lack either class. A loose count of
 all manual rows must never satisfy any rung's gate.
@@ -274,9 +279,12 @@ counts.
 
 Offer-level eligibility is atomic across source families. A missing XLSX, no
 item lookup, empty CSV/DB email-roster intersection, non-optimal ILP status, or
-an unsupported category, or an ambiguous case-normalised roster identity
-excludes the entire offer from manual, baseline, ILP, and synthetic records (any
-provisional records are discarded). An unsupported category means
+an unsupported category, an empty fruit/veg preference item pool, or an
+ambiguous case-normalised roster identity excludes the entire offer from manual,
+baseline, ILP, and synthetic records (any provisional records are discarded). An
+empty preference item pool means a selected fruit-only or veg-only box has no
+eligible item in the current lookup, so it cannot receive same-roster synthetic
+counterparts. An unsupported category means
 `extract_box_features()` raised `UnsupportedCategoryError` because a
 positive-quantity resolved item is neither the configured fruit nor vegetable
 category. A non-empty roster difference by itself is audit-only: the generator
