@@ -7,7 +7,7 @@ Allocates bulk produce overage into customer "mystery boxes" for a fruit & veggi
 ```bash
 python3 run.py 106 offer_106_shopping_list.xlsx                   # full run (TUI + LLM review)
 python3 run.py 106 offer_106_shopping_list.xlsx --no-tui --no-llm # quick run
-python3 compare.py                                                # validate against 42 historical offers
+python3 compare.py                                                # validate against 45 Tier-A historical offers
 python3 compare.py --all-strategies                               # strategy benchmark
 python3 -m pytest                                                 # run test suite
 ```
@@ -33,10 +33,10 @@ Mystery-Manager/
 │   ├── clean_history.py    #   Historical XLSX → CSV pipeline
 │   ├── fill_workbook.py    #   Write strategy results into XLSX
 │   └── benchmark_extraction.py  # LLM extraction benchmarks
-├── tests/                  # pytest suite (253 tests, no DB required)
+├── tests/                  # pytest suite (synthetic fixtures; no DB required)
 │   ├── conftest.py         #   Config bootstrap + factory fixtures
 │   ├── fixtures/           #   Synthetic identifiers + scoring config
-│   └── test_*.py           #   13 test modules
+│   └── test_*.py           #   test modules
 ├── scripts/                # Maintenance utilities
 │   ├── score_offer.py      #   Per-offer strategy benchmark
 │   ├── diagnose_scoring.py #   Penalty breakdown diagnostics

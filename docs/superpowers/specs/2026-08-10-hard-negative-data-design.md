@@ -1,7 +1,7 @@
 # Hard-Negative Data Set — Design
 
 **Date:** 2026-08-10
-**Status:** Approved for planning
+**Status:** Implemented and merged 2026-08-11 (PR #2, `a1dbf68`)
 **Scope:** PR #2 of the pre-survey diagnostics milestone
 
 ## Purpose

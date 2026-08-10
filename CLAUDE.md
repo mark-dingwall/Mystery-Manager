@@ -1,6 +1,6 @@
 # Mystery Manager
 
-We run a fruit & veggie box business. Customers place orders, we buy bulk boxes from farmers, then split & pack produce. This project is a python script to allocate fruit & veggie items from bulk purchase overage to "mystery" boxes bought by customers each week. Mystery boxes are better value than buying piecemeal, but without the latter's flexibility.
+We run a fruit & veggie box business. Customers place orders, we buy bulk boxes from farmers, then split & pack produce. This project is a Python application that allocates fruit & veggie items from bulk purchase overage to "mystery" boxes bought by customers each week. Mystery boxes are better value than buying piecemeal, but without the latter's flexibility.
 
 ## Running
 
@@ -12,7 +12,7 @@ python3 run.py <offer_id> <xlsx> --no-tui --no-llm               # quick run
 python3 run.py <offer_id> <xlsx> --no-tui --no-llm -v            # verbose (deal/topup logs)
 python3 run.py <offer_id> <xlsx> --no-tui --no-llm --algorithm deal-topup
 
-python3 compare.py                                                # validate vs 42 Tier A offers
+python3 compare.py                                                # validate vs 45 Tier A offers
 python3 compare.py --algorithm deal-topup                         # specific strategy
 python3 compare.py --only-offers 55-63                            # Tier B
 python3 compare.py --all-strategies                               # full benchmark (canonical vs baselines)
@@ -30,7 +30,7 @@ python3 allocator/clean_history.py                                # clean histor
 python3 allocator/clean_history.py --no-older                     # historical/ only
 python3 allocator/clean_history.py --llm-extract                  # LLM extraction (run outside Claude Code)
 python3 allocator/clean_history.py --llm-extract --llm-method sonnet-low
-python3 allocator/fill_workbook.py 106 offer_106_shopping_list.xlsx   # write strategy sheets into XLSX
+python3 -m allocator.fill_workbook 106 offer_106_shopping_list.xlsx   # write strategy sheets into XLSX
 python3 allocator/benchmark_extraction.py 5                       # benchmark LLM extraction (outside Claude Code)
 ```
 
@@ -191,7 +191,7 @@ To add a baseline benchmark: create `allocator/strategies/my_strat.py` with a `r
 - **`services/`** — service layer for the TUI: allocation, comparison, historical data, clean history, and DB connectivity services.
 - **`tui.py`** — legacy Rich interactive UI (pre-Textual). Still importable but superseded by `app.py`.
 - **`llm_review.py`** — optional Claude CLI integration for note parsing and post-allocation review.
-- **`clean_history.py`** — multi-tier historical data processing. Handles 57 offers across Tiers A–C from `historical/` and `historical/older/`. Discovers files, selects sheets, detects transposed layouts, classifies columns via `box_parser.py`. Tier C uses `name_matcher.py` for LLM-based item matching. `--llm-extract` flag runs extraction for non-standard Tier C/D workbooks via selectable strategy (`--llm-method`, default `haiku-whole`); reuses `benchmark_extraction.STRATEGY_RUNNERS`. Output per method to `cleaned_llm/{method}/`; cache per (offer, method) at `mappings/offer_N_llm_extraction_{method}.json`, with fallback to `benchmark_results/offer_N_{method}.json`.
+- **`clean_history.py`** — multi-tier historical data processing across Tiers A–D from `historical/` and `historical/older/`. Discovers files, selects sheets, detects transposed layouts, classifies columns via `box_parser.py`. Tier C uses `name_matcher.py` for LLM-based item matching. `--llm-extract` flag runs extraction for non-standard Tier C/D workbooks via selectable strategy (`--llm-method`, default `haiku-whole`); reuses `benchmark_extraction.STRATEGY_RUNNERS`. Output per method to `cleaned_llm/{method}/`; cache per (offer, method) at `mappings/offer_N_llm_extraction_{method}.json`, with fallback to `benchmark_results/offer_N_{method}.json`.
 - **`fill_workbook.py`** — runs all strategies against an offer and writes result sheets into the XLSX. Also imported by the TUI for the fill-workbook command.
 - **`benchmark_extraction.py`** — benchmarks LLM extraction strategies for non-standard historical workbooks. Must be run outside Claude Code.
 - **`sheet_analyzer.py`** — LLM-based workbook analysis for non-standard historical offers. Sends full workbook content to Sonnet with a Tier A example, gets back structured per-box allocation data. Cached in `mappings/offer_N_llm_extraction.json`.
@@ -214,7 +214,7 @@ Flask app for side-by-side comparison of algorithm vs manual packing at the box 
 
 ### Tests (`tests/`)
 
-Tests across 16 modules covering models, config, categorizer, scoring, desirability, tuning, strategies, allocator pipeline, box parser, excel I/O, wizard helpers, historical service, and web comparison. Uses synthetic fixtures — no DB or network required.
+Tests cover models/config, categorization/scoring, desirability/tuning/box features, hard-negative diagnostics, strategies, the allocator pipeline, parsing/I/O, wizard helpers and services, survey scenarios, and web comparison. They use synthetic fixtures — no DB or network required.
 
 - **`conftest.py`** — test config bootstrap (sets env vars before allocator import), factory fixtures for Item/MysteryBox/CharityBox/AllocationResult.
 - **`tests/fixtures/`** — synthetic `identifiers.json` and `scoring_config.json` for CI portability.
@@ -277,6 +277,10 @@ Score = 100 minus composite penalties (full breakdown in `docs/SCORING.md`, giti
 
 Offers 45–48 and 22–44 have all items soft-deleted in DB, but price data is still usable for historical name matching. Name matcher falls back to cached mappings when DB is unavailable. Cached matches in `mappings/`.
 
+`clean_history.py` and the TUI classify offers 45–54 as Tier C. `compare.py` currently
+groups offers 45–48 with Tier D (and 49–54 with Tier C); use `--only-offers` when a
+comparison needs an explicit cohort.
+
 ## Reference
 
-- Historical data: 74 XLSX files across `historical/` (42) and `historical/older/` (32); 57 produce cleaned CSVs
+- Current local historical archive: 80 XLSX files across `historical/` (45) and `historical/older/` (35); 76 offers have cleaned mystery-box CSVs
