@@ -105,7 +105,9 @@ side effects.
   `PER_OFFER_BOX_SIZE_OVERRIDES` to the DB-derived email roster, refreshes each
   corrected box's `target_value`, then sorts by target value. Other historical
   box-tier resolution layers are keyed by standalone CSV names and cannot be
-  reached safely from email-named DB boxes.
+  reached safely from email-named DB boxes. Override email keys are matched
+  case-insensitively, just as roster email identities are; a case-normalisation
+  collision is ambiguous rather than silently selecting one tier.
 - `intersect_roster(csv_box_names, db_box_names)` case-normalises names and
   returns retained email matches plus CSV-only and DB-only differences. A
   duplicate identity within either source after case-normalisation is ambiguous:
@@ -132,6 +134,13 @@ Defaults are: all Tier-A offers for `--only-offers`,
 `diagnostics/hard_negatives.json` for `--out`, and
 `diagnostics/hard_negatives_report.json` for `--report-out`.
 
+For an explicit `--only-offers`, `run_metadata.requested_offer_ids` records the
+Tier-A IDs expanded from the supplied ranges before availability filtering;
+`resolved_offer_ids` is its non-empty intersection with discovered historical
+offers. With no flag, both are the discovered Tier-A set. This separates an
+unavailable-but-valid request from the work actually performed without changing
+the MVP command surface.
+
 The MVP is deliberately sequential: it processes offers in resolved ID order
 in the one parent process and does not create a `ProcessPoolExecutor` or a
 `ThreadPoolExecutor`. That avoids forking a live Paramiko/MySQL tunnel and lets
@@ -152,10 +161,13 @@ Each per-offer pass:
    three baseline source labels for their respective allocation results.
 5. Rebuilds the retained manual boxes using **plain DB prices**, not XLSX
    overrides, and the selected roster's matching preference/tag denominator.
-6. Generates every standard `synth_*` negative for every selected box, using
-   that box's tier and matching preference/tag variant. This mirrors the manual
-   preference distribution exactly; synthetics are not an unrestricted,
-   class-specific denominator population.
+6. Generates every applicable standard `synth_*` negative for every selected
+   box, using that box's tier and matching preference/tag variant. Recipe input
+   items are filtered to the box's fruit/veg preference before allocation, while
+   feature extraction retains the canonical whole item lookup. This mirrors the
+   manual preference distribution exactly; synthetics are not an unrestricted,
+   class-specific denominator population. The over-fungible recipe is absent—not
+   faked—when the eligible items contain no fungible group.
 
 The per-box synthetic path extends the existing `generate_synthetic_boxes()`
 behind a backwards-compatible interface: shared allocation construction remains
@@ -203,11 +215,13 @@ source_counts, roster_check, attrition, exclusions, run_metadata
 
 `source_counts` maps each concrete source label to its record count.
 `roster_check` holds per-offer CSV-only and DB-only identities plus aggregate
-counts. `attrition` contains only numeric sample-loss accounting: roster
-intersection counts, solver-status counts, and paired-cell/final counts for
-**each** EBM rung. `exclusions` is the per-offer event list, with a reason and
-detail for each offer removed from the artifact. `run_metadata` records the
-requested offer IDs, resolved offer IDs, and deterministic generator version.
+counts. `attrition` contains only numeric sample-loss accounting with fixed keys:
+requested/resolved/eligible/excluded offer counts, CSV/DB/selected roster
+candidate counts, solver-status counts, per-source empty/unextractable counts,
+and paired-cell/final counts for **each** EBM rung. `exclusions` is the per-offer
+event list, with a reason and detail for each offer removed from the artifact.
+`run_metadata` records the requested offer IDs, resolved offer IDs, and
+deterministic generator version.
 
 Each rung's coverage is computed after matching its manual and negative rows by
 `(offer_id, tier)` and dropping cells that lack either class. A loose count of
@@ -219,7 +233,10 @@ all manual rows must never satisfy any rung's gate.
 2. Each paired rung—manual-vs-synth, manual-vs-baseline, and manual-vs-ILP—
    retains at least **150 manual boxes** across at least **20 offers**.
 3. All retained manual rows come from the case-normalised email roster
-   intersection and use the matching preference/tag variant.
+   intersection and use the matching preference/tag variant. Before finalisation,
+   the generator validates every emitted row against its selected roster's
+   canonical DB email, corrected tier, and four tag-denominator cardinalities;
+   a mismatch is a hard `selected_roster_contract` gate failure.
 4. The run carries the current feature schema version, feature config hash, and
    roster config hash; each must match its live value. Every required family is
    represented: `manual`, at least one `synth_*` source, all three named
@@ -280,14 +297,16 @@ The test suite remains DB-free and uses synthetic fixtures only. It covers:
 - tier correction, target-value refresh, resorting, and case-insensitive roster
   intersection;
 - selected-roster copying and identical per-box preference/tag variants across
-  manual, generated, and synthetic rows;
+  manual, generated, and synthetic rows, including preference-filtered synthetic
+  recipes and selected-roster hard-gate failures;
 - plain helper behavior for source labels, all three paired-rung gates, atomic
   offer-level exclusions, feature/roster config stamps, and Tier-A-only argument
   validation;
 - failure reports and atomic non-emission when any validation gate fails;
 - preservation of the existing no-template synthetic output and deterministic
   selected-template output; and
-- sequential aggregation order and unexpected per-offer error reporting.
+- sequential aggregation order, fixed attrition aggregation, real monkeypatched
+  per-offer orchestration, and unexpected per-offer error reporting.
 
 Operator validation, with live DB access, runs first on an explicit offer subset
 and then across Tier A. The review checks the attrition report, roster mismatch

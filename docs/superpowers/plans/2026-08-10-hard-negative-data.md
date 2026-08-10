@@ -342,13 +342,13 @@ def test_correct_box_tiers_copies_refreshes_and_resorts(make_box, monkeypatch):
     )
     original = [
         make_box(name="a@example.com", tier="small"),
-        make_box(name="z@example.com", tier="large"),
+        make_box(name="Z@Example.COM", tier="large"),
     ]
     corrected = roster.correct_box_tiers(80, original)
 
     assert original[1].tier == "large"
     assert [(box.name, box.tier) for box in corrected] == [
-        ("a@example.com", "small"), ("z@example.com", "small"),
+        ("a@example.com", "small"), ("Z@Example.COM", "small"),
     ]
     assert corrected[1].target_value == BOX_TIERS["small"]["target_value"]
 
@@ -414,8 +414,10 @@ needed; no runtime DB import is permitted.
 def correct_box_tiers(offer_id: int, boxes: Sequence[MysteryBox]) -> list[MysteryBox]:
     corrected_boxes = copy.deepcopy(list(boxes))
     overrides = PER_OFFER_BOX_SIZE_OVERRIDES.get(str(offer_id), {})
+    override_names = _casefold_unique(overrides, "tier override")
     for box in corrected_boxes:
-        tier = overrides.get(box.name)
+        original_override_name = override_names.get(box.name.casefold())
+        tier = overrides.get(original_override_name) if original_override_name else None
         if tier in BOX_TIERS:
             box.tier = tier
             box.target_value = BOX_TIERS[tier]["target_value"]
@@ -442,10 +444,12 @@ difference: the generator must preserve a non-empty valid intersection.
 `PER_OFFER_BOX_SIZE_OVERRIDES` is shared historical configuration. Some current
 entries (offers 65 and 67) are standalone CSV labels, not DB emails, so they
 cannot safely match the email-named `MysteryBox` objects and remain inapplicable
-here. `correct_box_tiers()` deliberately uses exact DB-email keys only; it must
-not add historical name matching. `roster_config_hash()` deliberately stamps the
-full mapping, rather than a Tier-A projection: a non-Tier-A edit may cause a
-harmless conservative regeneration but can never make an artifact stale.
+here. `correct_box_tiers()` matches only case-normalised DB-email keys; it must
+not add historical name matching. A case-normalised collision in the override
+mapping raises the same ambiguity error as a roster collision.
+`roster_config_hash()` deliberately stamps the full mapping, rather than a
+Tier-A projection: a non-Tier-A edit may cause a harmless conservative
+regeneration but can never make an artifact stale.
 
 - [ ] **Step 4: Verify this slice**
 
@@ -491,11 +495,12 @@ def generate_synthetic_boxes(
 ) -> list[dict]: pass
 ~~~
 
-The no-template branch must retain the current five recipes per small/medium/
-large tier, source order, legacy box names, and one Random(offer_id) sequence.
-The template branch emits the same five sources for every selected DB box and
-passes that template's tier, preference, and tag denominator into feature
-extraction.
+The no-template branch must retain the current legacy behavior: five recipes per
+small/medium/large tier when the offer has fungible groups, source order, legacy
+box names, and one Random(offer_id) sequence. The template branch emits every
+applicable recipe for each selected DB box, selects only items allowed by that
+template's fruit/veg preference, and passes that template's tier, preference,
+and tag denominator into feature extraction.
 
 - [ ] **Step 1: Write failing legacy and template tests**
 
@@ -544,6 +549,19 @@ def test_selected_synthetic_template_keeps_box_tier_and_tag_denominator():
         ("fruit@example.com", "small"),
     }
     assert all(record["dim_available"]["sub_category"] == 1 for record in records)
+    assert all(record["pref_violations"] == 0 for record in records)
+    assert all(record["category_value_share"]["veg"] == 0.0 for record in records)
+
+
+def test_synthetic_recipe_is_absent_when_its_required_fungible_group_is_missing():
+    from random import Random
+    from scripts.extract_features import _synthetic_allocations
+
+    lookup = {1: {"price": 100, "fungible_group": None}}
+    recipes = _synthetic_allocations(lookup, "small", Random(1))
+    assert {source for source, _fragment, _allocations in recipes} == {
+        "synth_monoculture", "synth_random", "synth_value_low", "synth_value_high",
+    }
 ~~~
 
 - [ ] **Step 2: Run the tests to confirm the red state**
@@ -552,9 +570,10 @@ def test_selected_synthetic_template_keeps_box_tier_and_tag_denominator():
 python3 -m pytest tests/test_tuning.py tests/test_hard_negative_data.py -q -k "synthetic"
 ~~~
 
-Expected: the template test fails because SyntheticTemplate and the templates
-parameter do not exist. If the legacy expectation reveals a pre-existing fixture
-assumption, correct the expectation before changing production code.
+Expected: the template and recipe-helper tests fail because SyntheticTemplate,
+the templates parameter, and _synthetic_allocations do not exist. If the legacy
+expectation reveals a pre-existing fixture assumption, correct the expectation
+before changing production code.
 
 - [ ] **Step 3: Share the allocation recipes while keeping legacy behavior**
 
@@ -564,14 +583,18 @@ Move the five current allocation recipes into one private helper:
 def _synthetic_allocations(
     item_lookup: dict[int, dict], tier: str, rng: Random,
 ) -> list[tuple[str, str, dict[int, int]]]:
-    """Return source, legacy name fragment, and allocations for five recipes."""
+    """Return source, legacy name fragment, and allocations for applicable recipes."""
 ~~~
 
 Add dataclass and Sequence imports from the standard library at the top of
 scripts/extract_features.py.
 
 Move the existing monoculture, random, over-fungible, low-value, and high-value
-math unchanged into that helper. The public function has two branches:
+math unchanged into that helper. The over-fungible recipe remains conditionally
+absent when no fungible-grouped item exists; do not invent an empty/placeholder
+row or a new synthetic attrition category. Its absence is semantically correct,
+visible in `source_counts`, and covered by the existing source-family and paired
+coverage gates. The public function has two branches:
 
 ~~~python
 if templates is None:
@@ -582,17 +605,26 @@ if templates is None:
 else:
     for template in templates:
         rng = Random(f"{offer_id}:{template.box_name.casefold()}:{template.tier}")
+        allowed_lookup = {
+            item_id: info for item_id, info in item_lookup.items()
+            if _matches_preference(info, template.preference)
+        }
         for source, _fragment, allocations in _synthetic_allocations(
-            item_lookup, template.tier, rng
+            allowed_lookup, template.tier, rng
         ):
             emit(template.box_name, template.tier, source, template.preference,
                  template.available_tags, allocations)
 ~~~
 
-The legacy emitter continues to use _extract_or_skip. Add an internal template
-emitter that permits UnsupportedCategoryError to propagate; the hard-negative
-generator will turn it into a whole-offer exclusion rather than a silent missing
-synthetic row.
+Add a private `_matches_preference(info, preference)` that returns true for all
+items with `None`, only `CATEGORY_FRUIT` for `fruit_only`, and only
+`CATEGORY_VEGETABLES` for `veg_only`; import those category constants alongside
+the existing configuration imports. `emit()` still passes the original complete
+`item_lookup` to feature extraction, while recipe construction receives the
+filtered lookup, so IDs and category checks remain canonical. The legacy emitter
+continues to use _extract_or_skip. Add an internal template emitter that permits
+UnsupportedCategoryError to propagate; the hard-negative generator will turn it
+into a whole-offer exclusion rather than a silent missing synthetic row.
 
 - [ ] **Step 4: Verify this slice**
 
@@ -630,11 +662,19 @@ BASELINE_SOURCES = (
     "baseline_greedy_best_fit",
 )
 
-def parse_tier_a_offer_ids(value: str | None, available: set[int]) -> list[int]: pass
+def parse_requested_tier_a_offer_ids(value: str) -> list[int]: pass
+def resolve_requested_offer_ids(requested: list[int], available: set[int]) -> list[int]: pass
+def customer_csv_names(names: Iterable[str]) -> list[str]: pass
 def tags_for_preference(preference: str | None, variants: dict[str, dict[str, set[str]]]) -> dict[str, set[str]]: pass
 def admits_to_ilp_class(status: str | None) -> bool: pass
 def paired_rung_coverage(records: list[dict], negative_selector: str) -> dict[str, int]: pass
-def validation_failures(records: list[dict], source_counts: dict[str, int]) -> list[dict]: pass
+def selected_roster_contract_failures(
+    records: list[dict], expected: dict[tuple[int, str], dict],
+) -> list[dict]: pass
+def validation_failures(
+    records: list[dict], source_counts: dict[str, int],
+    roster_contract_failures: Sequence[dict] = (),
+) -> list[dict]: pass
 def artifact_guard_failures(artifact: dict) -> list[dict]: pass
 def build_artifact(
     records: list[dict], source_counts: dict[str, int], roster_check: dict,
@@ -650,6 +690,7 @@ def write_json_atomically(path: Path, payload: dict) -> None: pass
 def finalize_run(
     records: list[dict], requested_offer_ids: list[int], resolved_offer_ids: list[int],
     roster_check: dict, attrition: dict, exclusions: list[dict], errors: list[dict],
+    roster_contract_failures: Sequence[dict],
     out_path: Path, report_path: Path,
 ) -> int: pass
 ~~~
@@ -705,6 +746,38 @@ def test_preference_tags_and_ilp_admission_are_exact():
     assert not admits_to_ilp_class("Solution Found")
     assert not admits_to_ilp_class("FallbackSolverError")
     assert not admits_to_ilp_class(None)
+
+
+def test_selected_roster_contract_rejects_an_unselected_or_wrong_denominator_row():
+    from scripts.generate_hard_negatives import (
+        selected_roster_contract_failures,
+        validation_failures,
+    )
+
+    expected = {
+        (64, "person@example.com"): {
+            "tier": "small",
+            "dim_available": {"sub_category": 1, "usage": 2, "colour": 3, "shape": 4},
+        },
+    }
+    valid = {
+        "offer_id": 64, "box_name": "Person@Example.com", "tier": "small",
+        "source": "manual",
+        "dim_available": {"sub_category": 1, "usage": 2, "colour": 3, "shape": 4},
+    }
+    assert selected_roster_contract_failures([valid], expected) == []
+
+    bad = {**valid, "box_name": "not-selected@example.com"}
+    wrong_denominator = {
+        **valid, "dim_available": {"sub_category": 0, "usage": 2, "colour": 3, "shape": 4},
+    }
+    failures = selected_roster_contract_failures([bad, wrong_denominator], expected)
+    assert {failure["gate"] for failure in failures} == {"selected_roster_contract"}
+
+    assert any(
+        failure["gate"] == "selected_roster_contract"
+        for failure in validation_failures([], {}, failures)
+    )
 
 
 def test_validation_rejects_nonoptimal_ilp_and_missing_baseline_source():
@@ -777,7 +850,7 @@ def test_failed_run_preserves_existing_artifact_and_writes_report(tmp_path):
     assert finalize_run(
         records=[], requested_offer_ids=[64], resolved_offer_ids=[64],
         roster_check={"offers": [], "totals": {}}, attrition={},
-        exclusions=[], errors=[], out_path=out, report_path=report,
+        exclusions=[], errors=[], roster_contract_failures=[], out_path=out, report_path=report,
     ) == 1
     assert out.read_text() == '{"prior": true}\n'
     assert __import__("json").loads(report.read_text())["status"] == "validation_failed"
@@ -799,9 +872,11 @@ Expected: ModuleNotFoundError for scripts.generate_hard_negatives.
 
 Create scripts/generate_hard_negatives.py with only stdlib,
 allocator.box_features, and allocator.hard_negative_roster imports at module
-scope. Its stdlib imports include argparse, Callable, Counter, dataclass, json,
-os, Path, Sequence, tempfile, and copy. Import the roster names needed by both
-pure assembly and runtime processing here:
+scope. Its stdlib imports include argparse, Callable, Counter, dataclass, field, Iterable,
+json, os, Path, Sequence, tempfile, and copy. Import DONATION_IDENTIFIERS,
+SKIP_COLUMN_IDENTIFIERS, and STAFF_IDENTIFIERS from allocator.config so the
+customer-column filter has the same exact-name policy as compare.py. Import the
+roster names needed by both pure assembly and runtime processing here:
 
 ~~~python
 from allocator.hard_negative_roster import (
@@ -857,13 +932,24 @@ fallback. It returns the selected variant itself, never a merged tag set.
 both ILP admission and the ILP-status validation gate so no near-optimal or
 fallback status can leak into the ILP class.
 
+`selected_roster_contract_failures()` is the remaining write gate. For each
+selected DB box, process_offer builds an expectation keyed by
+`(offer_id, db_name.casefold())`, containing its corrected tier and the four
+`dim_available` cardinalities of `tags_for_preference(box.preference, variants)`.
+Every emitted row—manual, baseline, ILP, and synthetic—uses the canonical DB box
+name and must match that expectation. The helper returns descriptive
+`selected_roster_contract` failures for an unselected name, wrong tier, or wrong
+denominator. This keeps preference provenance out of the numeric feature schema
+while hard-failing an artifact assembled from the wrong roster or tag variant.
+
 validation_failures() returns every failure, rather than stopping at the first:
 
 1. every included ilp_optimal record has the exact admitting solver status;
 2. all three coverage dictionaries have manual_boxes >= 150 and offers >= 20;
 3. source counts include manual, at least one synth source, each exact baseline
    source, and ilp_optimal;
-4. artifact_guard_failures() compares a built artifact's schema/config/roster
+4. all supplied selected-roster contract failures;
+5. artifact_guard_failures() compares a built artifact's schema/config/roster
    stamps to live FEATURE_SCHEMA_VERSION, config_hash(), and roster_config_hash().
 
 build_artifact() produces exactly these nine top-level fields:
@@ -898,8 +984,9 @@ status, failed_gates, source_counts, roster_check, attrition, run_metadata,
 exclusions, errors. Use status execution_failed if errors is non-empty;
 otherwise use validation_failed when gates fail.
 
-finalize_run() builds the artifact, concatenates validation_failures() and
-artifact_guard_failures(), then chooses whether the normal artifact can be
+finalize_run() builds the artifact, passes the aggregated per-offer
+roster_contract_failures to validation_failures(), concatenates those failures
+with artifact_guard_failures(), then chooses whether the normal artifact can be
 written. That second check protects the unlikely case of a configuration change
 between per-offer collection and atomic output.
 
@@ -941,11 +1028,13 @@ class OfferOutcome:
     offer_id: int
     records: list[dict]
     roster_entry: dict
-    attrition: dict[str, int | dict[str, int]]
+    attrition: dict
+    roster_contract_failures: list[dict] = field(default_factory=list)
     exclusion: dict | None = None
     error: dict | None = None
 
 def empty_roster_entry(offer_id: int) -> dict: pass
+def empty_offer_attrition() -> dict: pass
 def process_offer(offer_id: int) -> OfferOutcome: pass
 def execute(
     offer_ids: list[int],
@@ -965,23 +1054,40 @@ offers, processes them in sorted order, and calls execute() directly; it does no
 submit anything to an executor. `empty_roster_entry()` returns exactly
 `{"offer_id": offer_id, "csv_only": [], "db_only": [], "selected_count": 0}`;
 process_offer() creates it before its first early-exit condition and returns that
-same complete shape for every exclusion path.
+same complete shape for every exclusion path. `empty_offer_attrition()` returns
+the exact per-offer substructure used by execute() for aggregation:
+
+~~~python
+{
+    "roster_candidates": {"csv": 0, "db": 0, "selected": 0},
+    "solver_statuses": {},
+    "row_attrition": {},  # source -> {"empty": int, "unextractable": int}
+}
+~~~
+
+Every early return carries this structure (with known counters incremented), and
+every normal return also carries `roster_contract_failures` calculated before
+the OfferOutcome is returned.
 
 - [ ] **Step 1: Write failing orchestration tests**
 
 Append to tests/test_hard_negative_data.py:
 
 ~~~python
-def test_parse_tier_a_offers_accepts_ranges_and_rejects_out_of_scope_ids():
+def test_requested_and_resolved_tier_a_offers_remain_distinct():
     import pytest
-    from scripts.generate_hard_negatives import parse_tier_a_offer_ids
+    from scripts.generate_hard_negatives import (
+        parse_requested_tier_a_offer_ids,
+        resolve_requested_offer_ids,
+    )
 
-    assert parse_tier_a_offer_ids("64,66-67", {64, 65, 66, 67}) == [64, 66, 67]
-    assert parse_tier_a_offer_ids(None, {63, 64, 65, 110}) == [64, 65]
+    requested = parse_requested_tier_a_offer_ids("64,66-67")
+    assert requested == [64, 66, 67]
+    assert resolve_requested_offer_ids(requested, {64, 65, 67}) == [64, 67]
     with pytest.raises(ValueError, match="Tier-A"):
-        parse_tier_a_offer_ids("63", {63, 64})
+        parse_requested_tier_a_offer_ids("63")
     with pytest.raises(ValueError, match="non-empty"):
-        parse_tier_a_offer_ids("64", {65})
+        resolve_requested_offer_ids([64], {65})
 
 
 def test_execute_discards_every_source_for_nonoptimal_offer(tmp_path):
@@ -990,7 +1096,11 @@ def test_execute_discards_every_source_for_nonoptimal_offer(tmp_path):
     outcome = OfferOutcome(
         offer_id=64, records=[],
         roster_entry={"offer_id": 64, "csv_only": [], "db_only": [], "selected_count": 2},
-        attrition={"solver_statuses": {"Solution Found": 1}},
+        attrition={
+            "roster_candidates": {"csv": 2, "db": 2, "selected": 2},
+            "solver_statuses": {"Solution Found": 1},
+            "row_attrition": {},
+        },
         exclusion={"offer_id": 64, "reason": "nonoptimal_ilp", "detail": "Solution Found"},
     )
     code = execute(
@@ -1005,6 +1115,42 @@ def test_execute_discards_every_source_for_nonoptimal_offer(tmp_path):
     assert code == 1
     assert report["exclusions"] == [outcome.exclusion]
     assert report["source_counts"] == {}
+
+
+def test_execute_aggregates_the_pinned_attrition_contract(tmp_path):
+    from scripts.generate_hard_negatives import OfferOutcome, execute
+
+    outcome = OfferOutcome(
+        offer_id=64, records=[],
+        roster_entry={"offer_id": 64, "csv_only": [], "db_only": [], "selected_count": 2},
+        attrition={
+            "roster_candidates": {"csv": 3, "db": 2, "selected": 2},
+            "solver_statuses": {"Solution Found": 1},
+            "row_attrition": {"manual": {"empty": 1, "unextractable": 2}},
+        },
+        exclusion={"offer_id": 64, "reason": "nonoptimal_ilp", "detail": "Solution Found"},
+    )
+    execute(
+        [64], lambda _offer_id: outcome,
+        out_path=tmp_path / "hard_negatives.json",
+        report_path=tmp_path / "hard_negatives_report.json",
+        requested_offer_ids=[64, 65],
+    )
+    report = __import__("json").loads(
+        (tmp_path / "hard_negatives_report.json").read_text()
+    )
+    assert report["attrition"] == {
+        "requested_offers": 2, "resolved_offers": 1,
+        "eligible_offers": 0, "excluded_offers": 1,
+        "roster_candidates": {"csv": 3, "db": 2, "selected": 2},
+        "solver_statuses": {"Solution Found": 1},
+        "row_attrition": {"manual": {"empty": 1, "unextractable": 2}},
+        "rung_coverage": {
+            "manual_vs_synth": {"manual_boxes": 0, "offers": 0},
+            "manual_vs_baseline": {"manual_boxes": 0, "offers": 0},
+            "manual_vs_ilp": {"manual_boxes": 0, "offers": 0},
+        },
+    }
 
 
 def test_empty_roster_entry_keeps_early_exclusions_aggregateable():
@@ -1033,13 +1179,29 @@ def test_generator_module_import_does_not_import_compare_or_db():
     assert proc.returncode == 0, proc.stdout + proc.stderr
 ~~~
 
+Add one DB-free, monkeypatched `test_process_offer_uses_only_the_selected_customer
+roster()`. Patch the lazy runtime collaborators—not process_offer’s API—with a
+two-category item lookup, CSV names containing one matched customer plus donation,
+staff, and skip identifiers, one case-differing DB email box, deterministic
+allocation results for all four strategies, and deterministic synthetic output.
+Assert that the real process_offer() result contains only the canonical selected
+DB email for every source; manual allocation is read using the matched CSV name;
+every emitted `dim_available` equals the fruit-only variant; the filtered CSV
+columns do not appear in its roster_entry; and `roster_contract_failures == []`.
+Pass that exact returned OfferOutcome through execute() and assert that its
+roster/solver/row attrition counters and filtered roster survive aggregation in
+the failure report.
+This test must not introduce a production dependency-injection API or connect to
+the DB.
+
 - [ ] **Step 2: Run the tests to confirm the red state**
 
 ~~~bash
-python3 -m pytest tests/test_hard_negative_data.py -q -k "parse_tier or execute or generator_module"
+python3 -m pytest tests/test_hard_negative_data.py -q -k "requested or execute or generator_module or process_offer"
 ~~~
 
-Expected: failures for the absent parser, outcome, and execute interfaces.
+Expected: failures for the absent requested/resolved parser, outcome, execute,
+and process_offer contracts.
 
 - [ ] **Step 3: Implement process_offer() around one selected roster**
 
@@ -1054,15 +1216,20 @@ from scripts.extract_features import SyntheticTemplate, generate_synthetic_boxes
 
 Perform this exact sequence for every offer:
 
-1. Start with `roster_entry = empty_roster_entry(offer_id)`. Resolve
+1. Start with `roster_entry = empty_roster_entry(offer_id)` and
+   `attrition = empty_offer_attrition()`. Resolve
    xlsx_path = compare._find_xlsx_path(offer_id). If absent, return a
    missing_xlsx exclusion and no records. Use this and every DB lookup through
    the existing production non-deleted path; do not add historical name matching
    or call fetch_offer_parts_by_name(include_deleted=True).
 2. Load plain item_lookup = compare.build_item_lookup(offer_id). If empty,
-   return missing_item_lookup. Load csv_names and historical_allocations with
-   compare.load_historical_csv(offer_id); if no columns, return
-   missing_historical_csv.
+   return missing_item_lookup. Load raw_csv_names and historical_allocations with
+   compare.load_historical_csv(offer_id), then pass raw_csv_names through
+   customer_csv_names(). That helper must use the same exact-name exclusion
+   predicate as compare.py: remove DONATION_IDENTIFIERS,
+   SKIP_COLUMN_IDENTIFIERS, and STAFF_IDENTIFIERS before roster intersection. If
+   no customer columns remain, return missing_historical_csv; never report a
+   donation, staff, or skip column as CSV-only.
 3. Build db_boxes = correct_box_tiers(offer_id, build_boxes_from_db(offer_id)).
    Intersect its email names with CSV names. Put CSV-only, DB-only, and selected
    count in roster_entry. Catch `AmbiguousRosterIdentityError` here and return an
@@ -1072,7 +1239,8 @@ Perform this exact sequence for every offer:
    roster_entry rather than `{}` or `None`.
 4. Build selected boxes in RosterMatch order. Retain the pair of csv_name and a
    copied DB box so manual reconstruction uses the real historical column while
-   allocation uses DB tier/preference.
+   allocation uses DB tier/preference. Every emitted feature record, including
+   manual, uses the canonical `db_name` as box_name; csv_name is retrieval-only.
 5. Build tags as follows; no preference selects all:
 
    ~~~python
@@ -1088,17 +1256,25 @@ Perform this exact sequence for every offer:
    every admitted ILP feature record.
 7. Call allocate() with fresh copies of the same selected boxes for only
    deal-topup, minmax-deficit, and greedy-best-fit. Emit source labels
-   baseline_deal_topup, baseline_minmax_deficit, baseline_greedy_best_fit.
+   baseline_deal_topup, baseline_minmax_deficit, baseline_greedy_best_fit. The
+   four `allocate()` calls deliberately reread the XLSX. Do not widen the
+   production allocator with preloaded items/overage solely for this one-off
+   diagnostic; measure it after MVP if runtime becomes material.
 8. Rebuild manual records from historical_allocations[item_id][csv_name] with
    the matched corrected tier/preference and plain item_lookup. Do not call
    read_xlsx_pack_overrides.
-9. Build one SyntheticTemplate per selected box using its name, corrected tier,
-   preference, and matching tag variant. Pass all templates to
-   generate_synthetic_boxes().
+9. Build one SyntheticTemplate per selected box using its canonical db_name,
+   corrected tier, preference, and matching tag variant. Pass all templates to
+   generate_synthetic_boxes(). It filters recipe inputs to the template
+   preference and may propagate UnsupportedCategoryError.
 10. extract_box_features() gets the matching per-box tag variant for every
     manual/baseline/ILP record. A None feature increments numeric row attrition.
-    Any UnsupportedCategoryError returns unsupported_category and discards all
-    provisional records for the offer.
+    Catch UnsupportedCategoryError around both steps 9 and 10; return
+    unsupported_category and discard all provisional records for the offer.
+11. Build selected-roster expectations from the selected DB boxes and variants,
+    run selected_roster_contract_failures() over every provisional record, and
+    return those failures with the OfferOutcome. They are validation failures,
+    not ordinary attrition, so a contract failure prevents normal artifact write.
 
 Catch unexpected exceptions in execute(), not as ordinary attrition: record
 offer_id, exception class, and message in errors; continue to later sorted
@@ -1119,10 +1295,25 @@ roster_check = {
 }
 ~~~
 
-attrition contains numeric requested/resolved/eligible/excluded offer counts,
-roster candidate/intersection totals, solver-status counts, per-source
-empty/unextractable row totals, and all three paired-rung coverage dictionaries.
-exclusions remains the separate per-offer reason/detail event list.
+execute() aggregates each known OfferOutcome substructure by summation and pins
+the normal/report `attrition` shape exactly as follows:
+
+~~~python
+{
+    "requested_offers": len(requested_offer_ids),
+    "resolved_offers": len(offer_ids),
+    "eligible_offers": int,
+    "excluded_offers": int,
+    "roster_candidates": {"csv": int, "db": int, "selected": int},
+    "solver_statuses": {"status string": int},
+    "row_attrition": {"source": {"empty": int, "unextractable": int}},
+    "rung_coverage": {"manual_vs_*": {"manual_boxes": int, "offers": int}},
+}
+~~~
+
+It also concatenates `outcome.roster_contract_failures` in sorted offer order and
+passes them to finalize_run(). exclusions remains the separate per-offer
+reason/detail event list.
 
 build_parser() exposes only:
 
@@ -1133,9 +1324,15 @@ build_parser() exposes only:
 ~~~
 
 Do not use compare._build_offer_ids for explicit selection because it allows Tier
-B–D values. Discover available historical IDs through existing compare helpers,
-intersect with TIER_A_OFFER_IDS, then use parse_tier_a_offer_ids() for hard
-range/non-empty validation.
+B–D values. For an explicit `--only-offers`, parse_requested_tier_a_offer_ids()
+first expands the requested Tier-A range without considering availability. Then
+resolve_requested_offer_ids() intersects it with discovered available historical
+IDs, sorted, and rejects an empty resolved set. This preserves unavailable but
+valid explicit IDs in run_metadata.requested_offer_ids and writes only runnable
+ones to run_metadata.resolved_offer_ids. With no flag, both lists are the sorted
+available Tier-A IDs. Keep this small parser local: compare._build_offer_ids is a
+private, broader policy helper whose availability intersection would erase the
+requested-ID audit trail; extracting a shared production helper is not MVP work.
 
 Finish with:
 
@@ -1232,18 +1429,20 @@ With DB credentials and historical files available, run:
 python3 scripts/generate_hard_negatives.py --only-offers 85-86
 ~~~
 
-Verify the non-zero report has requested/resolved IDs, roster differences,
-solver-status counts, and expected gate failures; verify no normal artifact was
-created or replaced. Then run:
+Verify the non-zero report has requested/resolved IDs, roster differences, the
+pinned attrition keys, solver-status counts, selected-roster contract status, and
+expected gate failures; verify no normal artifact was created or replaced. Then
+run:
 
 ~~~bash
 python3 scripts/generate_hard_negatives.py
 ~~~
 
 On success, inspect the nine artifact fields, live schema/config/roster stamps,
-stable record ordering, all required source families, and each coverage count
-at or above 150/20. On failure, keep the report as the diagnosis; do not lower a
-gate or fit an EBM from partial data.
+stable record ordering, all required source families, each coverage count at or
+above 150/20, and that no selected-roster contract failure was reported. On
+failure, keep the report as the diagnosis; do not lower a gate or fit an EBM from
+partial data.
 
 - [ ] **Step 6: Commit and hand off**
 
@@ -1265,9 +1464,9 @@ an exploratory model fit.
 | Defaulted solver provenance, strict solution status, fallback behavior | Task 1 |
 | Feature schema version and shared roster hash | Tasks 1–2 |
 | DB-free tier correction and case-insensitive reconciliation | Task 2 |
-| Preference/template synthetic reuse without tuning-output regression | Task 3 |
-| Artifact/report fields, all three paired gates, atomic write | Task 4 |
-| Tier-A sequential generation, plain-price manual rebuild, atomic exclusions | Task 5 |
+| Preference-filtered template synthetics without tuning-output regression | Task 3 |
+| Artifact/report fields, provenance and paired gates, atomic write | Task 4 |
+| Tier-A sequential generation, filtered roster, plain-price manual rebuild, atomic exclusions | Task 5 |
 | No workers, operator docs, test/live verification | Task 6 |
 
 No EBM, ordinal regression, config-drift audit, Tier B–D support, historical name
