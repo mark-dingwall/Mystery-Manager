@@ -53,18 +53,34 @@ def parse_requested_tier_a_offer_ids(value: str) -> list[int]:
         part = raw_part.strip()
         if not part:
             raise ValueError("requested Tier-A offer IDs must be non-empty")
-        try:
-            if "-" in part:
+        if "-" in part:
+            try:
                 low_text, high_text = part.split("-", 1)
                 low = int(low_text)
                 high = int(high_text)
-                if high < low:
-                    raise ValueError
-                requested.update(range(low, high + 1))
-            else:
+            except ValueError as exc:
+                raise ValueError(
+                    f"invalid Tier-A offer selection: {part!r}"
+                ) from exc
+            outside_tier_a = [
+                endpoint
+                for endpoint in (low, high)
+                if endpoint not in TIER_A_OFFER_IDS
+            ]
+            if outside_tier_a:
+                raise ValueError(
+                    f"range endpoints are outside Tier-A: {outside_tier_a}"
+                )
+            if high < low:
+                raise ValueError(f"invalid Tier-A offer selection: {part!r}")
+            requested.update(range(low, high + 1))
+        else:
+            try:
                 requested.add(int(part))
-        except ValueError as exc:
-            raise ValueError(f"invalid Tier-A offer selection: {part!r}") from exc
+            except ValueError as exc:
+                raise ValueError(
+                    f"invalid Tier-A offer selection: {part!r}"
+                ) from exc
 
     if not requested:
         raise ValueError("requested Tier-A offer IDs must be non-empty")
@@ -348,26 +364,33 @@ def finalize_run(
     report_path: Path,
 ) -> int:
     """Write either a complete valid artifact or an audit-only failure report."""
+    if out_path.resolve() == report_path.resolve():
+        raise ValueError("artifact and failure-report paths must be distinct")
+
     source_counts = dict(sorted(Counter(
         record["source"] for record in records
     ).items()))
-    artifact = build_artifact(
-        records,
-        source_counts,
-        roster_check,
-        attrition,
-        exclusions,
-        requested_offer_ids,
-        resolved_offer_ids,
-    )
+    if errors:
+        report = build_failure_report(
+            "execution_failed",
+            [],
+            source_counts,
+            roster_check,
+            attrition,
+            exclusions,
+            errors,
+            requested_offer_ids,
+            resolved_offer_ids,
+        )
+        write_json_atomically(report_path, report)
+        return 1
+
     failed_gates = validation_failures(
         records, source_counts, roster_contract_failures
     )
-
-    if errors or failed_gates:
-        status = "execution_failed" if errors else "validation_failed"
+    if failed_gates:
         report = build_failure_report(
-            status,
+            "validation_failed",
             failed_gates,
             source_counts,
             roster_check,
@@ -380,5 +403,14 @@ def finalize_run(
         write_json_atomically(report_path, report)
         return 1
 
+    artifact = build_artifact(
+        records,
+        source_counts,
+        roster_check,
+        attrition,
+        exclusions,
+        requested_offer_ids,
+        resolved_offer_ids,
+    )
     write_json_atomically(out_path, artifact)
     return 0

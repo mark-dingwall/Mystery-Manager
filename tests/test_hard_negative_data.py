@@ -427,3 +427,60 @@ def test_failed_run_preserves_existing_artifact_and_writes_report(tmp_path):
     ) == 1
     assert out.read_text() == '{"prior": true}\n'
     assert __import__("json").loads(report.read_text())["status"] == "validation_failed"
+
+
+def test_execution_error_short_circuits_success_artifact_build(tmp_path):
+    import json
+
+    from scripts.generate_hard_negatives import finalize_run
+
+    out = tmp_path / "hard_negatives.json"
+    report = tmp_path / "hard_negatives_report.json"
+    out.write_text('{"prior": true}\n')
+
+    assert finalize_run(
+        records=[{"source": "manual"}],
+        requested_offer_ids=[64], resolved_offer_ids=[64],
+        roster_check={"offers": [], "totals": {}}, attrition={}, exclusions=[],
+        errors=[{"offer_id": 64, "type": "RuntimeError", "message": "boom"}],
+        roster_contract_failures=[], out_path=out, report_path=report,
+    ) == 1
+    assert out.read_text() == '{"prior": true}\n'
+    payload = json.loads(report.read_text())
+    assert payload["status"] == "execution_failed"
+    assert payload["failed_gates"] == []
+    assert payload["source_counts"] == {"manual": 1}
+
+
+def test_finalize_run_rejects_aliased_artifact_and_report_paths(tmp_path):
+    import pytest
+
+    from scripts.generate_hard_negatives import finalize_run
+
+    destination = tmp_path / "hard_negatives.json"
+    destination.write_text('{"prior": true}\n')
+
+    with pytest.raises(ValueError, match="distinct"):
+        finalize_run(
+            records=[], requested_offer_ids=[64], resolved_offer_ids=[64],
+            roster_check={"offers": [], "totals": {}}, attrition={},
+            exclusions=[], errors=[], roster_contract_failures=[],
+            out_path=destination, report_path=destination,
+        )
+    assert destination.read_text() == '{"prior": true}\n'
+
+
+def test_requested_offer_range_validates_endpoint_before_expansion(monkeypatch):
+    import pytest
+    import scripts.generate_hard_negatives as generator
+
+    real_range = range
+
+    def reject_large_range(start, stop):
+        if stop - start > 1_000:
+            raise AssertionError("large range expanded before validation")
+        return real_range(start, stop)
+
+    monkeypatch.setattr(generator, "range", reject_large_range, raising=False)
+    with pytest.raises(ValueError, match="Tier-A"):
+        generator.parse_requested_tier_a_offer_ids("64-1000000000")
