@@ -121,10 +121,10 @@ diversity denominators.
 
 For each offer, the generator first builds and tier-corrects the DB roster,
 intersects it with historical email columns, and creates one selected roster
-from those matched boxes. Every allocation strategy receives a fresh copy of
-that selected roster. Manual rows use the matched box's corrected tier and DB
-preference directly. This gives manual, baseline, and ILP rows the same box
-population, tier, and preference distribution.
+from those matched boxes. Every allocation strategy receives an independent
+deep copy of that selected roster. Manual rows use the matched box's corrected
+tier and DB preference directly. This gives manual, baseline, and ILP rows the
+same box population, tier, and preference distribution.
 
 ### Generator
 
@@ -220,8 +220,9 @@ requested/resolved/eligible/excluded offer counts, CSV/DB/selected roster
 candidate counts, solver-status counts, per-source empty/unextractable counts,
 and paired-cell/final counts for **each** EBM rung. `exclusions` is the per-offer
 event list, with a reason and detail for each offer removed from the artifact.
-`run_metadata` records the requested offer IDs, resolved offer IDs, and
-deterministic generator version.
+`run_metadata` records the requested offer IDs, resolved offer IDs, and the
+module-owned deterministic generator version. That integer is bumped only for a
+change that can alter generated records, eligibility, or validation meaning.
 
 For a feature-extraction `None`, `empty` means all allocation quantities are
 non-positive; `unextractable` means at least one allocation quantity is positive
@@ -242,10 +243,12 @@ all manual rows must never satisfy any rung's gate.
    the generator validates every emitted row against its selected roster's
    canonical DB email, corrected tier, and four tag-denominator cardinalities;
    a mismatch is a hard `selected_roster_contract` gate failure.
-4. The run carries the current feature schema version, feature config hash, and
-   roster config hash; each must match its live value. Every required family is
-   represented: `manual`, at least one `synth_*` source, all three named
-   `baseline_*` sources, and `ilp_optimal`.
+4. The artifact stamps the feature schema version, feature config hash, and
+   roster config hash used for generation. PR #3 recomputes and compares those
+   values when it loads the artifact; PR #2 does not tautologically compare a
+   newly built artifact against the same in-process values. Every required
+   family is represented: `manual`, at least one `synth_*` source, all three
+   named `baseline_*` sources, and `ilp_optimal`.
 
 No fill-to-target floor applies to baseline or synthetic records. They are
 deliberately negative classes, so an underfilled but feature-extractable box is
@@ -276,6 +279,11 @@ an unexpected worker/code error. A `validation_failed` report has one or more
 `errors`. The report lists each failed gate, source counts, roster differences,
 worker/data exclusions, non-optimal solver statuses by cause, and paired-rung
 counts.
+
+An unexpected execution error is neither an eligible nor an excluded offer: no
+per-offer eligibility decision was produced. It remains counted as resolved and
+appears in `errors`, while `eligible_offers` and `excluded_offers` count only
+returned OfferOutcomes.
 
 Offer-level eligibility is atomic across source families. A missing XLSX, no
 item lookup, empty CSV/DB email-roster intersection, non-optimal ILP status, or

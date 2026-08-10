@@ -603,6 +603,28 @@ def test_selected_synthetic_template_rejects_an_empty_preference_pool():
     template = SyntheticTemplate("fruit@example.com", "small", "fruit_only", {})
     with pytest.raises(EmptyPreferenceItemPoolError, match="fruit@example.com"):
         generate_synthetic_boxes(80, lookup, {}, templates=[template])
+
+
+def test_synthetic_recipe_helper_preserves_the_empty_item_guard():
+    from random import Random
+    from scripts.extract_features import _synthetic_allocations
+
+    assert _synthetic_allocations({}, "small", Random(1)) == []
+
+
+def test_template_synthetics_propagate_unsupported_categories_but_legacy_skips(monkeypatch):
+    import pytest
+    import scripts.extract_features as extractor
+
+    def raise_unsupported(*_args, **_kwargs):
+        raise extractor.UnsupportedCategoryError("test category")
+
+    monkeypatch.setattr(extractor, "extract_box_features", raise_unsupported)
+    lookup = {1: {"price": 100}}
+    assert extractor.generate_synthetic_boxes(80, lookup, {}) == []
+    template = extractor.SyntheticTemplate("box@example.com", "small", None, {})
+    with pytest.raises(extractor.UnsupportedCategoryError, match="test category"):
+        extractor.generate_synthetic_boxes(80, lookup, {}, templates=[template])
 ~~~
 
 - [ ] **Step 2: Run the tests to confirm the red state**
@@ -611,10 +633,10 @@ def test_selected_synthetic_template_rejects_an_empty_preference_pool():
 python3 -m pytest tests/test_tuning.py tests/test_hard_negative_data.py -q -k "synthetic"
 ~~~
 
-Expected: the template and recipe-helper tests fail because SyntheticTemplate,
-the templates parameter, and _synthetic_allocations do not exist. If the legacy
-expectation reveals a pre-existing fixture assumption, correct the expectation
-before changing production code.
+Expected: the template, exception-policy, and recipe-helper tests fail because
+SyntheticTemplate, the templates parameter, and _synthetic_allocations do not
+exist. If the legacy expectation reveals a pre-existing fixture assumption,
+correct the expectation before changing production code.
 
 - [ ] **Step 3: Share the allocation recipes while keeping legacy behavior**
 
@@ -642,7 +664,9 @@ if templates is None:
     rng = Random(offer_id)
     for tier in ("small", "medium", "large"):
         for source, fragment, allocations in _synthetic_allocations(item_lookup, tier, rng):
-            emit(f"synth_{fragment}_{tier}", tier, source, None, available_tags, allocations)
+            emit_legacy(
+                f"synth_{fragment}_{tier}", tier, source, None, available_tags, allocations,
+            )
 else:
     for template in templates:
         rng = Random(f"{offer_id}:{template.box_name.casefold()}:{template.tier}")
@@ -657,23 +681,31 @@ else:
         for source, _fragment, allocations in _synthetic_allocations(
             allowed_lookup, template.tier, rng
         ):
-            emit(template.box_name, template.tier, source, template.preference,
-                 template.available_tags, allocations)
+            emit_template(
+                template.box_name, template.tier, source, template.preference,
+                template.available_tags, allocations,
+            )
 ~~~
 
 Add a private `_matches_preference(info, preference)` that returns true for all
 items with `None`, only `CATEGORY_FRUIT` for `fruit_only`, and only
 `CATEGORY_VEGETABLES` for `veg_only`; import those category constants alongside
-the existing configuration imports. `emit()` still passes the original complete
+the existing configuration imports. Both emitters pass the original complete
 `item_lookup` to feature extraction, while recipe construction receives the
-filtered lookup, so IDs and category checks remain canonical. The legacy emitter
-continues to use _extract_or_skip. Add an internal template emitter that permits
-UnsupportedCategoryError to propagate; the hard-negative generator will turn it
-into a whole-offer exclusion rather than a silent missing synthetic row.
+filtered lookup, so IDs and category checks remain canonical. Define
+`emit_legacy()` as the existing `_extract_or_skip()` skip-and-append behavior,
+and `emit_template()` as a direct `extract_box_features()` call that appends a
+non-None result. The latter deliberately permits `UnsupportedCategoryError` to
+propagate; the hard-negative generator will turn it into a whole-offer exclusion
+rather than a silent missing synthetic row.
 Likewise, an empty filtered template pool raises EmptyPreferenceItemPoolError;
 the hard-negative offer processor excludes that whole offer as
 `empty_preference_item_pool` instead of retaining manual/baseline rows with no
 same-roster synthetic counterpart.
+
+Keep the existing `if not sorted_items: return []` guard at the top of
+`_synthetic_allocations()`. It is part of the legacy no-item behavior and must
+run before selecting the cheapest item.
 
 - [ ] **Step 4: Verify this slice**
 
@@ -705,6 +737,7 @@ git commit -m "feat: template synthetic hard-negative boxes"
 ~~~python
 TIER_A_OFFER_IDS = frozenset(range(64, 110))
 ADMITTING_ILP_STATUS = "Optimal Solution Found"
+GENERATOR_VERSION = 1
 BASELINE_SOURCES = (
     "baseline_deal_topup",
     "baseline_minmax_deficit",
@@ -728,7 +761,6 @@ def validation_failures(
     records: list[dict], source_counts: dict[str, int],
     roster_contract_failures: Sequence[dict] = (),
 ) -> list[dict]: pass
-def artifact_guard_failures(artifact: dict) -> list[dict]: pass
 def build_artifact(
     records: list[dict], source_counts: dict[str, int], roster_check: dict,
     attrition: dict, exclusions: list[dict], requested_offer_ids: list[int],
@@ -856,13 +888,13 @@ def test_validation_rejects_nonoptimal_ilp_and_missing_baseline_source():
     assert "required_sources" in gates
 
 
-def test_build_artifact_has_exact_guarded_shape():
+def test_build_artifact_has_exact_stamped_shape():
     from collections import Counter
 
     from allocator.box_features import FEATURE_SCHEMA_VERSION, config_hash
     from allocator.hard_negative_roster import roster_config_hash
     from scripts.generate_hard_negatives import (
-        artifact_guard_failures, build_artifact, validation_failures,
+        GENERATOR_VERSION, build_artifact, validation_failures,
     )
 
     records = _gate_records()
@@ -887,7 +919,7 @@ def test_build_artifact_has_exact_guarded_shape():
     assert artifact["feature_schema_version"] == FEATURE_SCHEMA_VERSION
     assert artifact["config_hash"] == config_hash()
     assert artifact["roster_config_hash"] == roster_config_hash()
-    assert artifact_guard_failures(artifact) == []
+    assert artifact["run_metadata"]["generator_version"] == GENERATOR_VERSION
     assert artifact["records"] == sorted(
         records,
         key=lambda r: (
@@ -895,10 +927,6 @@ def test_build_artifact_has_exact_guarded_shape():
             r.get("solver_status", ""),
         ),
     )
-    artifact["roster_config_hash"] = "stale"
-    assert {failure["gate"] for failure in artifact_guard_failures(artifact)} == {
-        "roster_config_hash"
-    }
 
 
 def test_failed_run_preserves_existing_artifact_and_writes_report(tmp_path):
@@ -931,9 +959,10 @@ Expected: ModuleNotFoundError for scripts.generate_hard_negatives.
 
 - [ ] **Step 3: Implement the artifact contract**
 
-Create scripts/generate_hard_negatives.py with only stdlib,
-allocator.box_features, and allocator.hard_negative_roster imports at module
-scope. Its stdlib imports include argparse, Callable, Counter, dataclass, field, Iterable,
+Create scripts/generate_hard_negatives.py with only stdlib and the allocator
+modules allocator.box_features, allocator.hard_negative_roster, and
+allocator.config imported at module scope. Its stdlib imports include argparse,
+Callable, Counter, dataclass, field, Iterable,
 Literal, Mapping, json, os, Path, Sequence, tempfile, and copy. Import DONATION_IDENTIFIERS,
 SKIP_COLUMN_IDENTIFIERS, and STAFF_IDENTIFIERS from allocator.config so the
 customer-column filter has the same exact-name policy as compare.py. Import the
@@ -1018,10 +1047,10 @@ validation_failures() returns every failure, rather than stopping at the first:
    source, and ilp_optimal;
 4. all supplied selected-roster contract failures.
 
-Separately, finalize_run() passes the constructed artifact to
-artifact_guard_failures(), which compares its schema/config/roster stamps to
-live FEATURE_SCHEMA_VERSION, config_hash(), and roster_config_hash(). It appends
-those independent failures after calling validation_failures().
+`finalize_run()` does not compare a newly built artifact's stamps back to the
+same live values: that would be tautological. It writes the feature-schema,
+feature-config, and roster-config stamps as provenance; PR #3's artifact loader
+will compare them to its live values before fitting an EBM.
 
 build_artifact() produces exactly these nine top-level fields:
 
@@ -1045,10 +1074,15 @@ sorted_records = sorted(
     "run_metadata": {
         "requested_offer_ids": requested_offer_ids,
         "resolved_offer_ids": resolved_offer_ids,
-        "generator_version": 1,
+        "generator_version": GENERATOR_VERSION,
     },
 }
 ~~~
+
+`GENERATOR_VERSION` is the module-level integer for generation semantics. Bump
+it whenever a change can alter emitted records, source eligibility, or validation
+meaning; do not bump it for formatting-only changes. It is provenance for the
+later artifact consumer, not a second feature-schema version.
 
 build_failure_report() produces exactly:
 status, failed_gates, source_counts, roster_check, attrition, run_metadata,
@@ -1056,15 +1090,17 @@ exclusions, errors. Use status execution_failed if errors is non-empty;
 otherwise use validation_failed when gates fail.
 
 finalize_run() builds the artifact, passes the aggregated per-offer
-roster_contract_failures to validation_failures(), concatenates those failures
-with artifact_guard_failures(), then chooses whether the normal artifact can be
-written. That second check protects the unlikely case of a configuration change
-between per-offer collection and atomic output.
+roster_contract_failures to validation_failures(), then chooses whether the
+normal artifact can be written. Configuration stamps are generation provenance,
+not an in-process config audit.
 
-write_json_atomically() creates the output parent, writes formatted sorted JSON
-to a NamedTemporaryFile in the destination directory, flushes and fsyncs it,
-then os.replace()s it into place. finalize_run() writes --out only when there
-are no errors and no failed gates; failures write only --report-out.
+write_json_atomically() creates the output parent, then uses
+`NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent, delete=False)`.
+It writes formatted sorted JSON, flushes and fsyncs, closes the temporary file,
+then `os.replace()`s its saved path into place. `delete=False` and closing before
+replacement make this work on Windows as well as POSIX. finalize_run() writes
+--out only when there are no errors and no failed gates; failures write only
+--report-out.
 
 - [ ] **Step 4: Verify this slice**
 
@@ -1190,6 +1226,30 @@ def test_execute_discards_every_source_for_nonoptimal_offer(tmp_path):
     assert report["source_counts"] == {}
 
 
+def test_execute_reports_an_unexpected_error_without_classifying_that_offer(tmp_path):
+    from scripts.generate_hard_negatives import execute
+
+    def process_one(_offer_id):
+        raise RuntimeError("test failure")
+
+    assert execute(
+        [64], process_one,
+        out_path=tmp_path / "hard_negatives.json",
+        report_path=tmp_path / "hard_negatives_report.json",
+        requested_offer_ids=[64],
+    ) == 1
+    report = __import__("json").loads(
+        (tmp_path / "hard_negatives_report.json").read_text()
+    )
+    assert report["status"] == "execution_failed"
+    assert report["errors"] == [
+        {"offer_id": 64, "exception": "RuntimeError", "message": "test failure"},
+    ]
+    assert report["attrition"]["resolved_offers"] == 1
+    assert report["attrition"]["eligible_offers"] == 0
+    assert report["attrition"]["excluded_offers"] == 0
+
+
 def test_execute_aggregates_the_pinned_attrition_contract(tmp_path):
     from scripts.generate_hard_negatives import OfferOutcome, execute
 
@@ -1286,6 +1346,66 @@ the failure report.
 This test must not introduce a production dependency-injection API or connect to
 the DB.
 
+Use this executable setup scaffold, then retain the assertions above plus the
+final failure-report assertions:
+
+~~~python
+def test_process_offer_uses_only_the_selected_customer_roster(monkeypatch, make_box, tmp_path):
+    from types import SimpleNamespace
+    import allocator.allocator as allocator_module
+    import allocator.box_features as box_features
+    from allocator.config import (
+        CATEGORY_FRUIT, CATEGORY_VEGETABLES, DONATION_IDENTIFIERS,
+        SKIP_COLUMN_IDENTIFIERS, STAFF_IDENTIFIERS,
+    )
+    import compare
+    import scripts.generate_hard_negatives as hard_negatives
+
+    csv_name, db_name = "fruit@example.com", "FRUIT@example.com"
+    raw_csv_names = [
+        csv_name, next(iter(DONATION_IDENTIFIERS)),
+        next(iter(SKIP_COLUMN_IDENTIFIERS)), next(iter(STAFF_IDENTIFIERS)),
+    ]
+    lookup = {
+        1: {"name": "Apple", "price": 100, "category_id": CATEGORY_FRUIT,
+            "fungible_group": "apple", "fungible_degree": 0.7,
+            "sub_category": "pome", "usage": "snacking", "colour": "red",
+            "shape": "round", "size": 1},
+        2: {"name": "Carrot", "price": 100, "category_id": CATEGORY_VEGETABLES,
+            "fungible_group": None, "fungible_degree": 0.0,
+            "sub_category": "root", "usage": "cooking", "colour": "orange",
+            "shape": "long", "size": 1},
+    }
+    monkeypatch.setattr(compare, "_find_xlsx_path", lambda _offer_id: tmp_path / "offer.xlsx")
+    monkeypatch.setattr(compare, "build_item_lookup", lambda _offer_id: lookup)
+    monkeypatch.setattr(
+        compare, "load_historical_csv", lambda _offer_id: (raw_csv_names, {1: {csv_name: 1}}),
+    )
+    monkeypatch.setattr(
+        allocator_module, "build_boxes_from_db",
+        lambda _offer_id: [make_box(name=db_name, tier="small", preference="fruit_only")],
+    )
+    strategies, manual_inputs = [], []
+    real_extract = box_features.extract_box_features
+
+    def fake_allocate(_offer_id, _xlsx_path, *, boxes, strategy, **_kwargs):
+        strategies.append(strategy)
+        boxes[0].allocations = {1: 1}
+        return SimpleNamespace(boxes=boxes, solver_status="Optimal Solution Found")
+
+    def spy_extract(box_name, allocations, *args, source="manual", **kwargs):
+        if source == "manual":
+            manual_inputs.append((box_name, allocations))
+        return real_extract(box_name, allocations, *args, source=source, **kwargs)
+
+    monkeypatch.setattr(allocator_module, "allocate", fake_allocate)
+    monkeypatch.setattr(box_features, "extract_box_features", spy_extract)
+    outcome = hard_negatives.process_offer(80)
+    assert strategies == ["ilp-optimal", "deal-topup", "minmax-deficit", "greedy-best-fit"]
+    assert manual_inputs == [(db_name, {1: 1})]
+    # Assert the selected-roster and failure-report contract described above.
+~~~
+
 - [ ] **Step 2: Run the tests to confirm the red state**
 
 ~~~bash
@@ -1351,16 +1471,19 @@ Perform this exact sequence for every offer:
        "veg_only": compare.compute_available_tags(item_lookup, preference="veg_only"),
    }
    ~~~
-6. Call allocate() for ilp-optimal first with a fresh deep copy of selected
-   boxes. Any status other than the admitting string returns a nonoptimal_ilp
-   whole-offer exclusion and records that status count. Add solver_status to
-   every admitted ILP feature record.
-7. Call allocate() with fresh copies of the same selected boxes for only
-   deal-topup, minmax-deficit, and greedy-best-fit. Emit source labels
-   baseline_deal_topup, baseline_minmax_deficit, baseline_greedy_best_fit. The
-   four `allocate()` calls deliberately reread the XLSX. Do not widen the
-   production allocator with preloaded items/overage solely for this one-off
-   diagnostic; measure it after MVP if runtime becomes material.
+6. Call `allocate(offer_id, xlsx_path, boxes=copy.deepcopy(selected_boxes),
+   strategy="ilp-optimal")` first. Any status other than the admitting string
+   returns a nonoptimal_ilp whole-offer exclusion and records that status count.
+   Add solver_status to every admitted ILP feature record.
+7. For each of deal-topup, minmax-deficit, and greedy-best-fit, call
+   `allocate()` with another independent `copy.deepcopy(selected_boxes)` and
+   that `strategy=` value. Do not import or call a baseline strategy's `run()`
+   function directly: allocate() retains the shared item, charity, and stock
+   infrastructure required by CLAUDE.md. Emit source labels baseline_deal_topup,
+   baseline_minmax_deficit, baseline_greedy_best_fit. The four `allocate()` calls
+   deliberately reread the XLSX. Do not widen the production allocator with
+   preloaded items/overage solely for this one-off diagnostic; measure it after
+   MVP if runtime becomes material.
 8. Rebuild manual records from historical_allocations[item_id][csv_name] with
    the matched corrected tier/preference and plain item_lookup. Do not call
    read_xlsx_pack_overrides.
@@ -1383,7 +1506,9 @@ Perform this exact sequence for every offer:
 
 Catch unexpected exceptions in execute(), not as ordinary attrition: record
 offer_id, exception class, and message in errors; continue to later sorted
-offers; and make the final report execution_failed.
+offers; and make the final report execution_failed. Such an error is neither an
+eligible nor an excluded outcome, because process_offer() did not return an
+eligibility decision. It remains included only in resolved_offers and errors.
 
 - [ ] **Step 4: Implement execute() and CLI**
 
@@ -1431,19 +1556,23 @@ build_parser() exposes only:
 ~~~
 
 Do not use compare._build_offer_ids for explicit selection because it allows Tier
-B–D values. For an explicit `--only-offers`, parse_requested_tier_a_offer_ids()
-first expands the requested Tier-A range without considering availability. Then
-resolve_requested_offer_ids() intersects it with discovered available historical
-IDs, sorted, and rejects an empty resolved set. This preserves unavailable but
-valid explicit IDs in run_metadata.requested_offer_ids and writes only runnable
-ones to run_metadata.resolved_offer_ids. With no flag, both lists are the sorted
-available Tier-A IDs. Keep this small parser local: compare._build_offer_ids is a
-private, broader policy helper whose availability intersection would erase the
-requested-ID audit trail; extracting a shared production helper is not MVP work.
-`default_tier_a_offer_ids(available)` is the no-flag path and returns exactly
-`sorted(available & TIER_A_OFFER_IDS)`. resolve_requested_offer_ids() also
-intersects its result with TIER_A_OFFER_IDS defensively. main() must call the
-default helper rather than passing all discovered IDs through to execution.
+B–D values. In main(), lazily import compare and set
+`available = compare._discover_cleaned_offer_ids()`: that existing narrow helper
+is the authoritative scan of cleaned historical CSVs without collapsing the
+requested-ID audit trail. For an explicit `--only-offers`,
+parse_requested_tier_a_offer_ids() first expands the requested Tier-A range
+without considering availability. Then resolve_requested_offer_ids() intersects
+it with `available`, sorted, and rejects an empty resolved set. This preserves
+unavailable but valid explicit IDs in run_metadata.requested_offer_ids and writes
+only runnable ones to run_metadata.resolved_offer_ids. With no flag, both lists
+are the sorted available Tier-A IDs. Keep this small parser local:
+compare._build_offer_ids is a private, broader policy helper whose availability
+intersection would erase the requested-ID audit trail; extracting a shared
+production helper is not MVP work. `default_tier_a_offer_ids(available)` is the
+no-flag path and returns exactly `sorted(available & TIER_A_OFFER_IDS)`.
+resolve_requested_offer_ids() also intersects its result with TIER_A_OFFER_IDS
+defensively. main() must call the default helper rather than passing all
+discovered IDs through to execution.
 
 Finish with:
 
