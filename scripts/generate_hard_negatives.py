@@ -14,8 +14,12 @@ from dataclasses import dataclass, field
 import json
 import os
 from pathlib import Path
+import sys
 import tempfile
 from typing import Literal
+
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from allocator.box_features import FEATURE_SCHEMA_VERSION, config_hash
 from allocator.config import (
@@ -44,6 +48,36 @@ RUNG_NEGATIVE_SELECTORS = {
     "manual_vs_baseline": "baseline_",
     "manual_vs_ilp": "ilp_optimal",
 }
+
+
+@dataclass
+class OfferOutcome:
+    offer_id: int
+    records: list[dict]
+    roster_entry: dict
+    attrition: dict
+    roster_contract_failures: list[dict] = field(default_factory=list)
+    exclusion: dict | None = None
+    error: dict | None = None
+
+
+def empty_roster_entry(offer_id: int) -> dict:
+    """Return the complete roster-audit shape for an unprocessed offer."""
+    return {
+        "offer_id": offer_id,
+        "csv_only": [],
+        "db_only": [],
+        "selected_count": 0,
+    }
+
+
+def empty_offer_attrition() -> dict:
+    """Return the fixed per-offer attrition shape used by orchestration."""
+    return {
+        "roster_candidates": {"csv": 0, "db": 0, "selected": 0},
+        "solver_statuses": {},
+        "row_attrition": {},
+    }
 
 
 def parse_requested_tier_a_offer_ids(value: str) -> list[int]:
@@ -419,3 +453,406 @@ def finalize_run(
     )
     write_json_atomically(out_path, artifact)
     return 0
+
+
+def process_offer(offer_id: int) -> OfferOutcome:
+    """Generate every hard-negative source for one reconciled customer roster."""
+    import compare
+    from allocator.allocator import allocate, build_boxes_from_db
+    from allocator.box_features import (
+        UnsupportedCategoryError,
+        extract_box_features,
+    )
+    from scripts.extract_features import (
+        EmptyPreferenceItemPoolError,
+        SyntheticTemplate,
+        generate_synthetic_boxes,
+    )
+
+    roster_entry = empty_roster_entry(offer_id)
+    attrition = empty_offer_attrition()
+
+    xlsx_path = compare._find_xlsx_path(offer_id)
+    if xlsx_path is None:
+        return OfferOutcome(
+            offer_id,
+            [],
+            roster_entry,
+            attrition,
+            exclusion={
+                "offer_id": offer_id,
+                "reason": "missing_xlsx",
+                "detail": "shopping-list XLSX not found",
+            },
+        )
+
+    item_lookup = compare.build_item_lookup(offer_id)
+    if not item_lookup:
+        return OfferOutcome(
+            offer_id,
+            [],
+            roster_entry,
+            attrition,
+            exclusion={
+                "offer_id": offer_id,
+                "reason": "missing_item_lookup",
+                "detail": "item lookup is empty",
+            },
+        )
+
+    raw_csv_names, historical_allocations = compare.load_historical_csv(offer_id)
+    csv_names = customer_csv_names(raw_csv_names)
+    attrition["roster_candidates"]["csv"] = len(csv_names)
+    if not csv_names:
+        return OfferOutcome(
+            offer_id,
+            [],
+            roster_entry,
+            attrition,
+            exclusion={
+                "offer_id": offer_id,
+                "reason": "missing_historical_csv",
+                "detail": "historical CSV has no customer columns",
+            },
+        )
+
+    try:
+        db_boxes = correct_box_tiers(offer_id, build_boxes_from_db(offer_id))
+        attrition["roster_candidates"]["db"] = len(db_boxes)
+        intersection = intersect_roster(csv_names, [box.name for box in db_boxes])
+    except AmbiguousRosterIdentityError as exc:
+        return OfferOutcome(
+            offer_id,
+            [],
+            roster_entry,
+            attrition,
+            exclusion={
+                "offer_id": offer_id,
+                "reason": "ambiguous_roster_identity",
+                "detail": str(exc),
+            },
+        )
+
+    attrition["roster_candidates"]["selected"] = len(intersection.matches)
+    roster_entry.update({
+        "csv_only": list(intersection.csv_only),
+        "db_only": list(intersection.db_only),
+        "selected_count": len(intersection.matches),
+    })
+    if not intersection.matches:
+        return OfferOutcome(
+            offer_id,
+            [],
+            roster_entry,
+            attrition,
+            exclusion={
+                "offer_id": offer_id,
+                "reason": "empty_roster_intersection",
+                "detail": "CSV and DB customer rosters do not overlap",
+            },
+        )
+
+    boxes_by_identity = {box.name.casefold(): box for box in db_boxes}
+    selected = [
+        (match.csv_name, copy.deepcopy(boxes_by_identity[match.db_name.casefold()]))
+        for match in intersection.matches
+    ]
+    selected_boxes = [box for _csv_name, box in selected]
+    variants = {
+        "all": compare.compute_available_tags(item_lookup),
+        "fruit_only": compare.compute_available_tags(
+            item_lookup, preference="fruit_only"
+        ),
+        "veg_only": compare.compute_available_tags(
+            item_lookup, preference="veg_only"
+        ),
+    }
+
+    ilp_result = allocate(
+        offer_id,
+        xlsx_path,
+        boxes=copy.deepcopy(selected_boxes),
+        strategy="ilp-optimal",
+    )
+    solver_status = ilp_result.solver_status
+    solver_status_key = solver_status or "<missing>"
+    attrition["solver_statuses"][solver_status_key] = 1
+    if not admits_to_ilp_class(solver_status):
+        return OfferOutcome(
+            offer_id,
+            [],
+            roster_entry,
+            attrition,
+            exclusion={
+                "offer_id": offer_id,
+                "reason": "nonoptimal_ilp",
+                "detail": solver_status_key,
+            },
+        )
+
+    baseline_results = []
+    for strategy, source in (
+        ("deal-topup", "baseline_deal_topup"),
+        ("minmax-deficit", "baseline_minmax_deficit"),
+        ("greedy-best-fit", "baseline_greedy_best_fit"),
+    ):
+        result = allocate(
+            offer_id,
+            xlsx_path,
+            boxes=copy.deepcopy(selected_boxes),
+            strategy=strategy,
+        )
+        baseline_results.append((source, result))
+
+    provisional_records: list[dict] = []
+
+    def extract_and_append(box, allocations: dict[int, int], source: str) -> None:
+        tags = tags_for_preference(box.preference, variants)
+        feature = extract_box_features(
+            box.name,
+            allocations,
+            item_lookup,
+            box.tier,
+            tags,
+            offer_id,
+            source=source,
+            preference=box.preference,
+        )
+        if feature is None:
+            source_attrition = attrition["row_attrition"].setdefault(
+                source, {"empty": 0, "unextractable": 0}
+            )
+            reason = unextracted_row_reason(allocations, item_lookup)
+            source_attrition[reason] += 1
+            return
+        if source == "ilp_optimal":
+            feature["solver_status"] = solver_status
+        provisional_records.append(feature)
+
+    try:
+        for csv_name, box in selected:
+            manual_allocations = {
+                item_id: allocations[csv_name]
+                for item_id, allocations in historical_allocations.items()
+                if csv_name in allocations
+            }
+            extract_and_append(box, manual_allocations, "manual")
+
+        for box in ilp_result.boxes:
+            extract_and_append(box, box.allocations, "ilp_optimal")
+
+        for source, result in baseline_results:
+            for box in result.boxes:
+                extract_and_append(box, box.allocations, source)
+
+        templates = [
+            SyntheticTemplate(
+                box.name,
+                box.tier,
+                box.preference,
+                tags_for_preference(box.preference, variants),
+            )
+            for box in selected_boxes
+        ]
+        provisional_records.extend(
+            generate_synthetic_boxes(
+                offer_id,
+                item_lookup,
+                variants["all"],
+                templates=templates,
+            )
+        )
+    except UnsupportedCategoryError as exc:
+        return OfferOutcome(
+            offer_id,
+            [],
+            roster_entry,
+            attrition,
+            exclusion={
+                "offer_id": offer_id,
+                "reason": "unsupported_category",
+                "detail": str(exc),
+            },
+        )
+    except EmptyPreferenceItemPoolError as exc:
+        return OfferOutcome(
+            offer_id,
+            [],
+            roster_entry,
+            attrition,
+            exclusion={
+                "offer_id": offer_id,
+                "reason": "empty_preference_item_pool",
+                "detail": str(exc),
+            },
+        )
+
+    expected = {
+        (offer_id, box.name.casefold()): {
+            "tier": box.tier,
+            "dim_available": {
+                dimension: len(tags)
+                for dimension, tags in tags_for_preference(
+                    box.preference, variants
+                ).items()
+            },
+        }
+        for box in selected_boxes
+    }
+    return OfferOutcome(
+        offer_id,
+        provisional_records,
+        roster_entry,
+        attrition,
+        roster_contract_failures=selected_roster_contract_failures(
+            provisional_records, expected
+        ),
+    )
+
+
+def execute(
+    offer_ids: list[int],
+    process_one: Callable[[int], OfferOutcome],
+    *,
+    out_path: Path,
+    report_path: Path,
+    requested_offer_ids: list[int],
+) -> int:
+    """Process offers sequentially and aggregate their DB-free outcomes."""
+    records: list[dict] = []
+    roster_entries: list[dict] = []
+    exclusions: list[dict] = []
+    errors: list[dict] = []
+    roster_contract_failures: list[dict] = []
+    eligible_offers = 0
+    excluded_offers = 0
+    aggregate_attrition = empty_offer_attrition()
+
+    for offer_id in offer_ids:
+        try:
+            outcome = process_one(offer_id)
+        except Exception as exc:
+            errors.append({
+                "offer_id": offer_id,
+                "exception": type(exc).__name__,
+                "message": str(exc),
+            })
+            continue
+
+        if outcome.error is not None:
+            errors.append(outcome.error)
+            continue
+
+        roster_entries.append(outcome.roster_entry)
+        for counter_name in ("csv", "db", "selected"):
+            aggregate_attrition["roster_candidates"][counter_name] += (
+                outcome.attrition["roster_candidates"].get(counter_name, 0)
+            )
+        for status, count in outcome.attrition["solver_statuses"].items():
+            aggregate_attrition["solver_statuses"][status] = (
+                aggregate_attrition["solver_statuses"].get(status, 0) + count
+            )
+        for source, reasons in outcome.attrition["row_attrition"].items():
+            aggregate_reasons = aggregate_attrition["row_attrition"].setdefault(
+                source, {"empty": 0, "unextractable": 0}
+            )
+            for reason, count in reasons.items():
+                aggregate_reasons[reason] = aggregate_reasons.get(reason, 0) + count
+
+        roster_contract_failures.extend(outcome.roster_contract_failures)
+        if outcome.exclusion is not None:
+            excluded_offers += 1
+            exclusions.append(outcome.exclusion)
+        else:
+            eligible_offers += 1
+            records.extend(outcome.records)
+
+    roster_check = {
+        "offers": sorted(roster_entries, key=lambda entry: entry["offer_id"]),
+        "totals": {
+            "csv_only": sum(len(entry["csv_only"]) for entry in roster_entries),
+            "db_only": sum(len(entry["db_only"]) for entry in roster_entries),
+            "selected": sum(entry["selected_count"] for entry in roster_entries),
+        },
+    }
+    attrition = {
+        "requested_offers": len(requested_offer_ids),
+        "resolved_offers": len(offer_ids),
+        "eligible_offers": eligible_offers,
+        "excluded_offers": excluded_offers,
+        "roster_candidates": aggregate_attrition["roster_candidates"],
+        "solver_statuses": aggregate_attrition["solver_statuses"],
+        "row_attrition": aggregate_attrition["row_attrition"],
+        "rung_coverage": {
+            rung: paired_rung_coverage(records, selector)
+            for rung, selector in RUNG_NEGATIVE_SELECTORS.items()
+        },
+    }
+    return finalize_run(
+        records,
+        requested_offer_ids,
+        list(offer_ids),
+        roster_check,
+        attrition,
+        exclusions,
+        errors,
+        roster_contract_failures,
+        out_path,
+        report_path,
+    )
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """Build the deliberately small sequential-generator CLI."""
+    parser = argparse.ArgumentParser(
+        description="Generate reconciled hard-negative feature data"
+    )
+    parser.add_argument(
+        "--only-offers",
+        help="comma-separated IDs/ranges; default all available Tier-A offers",
+    )
+    parser.add_argument(
+        "--out",
+        type=Path,
+        default=Path("diagnostics/hard_negatives.json"),
+    )
+    parser.add_argument(
+        "--report-out",
+        type=Path,
+        default=Path("diagnostics/hard_negatives_report.json"),
+    )
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    """Resolve the Tier-A audit trail and run the generator sequentially."""
+    import compare
+
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    available = compare._discover_cleaned_offer_ids()
+    try:
+        if args.only_offers is None:
+            requested_offer_ids = default_tier_a_offer_ids(available)
+            offer_ids = list(requested_offer_ids)
+        else:
+            requested_offer_ids = parse_requested_tier_a_offer_ids(
+                args.only_offers
+            )
+            offer_ids = resolve_requested_offer_ids(
+                requested_offer_ids, available
+            )
+    except ValueError as exc:
+        parser.error(str(exc))
+
+    return execute(
+        offer_ids,
+        process_offer,
+        out_path=args.out,
+        report_path=args.report_out,
+        requested_offer_ids=requested_offer_ids,
+    )
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

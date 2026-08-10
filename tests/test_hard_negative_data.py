@@ -507,3 +507,363 @@ def test_requested_offer_range_validates_endpoint_before_expansion(monkeypatch):
     monkeypatch.setattr(generator, "range", reject_large_range, raising=False)
     with pytest.raises(ValueError, match="Tier-A"):
         generator.parse_requested_tier_a_offer_ids("64-1000000000")
+
+
+def test_requested_and_resolved_tier_a_offers_remain_distinct():
+    import pytest
+    from scripts.generate_hard_negatives import (
+        default_tier_a_offer_ids,
+        parse_requested_tier_a_offer_ids,
+        resolve_requested_offer_ids,
+    )
+
+    requested = parse_requested_tier_a_offer_ids("64,66-67")
+    assert requested == [64, 66, 67]
+    assert resolve_requested_offer_ids(requested, {64, 65, 67}) == [64, 67]
+    assert default_tier_a_offer_ids({63, 64, 109, 110}) == [64, 109]
+    with pytest.raises(ValueError, match="Tier-A"):
+        parse_requested_tier_a_offer_ids("63")
+    with pytest.raises(ValueError, match="non-empty"):
+        resolve_requested_offer_ids([64], {65})
+
+
+def test_execute_discards_every_source_for_nonoptimal_offer(tmp_path):
+    from scripts.generate_hard_negatives import OfferOutcome, execute
+
+    outcome = OfferOutcome(
+        offer_id=64,
+        records=[],
+        roster_entry={
+            "offer_id": 64,
+            "csv_only": [],
+            "db_only": [],
+            "selected_count": 2,
+        },
+        attrition={
+            "roster_candidates": {"csv": 2, "db": 2, "selected": 2},
+            "solver_statuses": {"Solution Found": 1},
+            "row_attrition": {},
+        },
+        exclusion={
+            "offer_id": 64,
+            "reason": "nonoptimal_ilp",
+            "detail": "Solution Found",
+        },
+    )
+    code = execute(
+        [64],
+        lambda _offer_id: outcome,
+        out_path=tmp_path / "hard_negatives.json",
+        report_path=tmp_path / "hard_negatives_report.json",
+        requested_offer_ids=[64],
+    )
+    report = __import__("json").loads(
+        (tmp_path / "hard_negatives_report.json").read_text()
+    )
+    assert code == 1
+    assert report["exclusions"] == [outcome.exclusion]
+    assert report["source_counts"] == {}
+
+
+def test_execute_reports_an_unexpected_error_without_classifying_that_offer(tmp_path):
+    from scripts.generate_hard_negatives import execute
+
+    def process_one(_offer_id):
+        raise RuntimeError("test failure")
+
+    assert execute(
+        [64],
+        process_one,
+        out_path=tmp_path / "hard_negatives.json",
+        report_path=tmp_path / "hard_negatives_report.json",
+        requested_offer_ids=[64],
+    ) == 1
+    report = __import__("json").loads(
+        (tmp_path / "hard_negatives_report.json").read_text()
+    )
+    assert report["status"] == "execution_failed"
+    assert report["errors"] == [
+        {"offer_id": 64, "exception": "RuntimeError", "message": "test failure"},
+    ]
+    assert report["attrition"]["resolved_offers"] == 1
+    assert report["attrition"]["eligible_offers"] == 0
+    assert report["attrition"]["excluded_offers"] == 0
+
+
+def test_execute_aggregates_the_pinned_attrition_contract(tmp_path):
+    from scripts.generate_hard_negatives import OfferOutcome, execute
+
+    outcomes = {
+        64: OfferOutcome(
+            offer_id=64,
+            records=[],
+            roster_entry={
+                "offer_id": 64,
+                "csv_only": [],
+                "db_only": [],
+                "selected_count": 2,
+            },
+            attrition={
+                "roster_candidates": {"csv": 3, "db": 2, "selected": 2},
+                "solver_statuses": {"Solution Found": 1},
+                "row_attrition": {"manual": {"empty": 1, "unextractable": 2}},
+            },
+            exclusion={
+                "offer_id": 64,
+                "reason": "nonoptimal_ilp",
+                "detail": "Solution Found",
+            },
+        ),
+        65: OfferOutcome(
+            offer_id=65,
+            records=[],
+            roster_entry={
+                "offer_id": 65,
+                "csv_only": [],
+                "db_only": [],
+                "selected_count": 3,
+            },
+            attrition={
+                "roster_candidates": {"csv": 4, "db": 3, "selected": 3},
+                "solver_statuses": {"No Solution Exists": 1},
+                "row_attrition": {
+                    "manual": {"empty": 2, "unextractable": 1},
+                    "synth_random": {"empty": 1, "unextractable": 0},
+                },
+            },
+            exclusion={
+                "offer_id": 65,
+                "reason": "nonoptimal_ilp",
+                "detail": "No Solution Exists",
+            },
+        ),
+    }
+    execute(
+        [64, 65],
+        lambda offer_id: outcomes[offer_id],
+        out_path=tmp_path / "hard_negatives.json",
+        report_path=tmp_path / "hard_negatives_report.json",
+        requested_offer_ids=[64, 65],
+    )
+    report = __import__("json").loads(
+        (tmp_path / "hard_negatives_report.json").read_text()
+    )
+    assert report["attrition"] == {
+        "requested_offers": 2,
+        "resolved_offers": 2,
+        "eligible_offers": 0,
+        "excluded_offers": 2,
+        "roster_candidates": {"csv": 7, "db": 5, "selected": 5},
+        "solver_statuses": {"Solution Found": 1, "No Solution Exists": 1},
+        "row_attrition": {
+            "manual": {"empty": 3, "unextractable": 3},
+            "synth_random": {"empty": 1, "unextractable": 0},
+        },
+        "rung_coverage": {
+            "manual_vs_synth": {"manual_boxes": 0, "offers": 0},
+            "manual_vs_baseline": {"manual_boxes": 0, "offers": 0},
+            "manual_vs_ilp": {"manual_boxes": 0, "offers": 0},
+        },
+    }
+
+
+def test_empty_roster_entry_keeps_early_exclusions_aggregateable():
+    from scripts.generate_hard_negatives import empty_roster_entry
+
+    assert empty_roster_entry(64) == {
+        "offer_id": 64,
+        "csv_only": [],
+        "db_only": [],
+        "selected_count": 0,
+    }
+
+
+def test_generator_module_import_does_not_import_compare_or_db():
+    import os
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import sys; import scripts.generate_hard_negatives; "
+                "assert 'compare' not in sys.modules; "
+                "assert 'allocator.db' not in sys.modules"
+            ),
+        ],
+        cwd=root,
+        env={**os.environ, "PYTHONPATH": str(root)},
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+
+
+def test_generator_cli_help_runs_from_project_root():
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    proc = subprocess.run(
+        [sys.executable, "scripts/generate_hard_negatives.py", "--help"],
+        cwd=root,
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "--only-offers" in proc.stdout
+    assert "--out" in proc.stdout
+    assert "--report-out" in proc.stdout
+
+
+def test_process_offer_uses_only_the_selected_customer_roster(
+    monkeypatch, make_box, tmp_path
+):
+    from types import SimpleNamespace
+
+    import allocator.allocator as allocator_module
+    import allocator.box_features as box_features
+    from allocator.config import (
+        CATEGORY_FRUIT,
+        CATEGORY_VEGETABLES,
+        DONATION_IDENTIFIERS,
+        SKIP_COLUMN_IDENTIFIERS,
+        STAFF_IDENTIFIERS,
+    )
+    import compare
+    import scripts.generate_hard_negatives as hard_negatives
+
+    csv_name, db_name = "fruit@example.com", "FRUIT@example.com"
+    filtered_names = [
+        next(iter(DONATION_IDENTIFIERS)),
+        next(iter(SKIP_COLUMN_IDENTIFIERS)),
+        next(iter(STAFF_IDENTIFIERS)),
+    ]
+    raw_csv_names = [csv_name, *filtered_names]
+    lookup = {
+        1: {
+            "name": "Apple",
+            "price": 100,
+            "category_id": CATEGORY_FRUIT,
+            "fungible_group": "apple",
+            "fungible_degree": 0.7,
+            "sub_category": "pome",
+            "usage": "snacking",
+            "colour": "red",
+            "shape": "round",
+            "size": 1,
+        },
+        2: {
+            "name": "Carrot",
+            "price": 100,
+            "category_id": CATEGORY_VEGETABLES,
+            "fungible_group": None,
+            "fungible_degree": 0.0,
+            "sub_category": "root",
+            "usage": "cooking",
+            "colour": "orange",
+            "shape": "long",
+            "size": 1,
+        },
+    }
+    monkeypatch.setattr(
+        compare, "_find_xlsx_path", lambda _offer_id: tmp_path / "offer.xlsx"
+    )
+    monkeypatch.setattr(compare, "build_item_lookup", lambda _offer_id: lookup)
+    monkeypatch.setattr(
+        compare,
+        "load_historical_csv",
+        lambda _offer_id: (raw_csv_names, {1: {csv_name: 1}}),
+    )
+    monkeypatch.setattr(
+        allocator_module,
+        "build_boxes_from_db",
+        lambda _offer_id: [
+            make_box(name=db_name, tier="small", preference="fruit_only")
+        ],
+    )
+    strategies, manual_inputs = [], []
+    real_extract = box_features.extract_box_features
+
+    def fake_allocate(_offer_id, _xlsx_path, *, boxes, strategy, **_kwargs):
+        strategies.append(strategy)
+        boxes[0].allocations = {1: 1}
+        return SimpleNamespace(
+            boxes=boxes, solver_status="Optimal Solution Found"
+        )
+
+    def spy_extract(box_name, allocations, *args, source="manual", **kwargs):
+        if source == "manual":
+            manual_inputs.append((box_name, allocations))
+        return real_extract(
+            box_name, allocations, *args, source=source, **kwargs
+        )
+
+    monkeypatch.setattr(allocator_module, "allocate", fake_allocate)
+    monkeypatch.setattr(box_features, "extract_box_features", spy_extract)
+    outcome = hard_negatives.process_offer(80)
+
+    assert strategies == [
+        "ilp-optimal",
+        "deal-topup",
+        "minmax-deficit",
+        "greedy-best-fit",
+    ]
+    assert manual_inputs == [(db_name, {1: 1})]
+    assert outcome.exclusion is None
+    assert outcome.error is None
+    assert outcome.roster_entry == {
+        "offer_id": 80,
+        "csv_only": [],
+        "db_only": [],
+        "selected_count": 1,
+    }
+    assert not set(filtered_names) & set(outcome.roster_entry["csv_only"])
+    assert outcome.roster_contract_failures == []
+    assert outcome.records
+    assert {record["box_name"] for record in outcome.records} == {db_name}
+    assert {record["tier"] for record in outcome.records} == {"small"}
+    assert all(
+        record["dim_available"]
+        == {"sub_category": 1, "usage": 1, "colour": 1, "shape": 1}
+        for record in outcome.records
+    )
+    assert {
+        record["solver_status"]
+        for record in outcome.records
+        if record["source"] == "ilp_optimal"
+    } == {"Optimal Solution Found"}
+    assert outcome.attrition == {
+        "roster_candidates": {"csv": 1, "db": 1, "selected": 1},
+        "solver_statuses": {"Optimal Solution Found": 1},
+        "row_attrition": {},
+    }
+
+    report_path = tmp_path / "hard_negatives_report.json"
+    assert hard_negatives.execute(
+        [80],
+        lambda _offer_id: outcome,
+        out_path=tmp_path / "hard_negatives.json",
+        report_path=report_path,
+        requested_offer_ids=[80],
+    ) == 1
+    report = __import__("json").loads(report_path.read_text())
+    assert report["status"] == "validation_failed"
+    assert report["roster_check"] == {
+        "offers": [outcome.roster_entry],
+        "totals": {"csv_only": 0, "db_only": 0, "selected": 1},
+    }
+    assert report["attrition"]["roster_candidates"] == {
+        "csv": 1,
+        "db": 1,
+        "selected": 1,
+    }
+    assert report["attrition"]["solver_statuses"] == {
+        "Optimal Solution Found": 1,
+    }
+    assert report["attrition"]["row_attrition"] == {}
