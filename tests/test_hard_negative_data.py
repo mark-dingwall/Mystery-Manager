@@ -568,6 +568,8 @@ def test_requested_and_resolved_tier_a_offers_remain_distinct():
         parse_requested_tier_a_offer_ids("63")
     with pytest.raises(ValueError, match="non-empty"):
         resolve_requested_offer_ids([64], {65})
+    with pytest.raises(ValueError, match="resolved Tier-A offer IDs must be non-empty"):
+        default_tier_a_offer_ids({63, 110})
 
 
 def test_execute_discards_every_source_for_nonoptimal_offer(tmp_path):

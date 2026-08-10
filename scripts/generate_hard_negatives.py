@@ -128,7 +128,10 @@ def parse_requested_tier_a_offer_ids(value: str) -> list[int]:
 
 def default_tier_a_offer_ids(available: set[int]) -> list[int]:
     """Return all available Tier-A offer IDs in deterministic order."""
-    return sorted(available & TIER_A_OFFER_IDS)
+    resolved = sorted(available & TIER_A_OFFER_IDS)
+    if not resolved:
+        raise ValueError("resolved Tier-A offer IDs must be non-empty")
+    return resolved
 
 
 def resolve_requested_offer_ids(
