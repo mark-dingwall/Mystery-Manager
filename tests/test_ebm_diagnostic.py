@@ -265,6 +265,31 @@ import scripts.ebm_diagnostic
     assert proc.returncode == 0, proc.stdout + proc.stderr
 
 
+def test_ebm_script_runs_directly_without_pythonpath(tmp_path):
+    """Operators can invoke the documented script from outside the project root."""
+    project_root = Path(__file__).resolve().parent.parent
+    env = os.environ.copy()
+    env.pop("PYTHONPATH", None)
+    env.update(
+        {
+            "BOX_PRICE_SMALL": "2000",
+            "BOX_PRICE_MEDIUM": "3500",
+            "BOX_PRICE_LARGE": "5000",
+        }
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(project_root / "scripts" / "ebm_diagnostic.py"), "--help"],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "EBM hard-negative diagnostic" in proc.stdout
+
+
 def _fit_data() -> tuple[np.ndarray, np.ndarray, np.ndarray, list[tuple[int, str, str]]]:
     """Return five offer groups with separable but non-constant class signal."""
     rows = []
@@ -420,6 +445,50 @@ def test_maxt_rejects_too_few_permutations_and_ignores_scored_terms(monkeypatch)
             assert sorted(fitted_labels[indices].tolist()) == sorted(labels[indices].tolist())
 
 
+def test_maxt_reuses_a_supplied_full_data_fit(monkeypatch):
+    """The report fit is also the observed fit for maxT, avoiding a duplicate EBM."""
+    from scripts import ebm_diagnostic
+
+    X, labels, _offers, clusters = _fit_data()
+    columns = ["agnostic", "raw_tag_counts.deferred_tag", "scored"]
+    basis = {
+        "agnostic": "agnostic",
+        "raw_tag_counts.deferred_tag": "parent",
+        "scored": "scored",
+    }
+    observed_fit = ebm_diagnostic.FittedRung(
+        model=None,
+        importances={
+            "agnostic": 1.0,
+            "raw_tag_counts.deferred_tag": 50.0,
+            "scored": 100.0,
+        },
+        auc_insample=1.0,
+    )
+    fit_calls = []
+
+    def fake_fit(_X, _labels, _columns, seed):
+        del _X, _labels, _columns, seed
+        fit_calls.append(None)
+        return observed_fit
+
+    monkeypatch.setattr(ebm_diagnostic, "fit_full_ebm", fake_fit)
+
+    result = ebm_diagnostic.run_maxt(
+        X,
+        labels,
+        clusters,
+        columns,
+        basis,
+        seed=3,
+        n_permutations=200,
+        observed_fit=observed_fit,
+    )
+
+    assert len(fit_calls) == 200
+    assert result.observed_importances == {"agnostic": pytest.approx(1.0)}
+
+
 def test_maxt_rejects_an_incomplete_matched_cluster(monkeypatch):
     """A cluster without both classes cannot support a paired label permutation."""
     from scripts import ebm_diagnostic
@@ -447,6 +516,95 @@ def test_maxt_findings_require_strict_exceedance_of_the_null_threshold():
 
     assert _clears_maxt(1.01, 1.0) is True
     assert _clears_maxt(1.0, 1.0) is False
+
+
+def test_findings_report_tierwise_value_and_group_parent_metadata():
+    """Promoted group parents retain the descriptive checks needed for review."""
+    from scripts.ebm_diagnostic import FittedRung, MaxTResult, _build_findings
+
+    columns = [
+        "raw_group_totals.apple",
+        "capped_group_totals.apple",
+        "value_pct_small",
+        "value_pct_medium",
+        "value_pct_large",
+    ]
+    records = [
+        {"tier": tier}
+        for tier in ("small", "small", "medium", "medium", "large", "large")
+    ]
+    X = np.asarray(
+        [
+            [1.0, 10.0, 0.1, 0.0, 0.0],
+            [2.0, 20.0, 0.2, 0.0, 0.0],
+            [2.0, 20.0, 0.0, 0.2, 0.0],
+            [4.0, 40.0, 0.0, 0.5, 0.0],
+            [4.0, 40.0, 0.0, 0.0, 0.4],
+            [7.0, 70.0, 0.0, 0.0, 0.7],
+        ]
+    )
+    findings = _build_findings(
+        FittedRung(model=None, importances={"raw_group_totals.apple": 0.6}, auc_insample=1.0),
+        MaxTResult(
+            observed_importances={"raw_group_totals.apple": 0.6},
+            null_maxima=[0.5],
+            threshold=0.5,
+            family_columns=["raw_group_totals.apple"],
+        ),
+        X,
+        records,
+        columns,
+        {column: "parent" for column in columns},
+    )
+
+    assert len(findings) == 1
+    finding = findings[0]
+    assert finding["value_confound_r"] == {
+        "small": pytest.approx(1.0),
+        "medium": pytest.approx(1.0),
+        "large": pytest.approx(1.0),
+    }
+    assert finding["aggregate_term"] == "capped_group_totals.apple"
+    assert finding["aggregate_r"] == {
+        "small": pytest.approx(1.0),
+        "medium": pytest.approx(1.0),
+        "large": pytest.approx(1.0),
+    }
+    assert finding["aggregate_explained"] is True
+    assert finding["aggregate_check"] == "per-tier Pearson correlation"
+
+
+def test_findings_mark_degenerate_value_slices_and_tag_parent_checks():
+    """Degenerate statistics and deferred tag checks stay explicit in output."""
+    from scripts.ebm_diagnostic import FittedRung, MaxTResult, _build_findings
+
+    term = "raw_tag_counts.usage.snacking"
+    findings = _build_findings(
+        FittedRung(model=None, importances={term: 0.6}, auc_insample=1.0),
+        MaxTResult(
+            observed_importances={term: 0.6},
+            null_maxima=[0.5],
+            threshold=0.5,
+            family_columns=[term],
+        ),
+        np.asarray([[1.0, 0.1], [1.0, 0.2]]),
+        [{"tier": "small"}, {"tier": "small"}],
+        [term, "value_pct_small"],
+        {term: "parent", "value_pct_small": "scored"},
+    )
+
+    assert findings[0]["value_confound_r"] == {
+        "small": None,
+        "medium": None,
+        "large": None,
+    }
+    assert findings[0]["aggregate_term"] is None
+    assert findings[0]["aggregate_r"] is None
+    assert findings[0]["aggregate_explained"] is None
+    assert (
+        findings[0]["aggregate_check"]
+        == "deferred tag-parent aggregate-preserving refit"
+    )
 
 
 def _underpowered_artifact() -> dict:
@@ -524,6 +682,11 @@ def test_run_serializes_provenance_and_empty_underpowered_rung_deterministically
     assert first["methodology"]["seed"] == 11
     assert first["methodology"]["permutations"] == 200
     assert first["methodology"]["interactions_enabled"] is False
+    assert set(first["methodology"]["versions"]) == {
+        "interpret",
+        "scikit-learn",
+        "numpy",
+    }
     assert "value confounding" in first["methodology"]["caveats"]
     assert "tag-parent" in first["methodology"]["caveats"]
     assert rung == {
@@ -583,7 +746,9 @@ def test_run_reuses_one_prepared_cohort_for_all_inference(monkeypatch, tmp_path)
         )
         return 0.6
 
-    def fake_maxt(X, labels, clusters, columns, basis, seed, n_permutations):
+    def fake_maxt(
+        X, labels, clusters, columns, basis, seed, n_permutations, observed_fit
+    ):
         captured["maxt"] = (
             np.asarray(X).copy(),
             np.asarray(labels).copy(),
@@ -592,6 +757,7 @@ def test_run_reuses_one_prepared_cohort_for_all_inference(monkeypatch, tmp_path)
             dict(basis),
             seed,
             n_permutations,
+            observed_fit,
         )
         return ebm_diagnostic.MaxTResult(
             observed_importances={"n_unique_items": 1.0},
@@ -625,7 +791,8 @@ def test_run_reuses_one_prepared_cohort_for_all_inference(monkeypatch, tmp_path)
     assert captured["ablation"][3] == 6
     assert captured["oof"][4] == 6
     assert captured["maxt"][5] == 6
-    assert captured["maxt"][-1] == 200
+    assert captured["maxt"][6] == 200
+    assert captured["maxt"][7] is not None
     assert result["rungs"]["manual_vs_ilp"]["underpowered"] is False
     assert result["rungs"]["manual_vs_ilp"]["auc_oof"] == pytest.approx(0.6)
     assert result["rungs"]["manual_vs_ilp"]["maxT_family_count"] == 1

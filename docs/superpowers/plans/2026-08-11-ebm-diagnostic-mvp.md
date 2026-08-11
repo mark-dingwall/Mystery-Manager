@@ -81,10 +81,10 @@ git commit -m "feat: prepare validated EBM diagnostic cohorts"
 
 **Interfaces:**
 - `fit_full_ebm(X, labels, columns, seed) -> FittedRung`
-- `auc_group_kfold(X, labels, offers, seed) -> float`
+- `auc_group_kfold(X, labels, offers, columns, seed) -> float`
 - `permute_labels_within_clusters(labels, clusters, rng) -> np.ndarray`
 - `run_maxt(X, labels, clusters, columns, basis, seed, n_permutations) -> MaxTResult`
-- `build_findings(fit, maxt, records, columns, basis) -> list[dict]`
+- `_build_findings(ablated_fit, maxt, X, records, columns, basis) -> list[dict]`
 
 - [ ] **Step 1: Write failing diagnostics tests**
 
@@ -146,7 +146,7 @@ Expected: assertions fail because the result contract and CLI are incomplete.
 
 - [ ] **Step 3: Implement the MVP CLI and JSON output**
 
-Expose `--features`, `--seed`, `--permutations`, `--rungs`, `--out`, and `--no-plots`; default to all rungs and `diagnostics/ebm_findings.json`. Record `interpret`, `statsmodels`, `scikit-learn`, `numpy`, and `pandas` versions through `importlib.metadata`. Emit deterministic JSON with artifact provenance, cohort attrition, dynamic column counts, AUCs, maxT summaries, sorted findings, and the caveat that outputs are hypothesis-generating only. Document the isolated diagnostic command and the deferred MVP capabilities in `CLAUDE.md`.
+Expose `--features`, `--seed`, `--permutations`, `--rungs`, `--out`, and `--no-plots`; default to all rungs and `diagnostics/ebm_findings.json`. Record `interpret`, `scikit-learn`, and `numpy` versions through `importlib.metadata`. Emit deterministic JSON with artifact provenance, cohort attrition, dynamic column counts, AUCs, maxT summaries, sorted findings, and the caveat that outputs are hypothesis-generating only. Document the isolated diagnostic command and the deferred MVP capabilities in `CLAUDE.md`.
 
 - [ ] **Step 4: Verify the diagnostics suite passes**
 

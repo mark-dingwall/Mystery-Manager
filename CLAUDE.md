@@ -121,7 +121,7 @@ inspect `diagnostics/hard_negatives_report.json` after any non-zero generation
 run.
 
 `ebm_diagnostic.py` consumes only the validated hard-negative artifact and
-checks its feature, scorer, and roster hashes before fitting. It reports
+checks its feature-schema, feature-config, and roster hashes before fitting. It reports
 class-balanced, offer-held-out AUC separately from full-fit/maxT statistics, and
 never adjusts scoring or the ILP. A rung below 150 manual boxes or 20 offers is
 reported as underpowered with no findings. Findings are hypotheses only: value

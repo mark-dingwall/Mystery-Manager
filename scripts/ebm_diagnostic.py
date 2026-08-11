@@ -16,8 +16,14 @@ from importlib.metadata import version
 import json
 import os
 from pathlib import Path
+import sys
 import tempfile
 from typing import Sequence
+
+
+_PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
 
 import numpy as np
 
@@ -466,6 +472,7 @@ def run_maxt(
     basis: dict[str, str],
     seed: int,
     n_permutations: int,
+    observed_fit: FittedRung | None = None,
 ) -> MaxTResult:
     """Fit the observed EBM and its matched-cluster, promotable-family maxT null."""
     if n_permutations < 200:
@@ -482,7 +489,8 @@ def run_maxt(
     if not family_columns:
         raise ValueError("maxT requires at least one promotable parent or agnostic term")
 
-    observed_fit = fit_full_ebm(matrix, target, columns, seed)
+    if observed_fit is None:
+        observed_fit = fit_full_ebm(matrix, target, columns, seed)
     observed_importances = {
         column: observed_fit.importances[column] for column in family_columns
     }
@@ -667,10 +675,8 @@ def _diagnostic_versions() -> dict[str, str]:
         distribution: version(distribution)
         for distribution in (
             "interpret",
-            "statsmodels",
             "scikit-learn",
             "numpy",
-            "pandas",
         )
     }
 
@@ -780,6 +786,7 @@ def run(
                 basis,
                 seed=rung_seed,
                 n_permutations=permutations,
+                observed_fit=full_fit,
             )
             null = np.asarray(maxt.null_maxima, dtype=float)
             rung_result.update(
