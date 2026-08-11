@@ -3,6 +3,10 @@
 from __future__ import annotations
 
 import json
+import os
+from pathlib import Path
+import subprocess
+import sys
 
 import pytest
 
@@ -112,6 +116,23 @@ def test_load_artifact_rejects_each_stale_provenance_stamp(
         load_artifact(path)
 
 
+@pytest.mark.parametrize(
+    "field",
+    ["feature_schema_version", "config_hash", "roster_config_hash"],
+)
+def test_load_artifact_rejects_each_missing_provenance_stamp(tmp_path, field):
+    """Omitting a stamp must not bypass stale-artifact protection."""
+    from scripts.ebm_diagnostic import load_artifact
+
+    payload = _artifact([_record("manual"), _record("ilp_optimal", quantity=2)])
+    del payload[field]
+    path = tmp_path / "hard_negatives.json"
+    path.write_text(json.dumps(payload))
+
+    with pytest.raises(ValueError, match="missing required fields"):
+        load_artifact(path)
+
+
 def test_basis_for_columns_covers_the_live_flatten_contract_and_rejects_unknowns():
     """A new feature cannot silently enter the maxT family without a basis."""
     from scripts.ebm_diagnostic import basis_for_columns
@@ -154,6 +175,32 @@ def test_prepare_rung_keeps_only_complete_casefolded_box_clusters():
     }
 
 
+@pytest.mark.parametrize(
+    ("rung", "expected_sources"),
+    [
+        ("manual_vs_synth", ["manual", "synth_random"]),
+        ("manual_vs_baseline", ["manual", "baseline_deal_topup"]),
+        ("manual_vs_ilp", ["manual", "ilp_optimal"]),
+    ],
+)
+def test_prepare_rung_selects_only_its_declared_negative_sources(
+    rung, expected_sources
+):
+    """Cross-rung negatives would leak different failure modes into one model."""
+    from scripts.ebm_diagnostic import prepare_rung
+
+    records = [
+        _record("manual"),
+        _record("synth_random", quantity=2),
+        _record("baseline_deal_topup", quantity=3),
+        _record("ilp_optimal", quantity=4),
+    ]
+
+    prepared = prepare_rung(records, rung)
+
+    assert [record["source"] for record in prepared.records] == expected_sources
+
+
 def test_build_design_matrix_keeps_only_features_and_prepared_cluster_identity():
     """Source labels and variable-length scoring internals must not leak into X."""
     from scripts.ebm_diagnostic import build_design_matrix, prepare_rung
@@ -175,3 +222,39 @@ def test_build_design_matrix_keeps_only_features_and_prepared_cluster_identity()
     assert "source" not in columns
     assert "item_quantities" not in columns
     assert "group_totals" not in columns
+
+
+def test_ebm_module_import_never_reaches_db_or_allocation_modules(tmp_path):
+    """Adding an eager DB import would break diagnostics portability and tests."""
+    project_root = Path(__file__).resolve().parent.parent
+    target_lib = project_root / ".venv-diagnostics" / "lib"
+    code = """
+import importlib.abc
+import sys
+
+class BlockDiagnosticsLeaks(importlib.abc.MetaPathFinder):
+    blocked = {"allocator.db", "allocator.allocator", "compare"}
+
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname in self.blocked:
+            raise AssertionError(f"forbidden import: {fullname}")
+        return None
+
+sys.meta_path.insert(0, BlockDiagnosticsLeaks())
+import scripts.ebm_diagnostic
+"""
+    env = os.environ | {
+        "PYTHONPATH": os.pathsep.join((str(project_root), str(target_lib))),
+        "BOX_PRICE_SMALL": "2000",
+        "BOX_PRICE_MEDIUM": "3500",
+        "BOX_PRICE_LARGE": "5000",
+    }
+    proc = subprocess.run(
+        [sys.executable, "-S", "-c", code],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
