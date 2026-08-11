@@ -55,6 +55,25 @@ class PreparedRung:
     attrition: dict[str, int]
 
 
+@dataclass
+class FittedRung:
+    """A full-data EBM fit and the statistics used by the diagnostic."""
+
+    model: object
+    importances: dict[str, float]
+    auc_insample: float
+
+
+@dataclass
+class MaxTResult:
+    """Observed promotable importances and their cluster-permutation null."""
+
+    observed_importances: dict[str, float]
+    null_maxima: list[float]
+    threshold: float
+    family_columns: list[str]
+
+
 def load_artifact(path: Path) -> dict:
     """Load a successful, current hard-negative artifact or fail early.
 
@@ -219,3 +238,215 @@ def build_design_matrix(
     offers = np.asarray([record["offer_id"] for record in records], dtype=int)
     clusters = [_cluster_key(record) for record in records]
     return X, columns, labels, offers, clusters
+
+
+def _validated_fit_inputs(
+    X: np.ndarray, labels: np.ndarray, columns: Sequence[str]
+) -> tuple[np.ndarray, np.ndarray]:
+    """Normalize and validate the binary matrix contract shared by all fits."""
+    matrix = np.asarray(X, dtype=float)
+    target = np.asarray(labels, dtype=int)
+    if matrix.ndim != 2:
+        raise ValueError("EBM design matrix must be two-dimensional")
+    if matrix.shape[0] == 0:
+        raise ValueError("cannot fit an EBM with no rows")
+    if matrix.shape[1] != len(columns):
+        raise ValueError("EBM design matrix width does not match its columns")
+    if target.ndim != 1 or target.shape[0] != matrix.shape[0]:
+        raise ValueError("EBM labels must be a one-dimensional vector matching X")
+    if set(target.tolist()) != {0, 1}:
+        raise ValueError("EBM labels must contain both binary classes 0 and 1")
+    if not np.isfinite(matrix).all():
+        raise ValueError("EBM design matrix contains non-finite values")
+    return matrix, target
+
+
+def balanced_sample_weights(labels: np.ndarray) -> np.ndarray:
+    """Give each class half of the total fitting weight.
+
+    A rung can have many more generated negatives than manual rows.  Equal total
+    class mass makes every full and cross-validated fit answer the same
+    manual-versus-negative question instead of reflecting source multiplicity.
+    """
+    target = np.asarray(labels, dtype=int)
+    if target.ndim != 1 or set(target.tolist()) != {0, 1}:
+        raise ValueError("sample weights require both binary classes 0 and 1")
+    positive_count = int(np.count_nonzero(target == 1))
+    negative_count = int(np.count_nonzero(target == 0))
+    return np.where(target == 1, 0.5 / positive_count, 0.5 / negative_count)
+
+
+def _new_ebm(columns: Sequence[str], seed: int):
+    """Construct the deterministic, main-effects-only EBM used by every fit."""
+    try:
+        from interpret.glassbox import ExplainableBoostingClassifier
+    except ImportError as exc:  # pragma: no cover - exercised by dependency gate
+        raise RuntimeError(
+            "InterpretML is required for EBM diagnostics; install "
+            "requirements-diagnostics.txt"
+        ) from exc
+
+    # Feature names belong in the constructor in InterpretML 0.7.x; passing
+    # them to fit() is not supported.  Keep one worker so a seed reproduces the
+    # serial permutation null across runs.
+    return ExplainableBoostingClassifier(
+        feature_names=list(columns),
+        interactions=0,
+        n_jobs=1,
+        random_state=seed,
+    )
+
+
+def _positive_probabilities(model: object, X: np.ndarray) -> np.ndarray:
+    """Return the probability column corresponding to the manual class (1)."""
+    classes = list(np.asarray(model.classes_).tolist())
+    if 1 not in classes:
+        raise ValueError("EBM model did not retain the manual class")
+    probabilities = np.asarray(model.predict_proba(X), dtype=float)
+    if probabilities.ndim != 2 or probabilities.shape[1] != len(classes):
+        raise ValueError("EBM returned malformed class probabilities")
+    return probabilities[:, classes.index(1)]
+
+
+def fit_full_ebm(
+    X: np.ndarray, labels: np.ndarray, columns: Sequence[str], seed: int
+) -> FittedRung:
+    """Fit one class-balanced, named, main-effects EBM on the full cohort."""
+    matrix, target = _validated_fit_inputs(X, labels, columns)
+    model = _new_ebm(columns, seed)
+    model.fit(matrix, target, sample_weight=balanced_sample_weights(target))
+
+    term_names = list(model.term_names_)
+    if term_names != list(columns):
+        raise ValueError(
+            "main-effects EBM term names do not match the diagnostic feature columns"
+        )
+    importances = {
+        name: float(importance)
+        for name, importance in zip(term_names, model.term_importances("avg_weight"))
+    }
+
+    try:
+        from sklearn.metrics import roc_auc_score
+    except ImportError as exc:  # pragma: no cover - exercised by dependency gate
+        raise RuntimeError(
+            "scikit-learn is required for EBM diagnostics; install "
+            "requirements-diagnostics.txt"
+        ) from exc
+    return FittedRung(
+        model=model,
+        importances=importances,
+        auc_insample=float(roc_auc_score(target, _positive_probabilities(model, matrix))),
+    )
+
+
+def auc_group_kfold(
+    X: np.ndarray,
+    labels: np.ndarray,
+    offers: np.ndarray,
+    columns: Sequence[str],
+    seed: int,
+) -> float:
+    """Calculate OOF AUC with every validation fold holding out whole offers."""
+    matrix, target = _validated_fit_inputs(X, labels, columns)
+    groups = np.asarray(offers)
+    if groups.ndim != 1 or groups.shape[0] != matrix.shape[0]:
+        raise ValueError("offer groups must be a one-dimensional vector matching X")
+    if len(np.unique(groups)) < 5:
+        raise ValueError("GroupKFold requires at least five distinct offers")
+
+    try:
+        from sklearn.metrics import roc_auc_score
+        from sklearn.model_selection import GroupKFold
+    except ImportError as exc:  # pragma: no cover - exercised by dependency gate
+        raise RuntimeError(
+            "scikit-learn is required for EBM diagnostics; install "
+            "requirements-diagnostics.txt"
+        ) from exc
+
+    predictions = np.full(matrix.shape[0], np.nan, dtype=float)
+    splitter = GroupKFold(n_splits=5)
+    for fold_index, (train_indices, validation_indices) in enumerate(
+        splitter.split(matrix, target, groups)
+    ):
+        train_labels = target[train_indices]
+        validation_labels = target[validation_indices]
+        if set(train_labels.tolist()) != {0, 1} or set(validation_labels.tolist()) != {
+            0,
+            1,
+        }:
+            raise ValueError("each offer-held-out EBM fold must contain both classes")
+        fitted = fit_full_ebm(
+            matrix[train_indices], train_labels, columns, seed=seed + fold_index
+        )
+        predictions[validation_indices] = _positive_probabilities(
+            fitted.model, matrix[validation_indices]
+        )
+    if not np.isfinite(predictions).all():
+        raise ValueError("GroupKFold did not produce an OOF prediction for every row")
+    return float(roc_auc_score(target, predictions))
+
+
+def permute_labels_within_clusters(
+    labels: np.ndarray,
+    clusters: Sequence[tuple[int, str, str]],
+    rng: np.random.Generator,
+) -> np.ndarray:
+    """Shuffle labels only among rows sharing one matched roster cluster."""
+    target = np.asarray(labels, dtype=int)
+    if target.ndim != 1 or target.shape[0] != len(clusters):
+        raise ValueError("clusters must provide exactly one identity per label")
+
+    grouped_indices: dict[tuple[int, str, str], list[int]] = defaultdict(list)
+    for index, cluster in enumerate(clusters):
+        grouped_indices[cluster].append(index)
+
+    permuted = target.copy()
+    for indices in grouped_indices.values():
+        shuffled_indices = rng.permutation(indices)
+        permuted[indices] = target[shuffled_indices]
+    return permuted
+
+
+def run_maxt(
+    X: np.ndarray,
+    labels: np.ndarray,
+    clusters: Sequence[tuple[int, str, str]],
+    columns: Sequence[str],
+    basis: dict[str, str],
+    seed: int,
+    n_permutations: int,
+) -> MaxTResult:
+    """Fit the observed EBM and its matched-cluster, promotable-family maxT null."""
+    if n_permutations < 200:
+        raise ValueError("maxT requires at least 200 permutations")
+    matrix, target = _validated_fit_inputs(X, labels, columns)
+    if set(basis) != set(columns):
+        raise ValueError("maxT basis must classify exactly the diagnostic columns")
+    family_columns = [
+        column for column in columns if basis[column] in {"parent", "agnostic"}
+    ]
+    if not family_columns:
+        raise ValueError("maxT requires at least one promotable parent or agnostic term")
+
+    observed_fit = fit_full_ebm(matrix, target, columns, seed)
+    observed_importances = {
+        column: observed_fit.importances[column] for column in family_columns
+    }
+    rng = np.random.default_rng(seed)
+    null_maxima: list[float] = []
+    for permutation_index in range(n_permutations):
+        permuted_labels = permute_labels_within_clusters(target, clusters, rng)
+        permuted_fit = fit_full_ebm(
+            matrix, permuted_labels, columns, seed=seed + permutation_index + 1
+        )
+        null_maxima.append(
+            max(permuted_fit.importances[column] for column in family_columns)
+        )
+
+    return MaxTResult(
+        observed_importances=observed_importances,
+        null_maxima=null_maxima,
+        threshold=float(np.quantile(np.asarray(null_maxima), 0.95, method="higher")),
+        family_columns=family_columns,
+    )

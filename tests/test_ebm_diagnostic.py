@@ -8,6 +8,8 @@ from pathlib import Path
 import subprocess
 import sys
 
+import numpy as np
+
 import pytest
 
 from allocator.box_features import (
@@ -258,3 +260,141 @@ import scripts.ebm_diagnostic
     )
 
     assert proc.returncode == 0, proc.stdout + proc.stderr
+
+
+def _fit_data() -> tuple[np.ndarray, np.ndarray, np.ndarray, list[tuple[int, str, str]]]:
+    """Return five offer groups with separable but non-constant class signal."""
+    rows = []
+    labels = []
+    offers = []
+    clusters = []
+    for offer_id in range(1, 6):
+        for index, label in enumerate((1, 0, 1, 0)):
+            rows.append(
+                [float(label), float((offer_id + index) % 2), float(offer_id)]
+            )
+            labels.append(label)
+            offers.append(offer_id)
+            clusters.append((offer_id, "small", f"box-{index // 2}.example.test"))
+    return (
+        np.asarray(rows, dtype=float),
+        np.asarray(labels, dtype=int),
+        np.asarray(offers, dtype=int),
+        clusters,
+    )
+
+
+def test_balanced_sample_weights_equalise_total_class_mass():
+    """Unbalanced source counts must not let the larger class dominate an EBM."""
+    from scripts.ebm_diagnostic import balanced_sample_weights
+
+    weights = balanced_sample_weights(np.asarray([1, 1, 1, 0], dtype=int))
+
+    assert weights.tolist() == pytest.approx([1 / 6, 1 / 6, 1 / 6, 1 / 2])
+    assert weights[:3].sum() == pytest.approx(0.5)
+    assert weights[3] == pytest.approx(0.5)
+
+
+def test_fit_full_ebm_uses_named_main_effects_and_returns_importances():
+    """A model with unnamed or interaction terms cannot support the finding contract."""
+    from scripts.ebm_diagnostic import fit_full_ebm
+
+    X, labels, _offers, _clusters = _fit_data()
+    fitted = fit_full_ebm(X, labels, ["signal", "noise", "offer_marker"], seed=7)
+
+    assert fitted.model.interactions == 0
+    assert fitted.model.term_names_ == ["signal", "noise", "offer_marker"]
+    assert set(fitted.importances) == {"signal", "noise", "offer_marker"}
+    assert fitted.auc_insample > 0.9
+
+
+def test_auc_group_kfold_holds_out_entire_offers(monkeypatch):
+    """Rows from an offer must not appear in both train and validation folds."""
+    from scripts import ebm_diagnostic
+
+    X, labels, offers, _clusters = _fit_data()
+    fit_offer_sets = []
+
+    class PerfectModel:
+        classes_ = np.asarray([0, 1])
+
+        def predict_proba(self, validation_X):
+            positives = validation_X[:, 0]
+            return np.column_stack((1.0 - positives, positives))
+
+    def fake_fit(train_X, _train_labels, _columns, seed):
+        del _train_labels, _columns, seed
+        fit_offer_sets.append(set(train_X[:, 2].tolist()))
+        return ebm_diagnostic.FittedRung(
+            model=PerfectModel(), importances={}, auc_insample=1.0
+        )
+
+    monkeypatch.setattr(ebm_diagnostic, "fit_full_ebm", fake_fit)
+
+    result = ebm_diagnostic.auc_group_kfold(
+        X, labels, offers, ["signal", "noise", "offer_marker"], seed=7
+    )
+
+    assert result == pytest.approx(1.0)
+    assert len(fit_offer_sets) == 5
+    assert {frozenset(offer_set) for offer_set in fit_offer_sets} == {
+        frozenset({1, 2, 3, 4, 5} - {offer_id}) for offer_id in range(1, 6)
+    }
+
+
+def test_permutation_preserves_each_matched_cluster_label_count():
+    """Cluster-local shuffling protects the shared manual/negative roster structure."""
+    from scripts.ebm_diagnostic import permute_labels_within_clusters
+
+    labels = np.asarray([1, 0, 0, 1, 0], dtype=int)
+    clusters = [
+        (1, "small", "a"),
+        (1, "small", "a"),
+        (1, "small", "a"),
+        (2, "medium", "b"),
+        (2, "medium", "b"),
+    ]
+
+    permuted = permute_labels_within_clusters(
+        labels, clusters, np.random.default_rng(12)
+    )
+
+    assert sorted(permuted[:3].tolist()) == [0, 0, 1]
+    assert sorted(permuted[3:].tolist()) == [0, 1]
+
+
+def test_maxt_rejects_too_few_permutations_and_ignores_scored_terms(monkeypatch):
+    """Reducing the null below 200 or including scored terms invalidates promotion."""
+    from scripts import ebm_diagnostic
+
+    X, labels, _offers, clusters = _fit_data()
+    X = X[:, :2]
+    columns = ["agnostic", "scored"]
+    basis = {"agnostic": "agnostic", "scored": "scored"}
+
+    def fake_fit(_X, _labels, _columns, seed):
+        del _X, _labels, _columns, seed
+        return ebm_diagnostic.FittedRung(
+            model=None,
+            importances={"agnostic": 1.0, "scored": 100.0},
+            auc_insample=1.0,
+        )
+
+    monkeypatch.setattr(ebm_diagnostic, "fit_full_ebm", fake_fit)
+
+    with pytest.raises(ValueError, match="at least 200"):
+        ebm_diagnostic.run_maxt(
+            X, labels, clusters, columns, basis, seed=3, n_permutations=199
+        )
+
+    result = ebm_diagnostic.run_maxt(
+        X, labels, clusters, columns, basis, seed=3, n_permutations=200
+    )
+
+    assert len(result.null_maxima) == 200
+    assert result.family_columns == ["agnostic"]
+    assert result.observed_importances == {"agnostic": pytest.approx(1.0)}
+    assert result.threshold == pytest.approx(1.0)
+    assert result == ebm_diagnostic.run_maxt(
+        X, labels, clusters, columns, basis, seed=3, n_permutations=200
+    )
