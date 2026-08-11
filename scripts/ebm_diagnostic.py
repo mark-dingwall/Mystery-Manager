@@ -8,8 +8,10 @@ code: those paths belong exclusively to artifact generation.
 
 from __future__ import annotations
 
+import argparse
 from collections import defaultdict
 from dataclasses import dataclass
+from importlib.metadata import version
 import json
 from pathlib import Path
 from typing import Sequence
@@ -44,6 +46,9 @@ _AGNOSTIC_COLUMNS = frozenset(
         "fruit_value_share",
     }
 )
+_TIERS = ("small", "medium", "large")
+_MIN_MANUAL_ROWS = 150
+_MIN_OFFERS = 20
 
 
 @dataclass
@@ -408,6 +413,37 @@ def permute_labels_within_clusters(
     return permuted
 
 
+def _validate_complete_matched_clusters(
+    labels: np.ndarray, clusters: Sequence[tuple[int, str, str]]
+) -> None:
+    """Require the paired manual/negative structure assumed by the null test."""
+    if len(clusters) != labels.shape[0]:
+        raise ValueError("clusters must provide exactly one identity per label")
+    grouped_labels: dict[tuple[int, str, str], list[int]] = defaultdict(list)
+    for label, cluster in zip(labels.tolist(), clusters):
+        grouped_labels[cluster].append(label)
+    incomplete = [
+        cluster
+        for cluster, cluster_labels in grouped_labels.items()
+        if set(cluster_labels) != {0, 1}
+    ]
+    if incomplete:
+        raise ValueError(
+            "maxT requires every row to belong to a complete manual/negative "
+            f"cluster; incomplete clusters include {incomplete[:3]!r}"
+        )
+
+
+def _is_promotable_column(column: str, basis: str) -> bool:
+    """Return whether a term can enter the primary maxT family and findings."""
+    # Tag parents require an aggregate-preserving refit that is intentionally
+    # deferred in this MVP.  Keep them in the fitted model, but do not treat a
+    # plain parent classification as permission to promote them.
+    return basis in {"parent", "agnostic"} and not column.startswith(
+        "raw_tag_counts."
+    )
+
+
 def run_maxt(
     X: np.ndarray,
     labels: np.ndarray,
@@ -421,10 +457,13 @@ def run_maxt(
     if n_permutations < 200:
         raise ValueError("maxT requires at least 200 permutations")
     matrix, target = _validated_fit_inputs(X, labels, columns)
+    _validate_complete_matched_clusters(target, clusters)
     if set(basis) != set(columns):
         raise ValueError("maxT basis must classify exactly the diagnostic columns")
     family_columns = [
-        column for column in columns if basis[column] in {"parent", "agnostic"}
+        column
+        for column in columns
+        if _is_promotable_column(column, basis[column])
     ]
     if not family_columns:
         raise ValueError("maxT requires at least one promotable parent or agnostic term")
@@ -438,7 +477,7 @@ def run_maxt(
     for permutation_index in range(n_permutations):
         permuted_labels = permute_labels_within_clusters(target, clusters, rng)
         permuted_fit = fit_full_ebm(
-            matrix, permuted_labels, columns, seed=seed + permutation_index + 1
+            matrix, permuted_labels, columns, seed=seed
         )
         null_maxima.append(
             max(permuted_fit.importances[column] for column in family_columns)
@@ -450,3 +489,334 @@ def run_maxt(
         threshold=float(np.quantile(np.asarray(null_maxima), 0.95, method="higher")),
         family_columns=family_columns,
     )
+
+
+def _cohort_counts(records: Sequence[dict]) -> tuple[int, int, int]:
+    """Return manual rows, negative rows, and distinct offers for one rung."""
+    labels = [1 if record.get("source") == "manual" else 0 for record in records]
+    return (
+        labels.count(1),
+        labels.count(0),
+        len({record["offer_id"] for record in records}),
+    )
+
+
+def _is_underpowered(n_manual: int, n_offers: int) -> bool:
+    """Apply the registered floor before any EBM inference is attempted."""
+    return n_manual < _MIN_MANUAL_ROWS or n_offers < _MIN_OFFERS
+
+
+def fit_without_value_pct(
+    X: np.ndarray, labels: np.ndarray, columns: Sequence[str], seed: int
+) -> FittedRung:
+    """Refit after dropping all tier-sliced value columns as one group."""
+    retained_indices = [
+        index
+        for index, column in enumerate(columns)
+        if not column.startswith("value_pct_")
+    ]
+    if len(retained_indices) == len(columns):
+        raise ValueError("EBM matrix has no tier-sliced value_pct columns to ablate")
+    retained_columns = [columns[index] for index in retained_indices]
+    return fit_full_ebm(
+        np.asarray(X)[:, retained_indices], labels, retained_columns, seed
+    )
+
+
+def _pearson(left: np.ndarray, right: np.ndarray) -> float | None:
+    """Return a defined Pearson r, leaving degenerate tier slices explicit."""
+    if len(left) < 2 or np.std(left) == 0 or np.std(right) == 0:
+        return None
+    return float(np.corrcoef(left, right)[0, 1])
+
+
+def _correlations_by_tier(
+    X: np.ndarray,
+    columns: Sequence[str],
+    records: Sequence[dict],
+    term: str,
+    reference_term: str,
+) -> dict[str, float | None]:
+    """Calculate a transparent per-tier correlation for finding metadata."""
+    if term not in columns or reference_term not in columns:
+        return {tier: None for tier in _TIERS}
+    matrix = np.asarray(X, dtype=float)
+    if matrix.shape[0] != len(records):
+        raise ValueError("finding records must align with the EBM matrix")
+    term_index = list(columns).index(term)
+    reference_index = list(columns).index(reference_term)
+    result: dict[str, float | None] = {}
+    for tier in _TIERS:
+        indices = [
+            index for index, record in enumerate(records) if record["tier"] == tier
+        ]
+        result[tier] = _pearson(
+            matrix[indices, term_index], matrix[indices, reference_index]
+        )
+    return result
+
+
+def _value_confound_correlations(
+    X: np.ndarray, columns: Sequence[str], records: Sequence[dict], term: str
+) -> dict[str, float | None]:
+    """Measure each term against the matching tier-sliced value covariate."""
+    if term not in columns:
+        return {tier: None for tier in _TIERS}
+    matrix = np.asarray(X, dtype=float)
+    if matrix.shape[0] != len(records):
+        raise ValueError("finding records must align with the EBM matrix")
+    term_index = list(columns).index(term)
+    result: dict[str, float | None] = {}
+    for tier in _TIERS:
+        value_term = f"value_pct_{tier}"
+        if value_term not in columns:
+            result[tier] = None
+            continue
+        indices = [
+            index for index, record in enumerate(records) if record["tier"] == tier
+        ]
+        result[tier] = _pearson(
+            matrix[indices, term_index],
+            matrix[indices, list(columns).index(value_term)],
+        )
+    return result
+
+
+def _parent_metadata(
+    X: np.ndarray, columns: Sequence[str], records: Sequence[dict], term: str
+) -> dict[str, object]:
+    """Add the affordable group check and state the deferred tag-parent check."""
+    if term.startswith("raw_group_totals."):
+        aggregate_term = (
+            f"capped_group_totals.{term.removeprefix('raw_group_totals.')}"
+        )
+        correlations = _correlations_by_tier(X, columns, records, term, aggregate_term)
+        return {
+            "aggregate_term": aggregate_term,
+            "aggregate_r": correlations,
+            "aggregate_explained": any(
+                correlation is not None and abs(correlation) > 0.7
+                for correlation in correlations.values()
+            ),
+            "aggregate_check": "per-tier Pearson correlation",
+        }
+    if term.startswith("raw_tag_counts."):
+        return {
+            "aggregate_term": None,
+            "aggregate_r": None,
+            "aggregate_explained": None,
+            "aggregate_check": "deferred tag-parent aggregate-preserving refit",
+        }
+    return {
+        "aggregate_term": None,
+        "aggregate_r": None,
+        "aggregate_explained": None,
+        "aggregate_check": None,
+    }
+
+
+def _build_findings(
+    ablated_fit: FittedRung,
+    maxt: MaxTResult,
+    X: np.ndarray,
+    records: Sequence[dict],
+    columns: Sequence[str],
+    basis: dict[str, str],
+) -> list[dict[str, object]]:
+    """Turn maxT-clearing promotable terms into caveated hypotheses."""
+    findings: list[dict[str, object]] = []
+    for term, importance in maxt.observed_importances.items():
+        if importance < maxt.threshold:
+            continue
+        value_correlations = _value_confound_correlations(X, columns, records, term)
+        finding: dict[str, object] = {
+            "term": term,
+            "importance": importance,
+            "basis": basis[term],
+            "value_confound_r": value_correlations,
+            "ablation_drop_value_pct": {
+                "importance": ablated_fit.importances.get(term),
+                "crosses_original_maxt_threshold": (
+                    ablated_fit.importances.get(term, float("-inf")) >= maxt.threshold
+                ),
+            },
+        }
+        finding.update(_parent_metadata(X, columns, records, term))
+        findings.append(finding)
+    return sorted(
+        findings,
+        key=lambda finding: (-float(finding["importance"]), str(finding["term"])),
+    )
+
+
+def _diagnostic_versions() -> dict[str, str]:
+    """Record installed library versions without importing their runtime modules."""
+    return {
+        distribution: version(distribution)
+        for distribution in (
+            "interpret",
+            "statsmodels",
+            "scikit-learn",
+            "numpy",
+            "pandas",
+        )
+    }
+
+
+def run(
+    features: Path,
+    out: Path,
+    *,
+    seed: int,
+    permutations: int,
+    rungs: Sequence[str],
+) -> dict[str, object]:
+    """Run every requested EBM rung and write one deterministic findings report."""
+    requested_rungs = list(rungs)
+    unknown_rungs = [rung for rung in requested_rungs if rung not in RUNGS]
+    if unknown_rungs:
+        raise ValueError(f"unknown EBM rungs: {unknown_rungs!r}")
+    if not requested_rungs:
+        raise ValueError("at least one EBM rung is required")
+    if permutations < 200:
+        raise ValueError("maxT requires at least 200 permutations")
+
+    artifact = load_artifact(features)
+    rung_results: dict[str, object] = {}
+    result: dict[str, object] = {
+        "schema_version": 1,
+        "artifact": {
+            "feature_schema_version": artifact["feature_schema_version"],
+            "config_hash": artifact["config_hash"],
+            "roster_config_hash": artifact["roster_config_hash"],
+        },
+        "methodology": {
+            "seed": seed,
+            "permutations": permutations,
+            "interactions_enabled": False,
+            "balance": "equal total class weight",
+            "validation": "five-fold GroupKFold by offer_id",
+            "permutation": "cluster-local labels; fixed EBM seed; full-data refits",
+            "maxT_family": (
+                "agnostic plus group-parent terms; scored and deferred "
+                "tag-parent terms excluded"
+            ),
+            "versions": _diagnostic_versions(),
+            "caveats": (
+                "Findings are hypothesis-generating only. value confounding is "
+                "reported through a drop-value ablation but is not resolved by it. "
+                "The tag-parent aggregate-preserving refit is deferred, so tag "
+                "parents are not promotable."
+            ),
+        },
+        "rungs": rung_results,
+    }
+
+    for rung_index, rung in enumerate(requested_rungs):
+        prepared = prepare_rung(artifact["records"], rung)
+        n_pos, n_neg, n_offers = _cohort_counts(prepared.records)
+        rung_result: dict[str, object] = {
+            "underpowered": _is_underpowered(n_pos, n_offers),
+            "n_pos": n_pos,
+            "n_neg": n_neg,
+            "n_offers": n_offers,
+            "attrition": prepared.attrition,
+            "findings": [],
+        }
+        if not rung_result["underpowered"]:
+            X, columns, labels, offers, clusters = build_design_matrix(prepared.records)
+            _validate_complete_matched_clusters(labels, clusters)
+            basis = basis_for_columns(columns)
+            rung_seed = seed + rung_index
+            full_fit = fit_full_ebm(X, labels, columns, rung_seed)
+            ablated_fit = fit_without_value_pct(X, labels, columns, rung_seed)
+            maxt = run_maxt(
+                X,
+                labels,
+                clusters,
+                columns,
+                basis,
+                seed=rung_seed,
+                n_permutations=permutations,
+            )
+            null = np.asarray(maxt.null_maxima, dtype=float)
+            rung_result.update(
+                {
+                    "column_count": len(columns),
+                    "auc_oof": auc_group_kfold(X, labels, offers, columns, rung_seed),
+                    "auc_insample": full_fit.auc_insample,
+                    "maxt_threshold": maxt.threshold,
+                    "maxt_null_quantiles": {
+                        "p50": float(np.quantile(null, 0.5)),
+                        "p95": float(np.quantile(null, 0.95)),
+                        "max": float(np.max(null)),
+                    },
+                    "findings": _build_findings(
+                        ablated_fit,
+                        maxt,
+                        X,
+                        prepared.records,
+                        columns,
+                        basis,
+                    ),
+                }
+            )
+        rung_results[rung] = rung_result
+
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
+    return result
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """Build the small, documented command-line interface for the diagnostic."""
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--features",
+        type=Path,
+        default=Path("diagnostics/hard_negatives.json"),
+        help="validated hard-negative artifact",
+    )
+    parser.add_argument("--seed", type=int, default=0, help="fixed EBM/randomization seed")
+    parser.add_argument(
+        "--permutations",
+        type=int,
+        default=200,
+        help="matched-cluster maxT draws (minimum: 200)",
+    )
+    parser.add_argument(
+        "--rungs",
+        nargs="+",
+        choices=RUNGS,
+        default=list(RUNGS),
+        help="one or more manual-vs-negative rungs",
+    )
+    parser.add_argument(
+        "--out",
+        type=Path,
+        default=Path("diagnostics/ebm_findings.json"),
+        help="output findings JSON",
+    )
+    parser.add_argument(
+        "--no-plots",
+        action="store_true",
+        help="accepted for compatibility; plots are deferred from this MVP",
+    )
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    """Parse CLI arguments and run the DB-free diagnostic."""
+    args = build_parser().parse_args(argv)
+    run(
+        args.features,
+        args.out,
+        seed=args.seed,
+        permutations=args.permutations,
+        rungs=args.rungs,
+    )
+    return 0
+
+
+if __name__ == "__main__":  # pragma: no cover - exercised through main()
+    raise SystemExit(main())

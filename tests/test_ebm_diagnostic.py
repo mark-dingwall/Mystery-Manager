@@ -25,6 +25,8 @@ from tests.conftest import require_dep
 
 pytestmark = pytest.mark.diagnostics
 require_dep("numpy")
+require_dep("interpret")
+require_dep("sklearn")
 
 
 def _record(
@@ -368,15 +370,24 @@ def test_maxt_rejects_too_few_permutations_and_ignores_scored_terms(monkeypatch)
     from scripts import ebm_diagnostic
 
     X, labels, _offers, clusters = _fit_data()
-    X = X[:, :2]
-    columns = ["agnostic", "scored"]
-    basis = {"agnostic": "agnostic", "scored": "scored"}
+    columns = ["agnostic", "raw_tag_counts.deferred_tag", "scored"]
+    basis = {
+        "agnostic": "agnostic",
+        "raw_tag_counts.deferred_tag": "parent",
+        "scored": "scored",
+    }
+    fit_calls = []
 
-    def fake_fit(_X, _labels, _columns, seed):
-        del _X, _labels, _columns, seed
+    def fake_fit(_X, fitted_labels, _columns, seed):
+        del _X, _columns
+        fit_calls.append((np.asarray(fitted_labels).copy(), seed))
         return ebm_diagnostic.FittedRung(
             model=None,
-            importances={"agnostic": 1.0, "scored": 100.0},
+            importances={
+                "agnostic": 1.0,
+                "raw_tag_counts.deferred_tag": 50.0,
+                "scored": 100.0,
+            },
             auc_insample=1.0,
         )
 
@@ -395,6 +406,212 @@ def test_maxt_rejects_too_few_permutations_and_ignores_scored_terms(monkeypatch)
     assert result.family_columns == ["agnostic"]
     assert result.observed_importances == {"agnostic": pytest.approx(1.0)}
     assert result.threshold == pytest.approx(1.0)
-    assert result == ebm_diagnostic.run_maxt(
-        X, labels, clusters, columns, basis, seed=3, n_permutations=200
+    assert len(fit_calls) == 201
+    assert np.array_equal(fit_calls[0][0], labels)
+    assert {seed for _fitted_labels, seed in fit_calls} == {3}
+    assert any(
+        not np.array_equal(fitted_labels, labels)
+        for fitted_labels, _seed in fit_calls[1:]
     )
+    for fitted_labels, _seed in fit_calls[1:]:
+        for cluster in set(clusters):
+            indices = [index for index, value in enumerate(clusters) if value == cluster]
+            assert sorted(fitted_labels[indices].tolist()) == sorted(labels[indices].tolist())
+
+
+def test_maxt_rejects_an_incomplete_matched_cluster(monkeypatch):
+    """A cluster without both classes cannot support a paired label permutation."""
+    from scripts import ebm_diagnostic
+
+    def fail_if_fit(*_args, **_kwargs):
+        raise AssertionError("incomplete clusters must fail before fitting")
+
+    monkeypatch.setattr(ebm_diagnostic, "fit_full_ebm", fail_if_fit)
+
+    with pytest.raises(ValueError, match="complete manual/negative cluster"):
+        ebm_diagnostic.run_maxt(
+            np.asarray([[1.0], [0.0], [1.0], [0.0]]),
+            np.asarray([1, 0, 1, 0]),
+            [(1, "small", "a"), (1, "small", "a"), (2, "small", "b"), (3, "small", "c")],
+            ["agnostic"],
+            {"agnostic": "agnostic"},
+            seed=3,
+            n_permutations=200,
+        )
+
+
+def _underpowered_artifact() -> dict:
+    """Return five matched offers, intentionally below the diagnostic floor."""
+    records = []
+    for offer_id in range(1, 6):
+        records.extend(
+            [
+                _record("manual", offer_id=offer_id, quantity=1),
+                _record("ilp_optimal", offer_id=offer_id, quantity=2),
+            ]
+        )
+    return _artifact(records)
+
+
+def test_cli_defaults_reject_invalid_rungs_and_keeps_plot_flag_compatible():
+    """The documented operator interface stays small and validates rungs early."""
+    from scripts.ebm_diagnostic import build_parser
+
+    parser = build_parser()
+    args = parser.parse_args([])
+
+    assert args.features == Path("diagnostics/hard_negatives.json")
+    assert args.out == Path("diagnostics/ebm_findings.json")
+    assert args.seed == 0
+    assert args.permutations == 200
+    assert args.rungs == ["manual_vs_synth", "manual_vs_baseline", "manual_vs_ilp"]
+    assert args.no_plots is False
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--rungs", "not-a-rung"])
+
+
+def test_run_serializes_provenance_and_empty_underpowered_rung_deterministically(
+    tmp_path, monkeypatch
+):
+    """A rung below its registered floor must not fit or promote any term."""
+    from scripts import ebm_diagnostic
+
+    features = tmp_path / "hard_negatives.json"
+    features.write_text(json.dumps(_underpowered_artifact()))
+    first_out = tmp_path / "first.json"
+    second_out = tmp_path / "second.json"
+
+    def fail_if_fit(*_args, **_kwargs):
+        raise AssertionError("an underpowered rung must not fit an EBM")
+
+    monkeypatch.setattr(ebm_diagnostic, "fit_full_ebm", fail_if_fit)
+
+    first = ebm_diagnostic.run(
+        features,
+        first_out,
+        seed=11,
+        permutations=200,
+        rungs=["manual_vs_ilp"],
+    )
+    second = ebm_diagnostic.run(
+        features,
+        second_out,
+        seed=11,
+        permutations=200,
+        rungs=["manual_vs_ilp"],
+    )
+
+    rung = first["rungs"]["manual_vs_ilp"]
+    assert first["schema_version"] == 1
+    assert first["artifact"] == {
+        "feature_schema_version": FEATURE_SCHEMA_VERSION,
+        "config_hash": config_hash(),
+        "roster_config_hash": roster_config_hash(),
+    }
+    assert first["methodology"]["seed"] == 11
+    assert first["methodology"]["permutations"] == 200
+    assert first["methodology"]["interactions_enabled"] is False
+    assert "value confounding" in first["methodology"]["caveats"]
+    assert "tag-parent" in first["methodology"]["caveats"]
+    assert rung == {
+        "underpowered": True,
+        "n_pos": 5,
+        "n_neg": 5,
+        "n_offers": 5,
+        "attrition": {
+            "input_clusters": 5,
+            "missing_manual_clusters": 0,
+            "missing_negative_clusters": 0,
+            "retained_clusters": 5,
+        },
+        "findings": [],
+    }
+    assert first == second
+    assert first_out.read_text() == second_out.read_text()
+
+
+def test_run_reuses_one_prepared_cohort_for_all_inference(monkeypatch, tmp_path):
+    """AUC, ablation, and maxT must not silently receive different populations."""
+    from scripts import ebm_diagnostic
+
+    features = tmp_path / "hard_negatives.json"
+    features.write_text(json.dumps(_underpowered_artifact()))
+    captured = {}
+
+    def fake_full_fit(X, labels, columns, seed):
+        captured["full"] = (np.asarray(X).copy(), np.asarray(labels).copy(), list(columns), seed)
+        return ebm_diagnostic.FittedRung(
+            model=None,
+            importances={column: 1.0 for column in columns},
+            auc_insample=0.75,
+        )
+
+    def fake_ablation(X, labels, columns, seed):
+        captured["ablation"] = (
+            np.asarray(X).copy(),
+            np.asarray(labels).copy(),
+            list(columns),
+            seed,
+        )
+        return ebm_diagnostic.FittedRung(
+            model=None,
+            importances={column: 1.0 for column in columns},
+            auc_insample=0.7,
+        )
+
+    def fake_oof(X, labels, offers, columns, seed):
+        captured["oof"] = (
+            np.asarray(X).copy(),
+            np.asarray(labels).copy(),
+            np.asarray(offers).copy(),
+            list(columns),
+            seed,
+        )
+        return 0.6
+
+    def fake_maxt(X, labels, clusters, columns, basis, seed, n_permutations):
+        captured["maxt"] = (
+            np.asarray(X).copy(),
+            np.asarray(labels).copy(),
+            list(clusters),
+            list(columns),
+            dict(basis),
+            seed,
+            n_permutations,
+        )
+        return ebm_diagnostic.MaxTResult(
+            observed_importances={"n_unique_items": 1.0},
+            null_maxima=[0.5] * 200,
+            threshold=0.5,
+            family_columns=["n_unique_items"],
+        )
+
+    monkeypatch.setattr(ebm_diagnostic, "_is_underpowered", lambda *_args: False)
+    monkeypatch.setattr(ebm_diagnostic, "fit_full_ebm", fake_full_fit)
+    monkeypatch.setattr(ebm_diagnostic, "fit_without_value_pct", fake_ablation)
+    monkeypatch.setattr(ebm_diagnostic, "auc_group_kfold", fake_oof)
+    monkeypatch.setattr(ebm_diagnostic, "run_maxt", fake_maxt)
+
+    result = ebm_diagnostic.run(
+        features,
+        tmp_path / "findings.json",
+        seed=4,
+        permutations=200,
+        rungs=["manual_vs_ilp"],
+    )
+
+    full_X, full_labels, full_columns, full_seed = captured["full"]
+    for name in ("ablation", "oof", "maxt"):
+        assert np.array_equal(captured[name][0], full_X)
+        assert np.array_equal(captured[name][1], full_labels)
+    assert captured["ablation"][2] == full_columns
+    assert captured["oof"][3] == full_columns
+    assert captured["maxt"][3] == full_columns
+    assert full_seed == 4
+    assert captured["ablation"][3] == 4
+    assert captured["oof"][4] == 4
+    assert captured["maxt"][5] == 4
+    assert captured["maxt"][-1] == 200
+    assert result["rungs"]["manual_vs_ilp"]["underpowered"] is False
+    assert result["rungs"]["manual_vs_ilp"]["auc_oof"] == pytest.approx(0.6)
+    assert result["rungs"]["manual_vs_ilp"]["findings"][0]["term"] == "n_unique_items"
