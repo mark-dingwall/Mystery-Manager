@@ -137,6 +137,19 @@ def test_load_artifact_rejects_each_missing_provenance_stamp(tmp_path, field):
         load_artifact(path)
 
 
+def test_load_artifact_rejects_rows_that_cannot_build_the_feature_matrix(tmp_path):
+    """A malformed record cannot become an underpowered non-result by accident."""
+    from scripts.ebm_diagnostic import load_artifact
+
+    payload = _artifact([_record("manual"), _record("ilp_optimal", quantity=2)])
+    del payload["records"][0]["value_pct"]
+    path = tmp_path / "hard_negatives.json"
+    path.write_text(json.dumps(payload))
+
+    with pytest.raises(ValueError, match="record 0"):
+        load_artifact(path)
+
+
 def test_basis_for_columns_covers_the_live_flatten_contract_and_rejects_unknowns():
     """A new feature cannot silently enter the maxT family without a basis."""
     from scripts.ebm_diagnostic import basis_for_columns
@@ -177,6 +190,17 @@ def test_prepare_rung_keeps_only_complete_casefolded_box_clusters():
         "missing_negative_clusters": 1,
         "retained_clusters": 1,
     }
+
+
+def test_prepare_rung_rejects_boolean_offer_ids():
+    """Booleans compare equal to integer offer IDs but are never valid identities."""
+    from scripts.ebm_diagnostic import prepare_rung
+
+    records = [_record("manual"), _record("ilp_optimal", quantity=2)]
+    records[0]["offer_id"] = True
+
+    with pytest.raises(ValueError, match="invalid offer_id"):
+        prepare_rung(records, "manual_vs_ilp")
 
 
 @pytest.mark.parametrize(

@@ -128,6 +128,8 @@ def load_artifact(path: Path, *, raw_bytes: bytes | None = None) -> dict:
         raise ValueError("hard-negative artifact records must be a list")
     if not all(isinstance(record, dict) for record in payload["records"]):
         raise ValueError("hard-negative artifact records must contain only objects")
+    for index, record in enumerate(payload["records"]):
+        _validate_artifact_record(record, index)
     return payload
 
 
@@ -172,11 +174,27 @@ def _cluster_key(record: dict) -> tuple[int, str, str]:
         box_name = record["box_name"]
     except KeyError as exc:
         raise ValueError(f"hard-negative record missing cluster field: {exc.args[0]}") from exc
-    if not isinstance(offer_id, int) or not isinstance(tier, str) or not isinstance(
-        box_name, str
+    if (
+        isinstance(offer_id, bool)
+        or not isinstance(offer_id, int)
+        or not isinstance(tier, str)
+        or not isinstance(box_name, str)
     ):
         raise ValueError("hard-negative record has invalid offer_id, tier, or box_name")
     return offer_id, tier, box_name.casefold()
+
+
+def _validate_artifact_record(record: dict, index: int) -> None:
+    """Verify every artifact row can form a valid diagnostic matrix row."""
+    try:
+        _cluster_key(record)
+        if not isinstance(record.get("source"), str):
+            raise ValueError("source must be a string")
+        flatten(record)
+    except (AttributeError, KeyError, TypeError, ValueError) as exc:
+        raise ValueError(
+            f"hard-negative artifact record {index} is not valid diagnostic input"
+        ) from exc
 
 
 def prepare_rung(records: Sequence[dict], rung: str) -> PreparedRung:
