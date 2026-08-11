@@ -9,9 +9,15 @@ from pathlib import Path
 import subprocess
 import sys
 
-import numpy as np
-
 import pytest
+
+from tests.conftest import require_dep
+
+
+pytestmark = pytest.mark.diagnostics
+np = require_dep("numpy")
+require_dep("interpret")
+require_dep("sklearn")
 
 from allocator.box_features import (
     FEATURE_SCHEMA_VERSION,
@@ -21,13 +27,6 @@ from allocator.box_features import (
 )
 from allocator.config import CATEGORY_FRUIT
 from allocator.hard_negative_roster import roster_config_hash
-from tests.conftest import require_dep
-
-
-pytestmark = pytest.mark.diagnostics
-require_dep("numpy")
-require_dep("interpret")
-require_dep("sklearn")
 
 
 def _record(
@@ -265,13 +264,14 @@ import scripts.ebm_diagnostic
     assert proc.returncode == 0, proc.stdout + proc.stderr
 
 
-def test_ebm_script_runs_directly_without_pythonpath(tmp_path):
-    """Operators can invoke the documented script from outside the project root."""
+def test_ebm_script_runs_the_documented_isolated_command():
+    """The documented command supplies only diagnostic dependencies, not the root."""
     project_root = Path(__file__).resolve().parent.parent
+    target_lib = project_root / ".venv-diagnostics" / "lib"
     env = os.environ.copy()
-    env.pop("PYTHONPATH", None)
     env.update(
         {
+            "PYTHONPATH": str(target_lib),
             "BOX_PRICE_SMALL": "2000",
             "BOX_PRICE_MEDIUM": "3500",
             "BOX_PRICE_LARGE": "5000",
@@ -279,8 +279,8 @@ def test_ebm_script_runs_directly_without_pythonpath(tmp_path):
     )
 
     proc = subprocess.run(
-        [sys.executable, str(project_root / "scripts" / "ebm_diagnostic.py"), "--help"],
-        cwd=tmp_path,
+        [sys.executable, "-S", "scripts/ebm_diagnostic.py", "--help"],
+        cwd=project_root,
         env=env,
         capture_output=True,
         text=True,
@@ -705,6 +705,33 @@ def test_run_serializes_provenance_and_empty_underpowered_rung_deterministically
     }
     assert first == second
     assert first_out.read_text() == second_out.read_text()
+
+
+def test_run_fingerprints_the_validated_artifact_byte_snapshot(monkeypatch, tmp_path):
+    """The provenance hash is for the exact bytes consumed as diagnostic input."""
+    from scripts import ebm_diagnostic
+
+    features = tmp_path / "hard_negatives.json"
+    artifact_bytes = json.dumps(_underpowered_artifact()).encode("utf-8")
+    features.write_bytes(artifact_bytes)
+    real_load_artifact = ebm_diagnostic.load_artifact
+
+    def validate_then_replace(path, *, raw_bytes):
+        artifact = real_load_artifact(path, raw_bytes=raw_bytes)
+        path.write_text('{"status": "changed_after_validation"}')
+        return artifact
+
+    monkeypatch.setattr(ebm_diagnostic, "load_artifact", validate_then_replace)
+
+    result = ebm_diagnostic.run(
+        features,
+        tmp_path / "findings.json",
+        seed=11,
+        permutations=200,
+        rungs=["manual_vs_ilp"],
+    )
+
+    assert result["artifact"]["input_sha256"] == hashlib.sha256(artifact_bytes).hexdigest()
 
 
 def test_run_reuses_one_prepared_cohort_for_all_inference(monkeypatch, tmp_path):

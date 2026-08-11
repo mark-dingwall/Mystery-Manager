@@ -89,7 +89,7 @@ class MaxTResult:
     family_columns: list[str]
 
 
-def load_artifact(path: Path) -> dict:
+def load_artifact(path: Path, *, raw_bytes: bytes | None = None) -> dict:
     """Load a successful, current hard-negative artifact or fail early.
 
     A failure report and an artifact generated under stale feature or roster
@@ -97,7 +97,7 @@ def load_artifact(path: Path) -> dict:
     matrix errors cannot be mistaken for an inference result.
     """
     try:
-        payload = json.loads(path.read_text())
+        payload = json.loads(path.read_bytes() if raw_bytes is None else raw_bytes)
     except json.JSONDecodeError as exc:
         raise ValueError(f"invalid hard-negative JSON: {path}") from exc
 
@@ -724,7 +724,8 @@ def run(
     if permutations < 200:
         raise ValueError("maxT requires at least 200 permutations")
 
-    artifact = load_artifact(features)
+    artifact_bytes = features.read_bytes()
+    artifact = load_artifact(features, raw_bytes=artifact_bytes)
     rung_results: dict[str, object] = {}
     result: dict[str, object] = {
         "schema_version": 1,
@@ -732,7 +733,7 @@ def run(
             "feature_schema_version": artifact["feature_schema_version"],
             "config_hash": artifact["config_hash"],
             "roster_config_hash": artifact["roster_config_hash"],
-            "input_sha256": hashlib.sha256(features.read_bytes()).hexdigest(),
+            "input_sha256": hashlib.sha256(artifact_bytes).hexdigest(),
             "run_metadata": artifact["run_metadata"],
             "source_counts": artifact["source_counts"],
             "attrition": artifact["attrition"],

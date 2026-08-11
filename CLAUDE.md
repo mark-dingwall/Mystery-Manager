@@ -106,7 +106,7 @@ python3 scripts/extract_features.py --only-offers 85-106          # post-85 only
 python3 scripts/extract_features.py --no-synthetics               # manual boxes only
 python3 scripts/generate_hard_negatives.py                       # Tier-A EBM input; needs DB
 python3 scripts/generate_hard_negatives.py --only-offers 85-86   # smoke test; writes failure report below gates
-PYTHONPATH=.:.venv-diagnostics/lib python3 -S scripts/ebm_diagnostic.py --no-plots  # DB-free EBM hypotheses
+PYTHONPATH=.venv-diagnostics/lib python3 -S scripts/ebm_diagnostic.py --no-plots    # DB-free EBM hypotheses
 python3 scripts/tune_scoring.py                                   # parameter tuning (needs features JSON)
 python3 scripts/tune_scoring.py --trials 200 --folds 3            # quick run
 python3 scripts/tune_scoring.py --trials 3000 --repeats 25        # overnight stability run
