@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -440,6 +441,14 @@ def test_maxt_rejects_an_incomplete_matched_cluster(monkeypatch):
         )
 
 
+def test_maxt_findings_require_strict_exceedance_of_the_null_threshold():
+    """A tie with the maxT threshold is not enough evidence to promote a term."""
+    from scripts.ebm_diagnostic import _clears_maxt
+
+    assert _clears_maxt(1.01, 1.0) is True
+    assert _clears_maxt(1.0, 1.0) is False
+
+
 def _underpowered_artifact() -> dict:
     """Return five matched offers, intentionally below the diagnostic floor."""
     records = []
@@ -507,6 +516,10 @@ def test_run_serializes_provenance_and_empty_underpowered_rung_deterministically
         "feature_schema_version": FEATURE_SCHEMA_VERSION,
         "config_hash": config_hash(),
         "roster_config_hash": roster_config_hash(),
+        "input_sha256": hashlib.sha256(features.read_bytes()).hexdigest(),
+        "run_metadata": {"generator_version": 1},
+        "source_counts": {"manual": 1, "ilp_optimal": 1},
+        "attrition": {},
     }
     assert first["methodology"]["seed"] == 11
     assert first["methodology"]["permutations"] == 200
@@ -518,6 +531,7 @@ def test_run_serializes_provenance_and_empty_underpowered_rung_deterministically
         "n_pos": 5,
         "n_neg": 5,
         "n_offers": 5,
+        "model_seed": 13,
         "attrition": {
             "input_clusters": 5,
             "missing_manual_clusters": 0,
@@ -607,11 +621,53 @@ def test_run_reuses_one_prepared_cohort_for_all_inference(monkeypatch, tmp_path)
     assert captured["ablation"][2] == full_columns
     assert captured["oof"][3] == full_columns
     assert captured["maxt"][3] == full_columns
-    assert full_seed == 4
-    assert captured["ablation"][3] == 4
-    assert captured["oof"][4] == 4
-    assert captured["maxt"][5] == 4
+    assert full_seed == 6
+    assert captured["ablation"][3] == 6
+    assert captured["oof"][4] == 6
+    assert captured["maxt"][5] == 6
     assert captured["maxt"][-1] == 200
     assert result["rungs"]["manual_vs_ilp"]["underpowered"] is False
     assert result["rungs"]["manual_vs_ilp"]["auc_oof"] == pytest.approx(0.6)
+    assert result["rungs"]["manual_vs_ilp"]["maxT_family_count"] == 1
+    assert result["rungs"]["manual_vs_ilp"]["maxT_family_columns"] == [
+        "n_unique_items"
+    ]
     assert result["rungs"]["manual_vs_ilp"]["findings"][0]["term"] == "n_unique_items"
+    assert result["rungs"]["manual_vs_ilp"]["findings"][0][
+        "ablation_drop_value_pct"
+    ] == {
+        "importance": 1.0,
+        "interpretation": "descriptive full-fit importance only",
+    }
+
+
+def test_rung_seed_is_stable_when_requested_rungs_are_reordered():
+    """The report must not turn a harmless CLI order change into a new model."""
+    from scripts.ebm_diagnostic import _rung_seed
+
+    assert _rung_seed(10, "manual_vs_synth") == 10
+    assert _rung_seed(10, "manual_vs_baseline") == 11
+    assert _rung_seed(10, "manual_vs_ilp") == 12
+
+
+def test_findings_json_is_published_by_atomic_replace(monkeypatch, tmp_path):
+    """A stale result remains intact until the complete replacement is ready."""
+    from scripts import ebm_diagnostic
+
+    output = tmp_path / "nested" / "findings.json"
+    output.parent.mkdir()
+    output.write_text('{"previous": true}\n')
+    replace_calls = []
+    real_replace = ebm_diagnostic.os.replace
+
+    def recording_replace(source, destination):
+        replace_calls.append((Path(source), Path(destination)))
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(ebm_diagnostic.os, "replace", recording_replace)
+    ebm_diagnostic._write_json_atomically(output, {"complete": True})
+
+    assert json.loads(output.read_text()) == {"complete": True}
+    assert replace_calls[0][1] == output
+    assert replace_calls[0][0].parent == output.parent
+    assert not list(output.parent.glob(".findings.json.*.tmp"))

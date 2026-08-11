@@ -11,9 +11,12 @@ from __future__ import annotations
 import argparse
 from collections import defaultdict
 from dataclasses import dataclass
+import hashlib
 from importlib.metadata import version
 import json
+import os
 from pathlib import Path
+import tempfile
 from typing import Sequence
 
 import numpy as np
@@ -49,6 +52,7 @@ _AGNOSTIC_COLUMNS = frozenset(
 _TIERS = ("small", "medium", "large")
 _MIN_MANUAL_ROWS = 150
 _MIN_OFFERS = 20
+_RUNG_SEED_OFFSETS = {rung: index for index, rung in enumerate(RUNGS)}
 
 
 @dataclass
@@ -444,6 +448,16 @@ def _is_promotable_column(column: str, basis: str) -> bool:
     )
 
 
+def _clears_maxt(importance: float, threshold: float) -> bool:
+    """Return whether a term strictly exceeds the discrete null cutoff."""
+    return importance > threshold
+
+
+def _rung_seed(seed: int, rung: str) -> int:
+    """Derive a stable per-rung seed independent of CLI ordering."""
+    return seed + _RUNG_SEED_OFFSETS[rung]
+
+
 def run_maxt(
     X: np.ndarray,
     labels: np.ndarray,
@@ -626,7 +640,7 @@ def _build_findings(
     """Turn maxT-clearing promotable terms into caveated hypotheses."""
     findings: list[dict[str, object]] = []
     for term, importance in maxt.observed_importances.items():
-        if importance < maxt.threshold:
+        if not _clears_maxt(importance, maxt.threshold):
             continue
         value_correlations = _value_confound_correlations(X, columns, records, term)
         finding: dict[str, object] = {
@@ -636,9 +650,7 @@ def _build_findings(
             "value_confound_r": value_correlations,
             "ablation_drop_value_pct": {
                 "importance": ablated_fit.importances.get(term),
-                "crosses_original_maxt_threshold": (
-                    ablated_fit.importances.get(term, float("-inf")) >= maxt.threshold
-                ),
+                "interpretation": "descriptive full-fit importance only",
             },
         }
         finding.update(_parent_metadata(X, columns, records, term))
@@ -661,6 +673,31 @@ def _diagnostic_versions() -> dict[str, str]:
             "pandas",
         )
     }
+
+
+def _write_json_atomically(path: Path, payload: dict[str, object]) -> None:
+    """Publish findings only after a complete JSON file has reached disk."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    serialized = json.dumps(payload, indent=2, sort_keys=True) + "\n"
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as temporary:
+            temporary_path = Path(temporary.name)
+            temporary.write(serialized)
+            temporary.flush()
+            os.fsync(temporary.fileno())
+        os.replace(temporary_path, path)
+    except BaseException:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+        raise
 
 
 def run(
@@ -689,6 +726,10 @@ def run(
             "feature_schema_version": artifact["feature_schema_version"],
             "config_hash": artifact["config_hash"],
             "roster_config_hash": artifact["roster_config_hash"],
+            "input_sha256": hashlib.sha256(features.read_bytes()).hexdigest(),
+            "run_metadata": artifact["run_metadata"],
+            "source_counts": artifact["source_counts"],
+            "attrition": artifact["attrition"],
         },
         "methodology": {
             "seed": seed,
@@ -712,14 +753,16 @@ def run(
         "rungs": rung_results,
     }
 
-    for rung_index, rung in enumerate(requested_rungs):
+    for rung in requested_rungs:
         prepared = prepare_rung(artifact["records"], rung)
         n_pos, n_neg, n_offers = _cohort_counts(prepared.records)
+        rung_seed = _rung_seed(seed, rung)
         rung_result: dict[str, object] = {
             "underpowered": _is_underpowered(n_pos, n_offers),
             "n_pos": n_pos,
             "n_neg": n_neg,
             "n_offers": n_offers,
+            "model_seed": rung_seed,
             "attrition": prepared.attrition,
             "findings": [],
         }
@@ -727,7 +770,6 @@ def run(
             X, columns, labels, offers, clusters = build_design_matrix(prepared.records)
             _validate_complete_matched_clusters(labels, clusters)
             basis = basis_for_columns(columns)
-            rung_seed = seed + rung_index
             full_fit = fit_full_ebm(X, labels, columns, rung_seed)
             ablated_fit = fit_without_value_pct(X, labels, columns, rung_seed)
             maxt = run_maxt(
@@ -746,6 +788,8 @@ def run(
                     "auc_oof": auc_group_kfold(X, labels, offers, columns, rung_seed),
                     "auc_insample": full_fit.auc_insample,
                     "maxt_threshold": maxt.threshold,
+                    "maxT_family_count": len(maxt.family_columns),
+                    "maxT_family_columns": maxt.family_columns,
                     "maxt_null_quantiles": {
                         "p50": float(np.quantile(null, 0.5)),
                         "p95": float(np.quantile(null, 0.95)),
@@ -763,8 +807,7 @@ def run(
             )
         rung_results[rung] = rung_result
 
-    out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
+    _write_json_atomically(out, result)
     return result
 
 
