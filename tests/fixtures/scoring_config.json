@@ -40,16 +40,16 @@
   },
 
   "fungible_groups": {
-    "apple":  [0.7, ["Apples -"],   "snack_piece"],
-    "banana": [1.0, ["Bananas -"],  "snack_piece"],
-    "tomato": [1.0, ["Tomatoes -"], "cooking_piece"]
+    "apple":  [0.61, ["Fixture-Aster :: "],  "snack_piece"],
+    "banana": [0.86, ["Fixture-Beryl :: "],  "snack_piece"],
+    "tomato": [0.48, ["Fixture-Cinder :: "], "cooking_piece"]
   },
 
   "quantity_classes": {
     "snack_piece":   {"small": 2, "medium": 3, "large": 4},
     "cooking_piece": {"small": 1, "medium": 2, "large": 2},
     "garnish":       {"small": 1, "medium": 1, "large": 1},
-    "portioned":     {"small": 1, "medium": 1, "large": 1}
+    "portioned":     {"small": 2, "medium": 2, "large": 3}
   },
 
   "group_allowances": {
@@ -68,10 +68,10 @@
   },
 
   "item_classifications": {
-    "apple":    [["Apples -"],   "pome_fruit",   "snacking", "red",    "round"],
-    "banana":   [["Bananas -"],  "tropical",     "snacking", "yellow", "long"],
-    "tomato":   [["Tomatoes -"], "fruiting_veg", "cooking",  "red",    "round"],
-    "carrot":   [["Carrots -"],  "root_veg",     "cooking",  "orange", "long"]
+    "apple":    [["Fixture-Aster :: "],  "fixture_orbit", "fixture_use_a", "teal",   "pentagon"],
+    "banana":   [["Fixture-Beryl :: "],  "fixture_wing",  "fixture_use_b", "violet", "crescent"],
+    "tomato":   [["Fixture-Cinder :: "], "fixture_spoke", "fixture_use_c", "amber",  "triangle"],
+    "carrot":   [["Fixture-Delta :: "],  "fixture_root",  "fixture_use_d", "indigo", "square"]
   },
 
   "same_item_multiplier": 2.0,
@@ -97,12 +97,12 @@
   "round_robin_max_passes": 200,
   "minmax_max_passes": 100,
 
-  "ilp_hhi_breakpoints": [0.0, 0.1, 0.2, 0.3, 0.5, 0.7, 1.0],
+  "ilp_hhi_breakpoints": [0.0, 0.12, 0.28, 0.47, 0.68, 0.86, 1.0],
   "ilp_coverage_weight": 0.3,
   "ilp_balance_weight": 0.7,
 
   "classification_fallback": {
-    "fruit": ["other_fruit", "cooking", "green", "round"],
-    "veg":   ["other_veg",   "cooking", "green", "round"]
+    "fruit": ["fixture_fruit", "fixture_use", "teal",   "pentagon"],
+    "veg":   ["fixture_veg",   "fixture_use", "indigo", "triangle"]
   }
 }

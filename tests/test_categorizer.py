@@ -2,6 +2,8 @@
 
 import pytest
 
+import allocator.categorizer as categorizer
+
 from allocator.categorizer import (
     assign_classification,
     assign_fungible_group,
@@ -10,54 +12,73 @@ from allocator.categorizer import (
 from allocator.config import (
     CATEGORY_FRUIT,
     CATEGORY_VEGETABLES,
-    CLASSIFICATION_FALLBACK,
-    FUNGIBLE_GROUPS,
-    ITEM_CLASSIFICATIONS,
 )
+
+
+_SYNTHETIC_FUNGIBLE_GROUPS = {
+    "fixture_aster": (0.61, ["Fixture-Aster :: "], "snack_piece"),
+    "fixture_beryl": (0.86, ["Fixture-Beryl :: "], "snack_piece"),
+    "fixture_cinder": (0.48, ["Fixture-Cinder :: "], "cooking_piece"),
+}
+_SYNTHETIC_CLASSIFICATIONS = {
+    "fixture_aster": (
+        ["Fixture-Aster :: "], "fixture_orbit", "fixture_use_a", "teal", "pentagon"
+    ),
+    "fixture_beryl": (
+        ["Fixture-Beryl :: "], "fixture_wing", "fixture_use_b", "violet", "crescent"
+    ),
+}
+_SYNTHETIC_FALLBACK = {
+    CATEGORY_FRUIT: ("fixture_fruit", "fixture_use", "teal", "pentagon"),
+    CATEGORY_VEGETABLES: ("fixture_veg", "fixture_use", "indigo", "triangle"),
+}
+
+
+@pytest.fixture(autouse=True)
+def synthetic_categorization_rules(monkeypatch):
+    monkeypatch.setattr(categorizer, "FUNGIBLE_GROUPS", _SYNTHETIC_FUNGIBLE_GROUPS)
+    monkeypatch.setattr(
+        categorizer, "ITEM_CLASSIFICATIONS", _SYNTHETIC_CLASSIFICATIONS
+    )
+    monkeypatch.setattr(categorizer, "CLASSIFICATION_FALLBACK", _SYNTHETIC_FALLBACK)
 
 
 # ── assign_fungible_group ───────────────────────────────────────────────────
 
 
 class TestAssignFungibleGroup:
-    def test_apple_prefix_match(self):
-        group, degree = assign_fungible_group("Apples - Royal Gala")
-        assert group == "apple"
-        assert degree == 0.7
+    def test_aster_prefix_match(self):
+        group, degree = assign_fungible_group("Fixture-Aster :: Variant")
+        assert group == "fixture_aster"
+        assert degree == 0.61
 
-    def test_banana_prefix_match(self):
-        group, degree = assign_fungible_group("Bananas - Cavendish")
-        assert group == "banana"
-        assert degree == 1.0
+    def test_beryl_prefix_match(self):
+        group, degree = assign_fungible_group("Fixture-Beryl :: Variant")
+        assert group == "fixture_beryl"
+        assert degree == 0.86
 
-    def test_tomato_prefix_match(self):
-        group, degree = assign_fungible_group("Tomatoes - Cherry")
-        if "tomato" in FUNGIBLE_GROUPS:
-            assert group == "tomato"
-            assert degree == FUNGIBLE_GROUPS["tomato"][0]
-        else:
-            # Real config may use a different group name for tomatoes
-            # Just verify consistent return type
-            assert group is None or isinstance(group, str)
+    def test_cinder_prefix_match(self):
+        group, degree = assign_fungible_group("Fixture-Cinder :: Variant")
+        assert group == "fixture_cinder"
+        assert degree == 0.48
 
     def test_no_match(self):
-        group, degree = assign_fungible_group("Broccoli")
+        group, degree = assign_fungible_group("Unmatched fixture item")
         assert group is None
         assert degree == 0.0
 
     def test_case_insensitive_match(self):
-        group, degree = assign_fungible_group("apples - gala")
-        assert group == "apple"
+        group, degree = assign_fungible_group("fixture-aster :: variant")
+        assert group == "fixture_aster"
 
     def test_first_match_wins_known_limitation(self):
         """First matching group wins — if groups overlap, order matters."""
-        # This documents the behavior; actual overlap depends on config
-        group1, _ = assign_fungible_group("Apples - Royal Gala")
-        assert group1 is not None  # Should match apple
+        group1, _ = assign_fungible_group("Fixture-Aster :: Variant")
+        assert group1 == "fixture_aster"
 
     def test_partial_prefix_no_match(self):
-        """'App' doesn't match 'Apples -' prefix."""
-        group, degree = assign_fungible_group("Appetizer")
+        """A shortened prefix does not match a configured rule."""
+        group, degree = assign_fungible_group("Fixture")
         assert group is None
 
 
@@ -65,31 +86,36 @@ class TestAssignFungibleGroup:
 
 
 class TestAssignClassification:
-    def test_apple_classification(self):
-        sub, usage, colour, shape = assign_classification("Apples - Royal Gala", CATEGORY_FRUIT)
-        assert sub == "pome_fruit"
-        assert usage == "snacking"
-        assert colour == "red"
-        assert shape == "round"
+    def test_aster_classification(self):
+        sub, usage, colour, shape = assign_classification(
+            "Fixture-Aster :: Variant", CATEGORY_FRUIT
+        )
+        assert (sub, usage, colour, shape) == (
+            "fixture_orbit", "fixture_use_a", "teal", "pentagon"
+        )
 
-    def test_banana_classification(self):
-        sub, usage, colour, shape = assign_classification("Bananas - Cavendish", CATEGORY_FRUIT)
-        assert sub == "tropical"
-        assert usage == "snacking"
-        # Colour depends on config (could be "yellow" or "orange_yellow")
-        assert colour != ""  # should not be empty
-        assert shape == "long"
+    def test_beryl_classification(self):
+        sub, usage, colour, shape = assign_classification(
+            "Fixture-Beryl :: Variant", CATEGORY_FRUIT
+        )
+        assert (sub, usage, colour, shape) == (
+            "fixture_wing", "fixture_use_b", "violet", "crescent"
+        )
 
     def test_fallback_fruit(self):
         """Unknown fruit item falls back to classification_fallback for fruit category."""
-        sub, usage, colour, shape = assign_classification("Dragon Fruit", CATEGORY_FRUIT)
-        expected_sub = CLASSIFICATION_FALLBACK[CATEGORY_FRUIT][0]
+        sub, usage, colour, shape = assign_classification(
+            "Unknown fixture item", CATEGORY_FRUIT
+        )
+        expected_sub = _SYNTHETIC_FALLBACK[CATEGORY_FRUIT][0]
         assert sub == expected_sub
 
     def test_fallback_veg(self):
         """Unknown veg item falls back to classification_fallback for veg category."""
-        sub, usage, colour, shape = assign_classification("Artichoke", CATEGORY_VEGETABLES)
-        expected_sub = CLASSIFICATION_FALLBACK[CATEGORY_VEGETABLES][0]
+        sub, usage, colour, shape = assign_classification(
+            "Unknown fixture item", CATEGORY_VEGETABLES
+        )
+        expected_sub = _SYNTHETIC_FALLBACK[CATEGORY_VEGETABLES][0]
         assert sub == expected_sub
 
     def test_fallback_unknown_category(self):
@@ -99,8 +125,8 @@ class TestAssignClassification:
         assert usage == "cooking"
 
     def test_case_insensitive_match(self):
-        sub, _, _, _ = assign_classification("apples - gala", CATEGORY_FRUIT)
-        assert sub == "pome_fruit"
+        sub, _, _, _ = assign_classification("fixture-aster :: variant", CATEGORY_FRUIT)
+        assert sub == "fixture_orbit"
 
 
 # ── category_name ───────────────────────────────────────────────────────────

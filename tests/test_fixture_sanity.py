@@ -47,7 +47,31 @@ _SENSITIVE_KEYS = [
     "category_vegetables",
     "ilp_coverage_weight",
     "ilp_balance_weight",
+    "classification_fallback",
+    "ilp_hhi_breakpoints",
 ]
+
+_SENSITIVE_RULE_SECTIONS = (
+    "fungible_groups",
+    "item_classifications",
+    "quantity_classes",
+)
+
+
+def _mirrored_sensitive_fields(real: dict, public: dict) -> list[str]:
+    mirrored = [
+        key for key in _SENSITIVE_KEYS
+        if key in real and key in public and real[key] == public[key]
+    ]
+    for section in _SENSITIVE_RULE_SECTIONS:
+        real_rules = real.get(section, {})
+        public_rules = public.get(section, {})
+        mirrored.extend(
+            f"{section}.{key}"
+            for key, value in public_rules.items()
+            if key in real_rules and real_rules[key] == value
+        )
+    return mirrored
 
 
 @pytest.mark.parametrize("tracked", _TRACKED, ids=lambda p: p.name)
@@ -56,9 +80,7 @@ def test_tracked_file_does_not_mirror_real_config(tracked):
         pytest.skip("real scoring_config.json absent — nothing to compare against")
     real = json.loads(_REAL.read_text())
     public = json.loads(tracked.read_text())
-    leaked = [
-        k for k in _SENSITIVE_KEYS if k in real and k in public and real[k] == public[k]
-    ]
+    leaked = _mirrored_sensitive_fields(real, public)
     assert not leaked, (
         f"{tracked.name} mirrors REAL production values for sensitive keys {leaked} "
         "— replace with synthetic values (see memory/feedback_opensource_sensitivity.md)"

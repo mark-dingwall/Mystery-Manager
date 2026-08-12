@@ -564,29 +564,39 @@ def _item_lookup():
     config = _SCORING_FIXTURE
     category_fruit = config["category_fruit"]
     category_vegetables = config["category_vegetables"]
+    apple_tags = config["item_classifications"]["apple"][1:]
+    banana_tags = config["item_classifications"]["banana"][1:]
+    tomato_tags = config["item_classifications"]["tomato"][1:]
 
     return {
-        1: {"name": "Apples - Fuji", "price": 100, "size": 1,
+        1: {"name": "Fixture-Aster :: One", "price": 100, "size": 1,
             "category_id": category_fruit, "fungible_group": "apple",
-            "fungible_degree": 0.7, "sub_category": "pome_fruit",
-            "usage": "snacking", "colour": "red", "shape": "round"},
-        2: {"name": "Bananas - Cavendish", "price": 150, "size": 2,
+            "fungible_degree": 0.61, "sub_category": apple_tags[0],
+            "usage": apple_tags[1], "colour": apple_tags[2], "shape": apple_tags[3]},
+        2: {"name": "Fixture-Beryl :: Two", "price": 150, "size": 2,
             "category_id": category_fruit, "fungible_group": "banana",
-            "fungible_degree": 1.0, "sub_category": "tropical",
-            "usage": "snacking", "colour": "yellow", "shape": "long"},
-        3: {"name": "Tomatoes - Roma", "price": 200, "size": 1,
+            "fungible_degree": 0.86, "sub_category": banana_tags[0],
+            "usage": banana_tags[1], "colour": banana_tags[2], "shape": banana_tags[3]},
+        3: {"name": "Fixture-Cinder :: Three", "price": 200, "size": 1,
             "category_id": category_vegetables, "fungible_group": "tomato",
-            "fungible_degree": 1.0, "sub_category": "fruiting_veg",
-            "usage": "cooking", "colour": "red", "shape": "round"},
+            "fungible_degree": 0.48, "sub_category": tomato_tags[0],
+            "usage": tomato_tags[1], "colour": tomato_tags[2], "shape": tomato_tags[3]},
     }
 
 
 def _available_tags():
+    classifications = _SCORING_FIXTURE["item_classifications"].values()
     return {
-        "sub_category": {"pome_fruit", "tropical", "fruiting_veg", "root_veg"},
-        "usage": {"snacking", "cooking"},
-        "colour": {"red", "yellow", "orange"},
-        "shape": {"round", "long"},
+        "sub_category": {value[1] for value in classifications},
+        "usage": {
+            value[2] for value in _SCORING_FIXTURE["item_classifications"].values()
+        },
+        "colour": {
+            value[3] for value in _SCORING_FIXTURE["item_classifications"].values()
+        },
+        "shape": {
+            value[4] for value in _SCORING_FIXTURE["item_classifications"].values()
+        },
     }
 
 
@@ -703,7 +713,7 @@ def test_extract_box_features_scored_lists_unchanged():
     rec = _record()
     assert rec["item_quantities"] == [[3, 100, 2], [1, 150, 2], [2, 200, 1]]
     # [capped_load, degree, group_allowance] per group, insertion-ordered
-    assert rec["group_totals"] == [[2, 0.7, 2], [1, 1.0, 2], [1, 1.0, 1]]
+    assert rec["group_totals"] == [[2, 0.61, 2], [1, 0.86, 2], [1, 0.48, 1]]
 
 
 def test_extract_box_features_uses_synthetic_price_threshold_for_allowance():
@@ -718,6 +728,7 @@ def test_extract_box_features_uses_synthetic_price_threshold_for_allowance():
         "price": price,
         "fungible_group": None,
         "fungible_degree": 0.0,
+        "usage": "snacking",
     }
 
     rec = extract_box_features(
@@ -736,12 +747,14 @@ def test_extract_box_features_uses_synthetic_price_threshold_for_allowance():
 
 def test_extract_box_features_dim_ratios():
     rec = _record()
-    assert rec["dim_available"] == {"sub_category": 4, "usage": 2, "colour": 3, "shape": 2}
+    available_tags = _available_tags()
+    assert rec["dim_available"] == {
+        dimension: len(tags) for dimension, tags in available_tags.items()
+    }
+    effective_species = 1 / ((3 / 6) ** 2 + (1 / 6) ** 2 + (2 / 6) ** 2)
     assert rec["dim_ratios"] == {
-        "sub_category": 0.642857,   # eff_species({3,1,2}) = 2.571429 / 4
-        "usage": 0.9,               # eff_species({4,2})   = 1.8      / 2
-        "colour": 0.461538,         # eff_species({5,1})   = 1.384615 / 3
-        "shape": 0.692308,          # eff_species({5,1})   = 1.384615 / 2
+        dimension: round(effective_species / len(tags), 6)
+        for dimension, tags in available_tags.items()
     }
 
 
@@ -787,10 +800,10 @@ def test_ungrouped_items_produce_no_group_columns():
     from allocator.box_features import extract_box_features
 
     lookup = _item_lookup()
-    lookup[4] = {"name": "Kiwi - Green", "price": 90, "size": 1,
+    lookup[4] = {"name": "Fixture-Unmatched :: Four", "price": 90, "size": 1,
                  "category_id": lookup[1]["category_id"], "fungible_group": None,
-                 "fungible_degree": 0.0, "sub_category": "tropical",
-                 "usage": "snacking", "colour": "green", "shape": "round"}
+                 "fungible_degree": 0.0, "sub_category": "fixture_wing",
+                 "usage": "fixture_use_b", "colour": "violet", "shape": "crescent"}
     rec = extract_box_features(
         box_name="x", allocations={1: 3, 4: 5}, item_lookup=lookup,
         tier="small", available_tags=_available_tags(), offer_id=1,
@@ -802,14 +815,20 @@ def test_ungrouped_items_produce_no_group_columns():
 
 def test_raw_tag_counts_are_quantity_weighted_and_sparse():
     rec = _record()
+    apple_tags = _SCORING_FIXTURE["item_classifications"]["apple"][1:]
+    banana_tags = _SCORING_FIXTURE["item_classifications"]["banana"][1:]
+    tomato_tags = _SCORING_FIXTURE["item_classifications"]["tomato"][1:]
     assert rec["raw_tag_counts"] == {
-        "sub_category": {"pome_fruit": 3, "tropical": 1, "fruiting_veg": 2},
-        "usage": {"snacking": 4, "cooking": 2},
-        "colour": {"red": 5, "yellow": 1},
-        "shape": {"round": 5, "long": 1},
+        "sub_category": {apple_tags[0]: 3, banana_tags[0]: 1, tomato_tags[0]: 2},
+        "usage": {apple_tags[1]: 3, banana_tags[1]: 1, tomato_tags[1]: 2},
+        "colour": {apple_tags[2]: 3, banana_tags[2]: 1, tomato_tags[2]: 2},
+        "shape": {apple_tags[3]: 3, banana_tags[3]: 1, tomato_tags[3]: 2},
     }
     # Absent tags are omitted, not zero-filled.
-    assert "root_veg" not in rec["raw_tag_counts"]["sub_category"]
+    assert (
+        _SCORING_FIXTURE["item_classifications"]["carrot"][1]
+        not in rec["raw_tag_counts"]["sub_category"]
+    )
 
 
 def test_raw_tag_counts_each_dimension_sums_to_resolved_qty():
@@ -964,10 +983,18 @@ def test_tag_vocabulary_includes_all_three_fallback_sub_categories():
     from allocator.box_features import tag_vocabulary
 
     vocab = set(tag_vocabulary())
-    assert "sub_category.other_fruit" in vocab
-    assert "sub_category.other_veg" in vocab
+    assert (
+        "sub_category."
+        + _SCORING_FIXTURE["classification_fallback"]["fruit"][0]
+    ) in vocab
+    assert (
+        "sub_category."
+        + _SCORING_FIXTURE["classification_fallback"]["veg"][0]
+    ) in vocab
     assert "sub_category.other" in vocab
-    assert "colour.green" in vocab
+    assert (
+        "colour." + _SCORING_FIXTURE["classification_fallback"]["fruit"][2]
+    ) in vocab
 
 
 def test_tag_vocabulary_size_matches_config():
@@ -984,7 +1011,7 @@ def test_tag_vocabulary_size_matches_config():
         for dimension, tag in zip(dims, fallback):
             expected[dimension].add(tag)
 
-    assert len(tag_vocabulary()) == sum(len(tags) for tags in expected.values()) == 15
+    assert len(tag_vocabulary()) == sum(len(tags) for tags in expected.values())
 
 
 def test_flatten_column_count_derived_from_config():
@@ -993,7 +1020,7 @@ def test_flatten_column_count_derived_from_config():
 
     cols = flatten(_record())
     expected = 3 + 8 + 3 + 5 + 1 + 2 * len(GROUP_ALLOWANCES) + len(tag_vocabulary())
-    assert len(cols) == expected == 41
+    assert len(cols) == expected
 
 
 def test_flatten_is_globally_name_sorted():
@@ -1018,8 +1045,10 @@ def test_flatten_column_set_is_identical_across_disjoint_boxes():
     assert list(apple) == list(tomato)
     assert apple["raw_group_totals.tomato"] == 0.0
     assert tomato["raw_group_totals.apple"] == 0.0
-    assert apple["raw_tag_counts.sub_category.fruiting_veg"] == 0.0
-    assert tomato["raw_tag_counts.sub_category.pome_fruit"] == 0.0
+    tomato_sub_category = _SCORING_FIXTURE["item_classifications"]["tomato"][1]
+    apple_sub_category = _SCORING_FIXTURE["item_classifications"]["apple"][1]
+    assert apple[f"raw_tag_counts.sub_category.{tomato_sub_category}"] == 0.0
+    assert tomato[f"raw_tag_counts.sub_category.{apple_sub_category}"] == 0.0
 
 
 def test_flatten_tier_slices_value_pct():
@@ -1328,6 +1357,7 @@ def test_price_threshold_owner_changes_allowance_hash_and_snapshot(monkeypatch):
         "price": original_threshold - 1,
         "fungible_group": None,
         "fungible_degree": 0.0,
+        "usage": "snacking",
     }
     before_hash = box_features.config_hash()
     before_snapshot = box_features.config_snapshot()

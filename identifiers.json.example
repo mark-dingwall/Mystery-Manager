@@ -16,5 +16,7 @@
   ],
   "box_size_overrides": {
     "Customer Name #2": "small"
+  },
+  "per_offer_box_size_overrides": {
   }
 }

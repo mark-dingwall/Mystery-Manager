@@ -8,6 +8,9 @@ import subprocess
 import sys
 
 
+_SYNTHETIC_OFFER_ID = 910_001
+
+
 def test_allocation_result_defaults_solver_status_to_none(make_result):
     assert make_result().solver_status is None
 
@@ -83,13 +86,15 @@ def test_correct_box_tiers_copies_refreshes_and_resorts(make_box, monkeypatch):
     from allocator.config import BOX_TIERS
 
     monkeypatch.setattr(
-        roster, "PER_OFFER_BOX_SIZE_OVERRIDES", {"80": {"z@example.com": "small"}}
+        roster,
+        "PER_OFFER_BOX_SIZE_OVERRIDES",
+        {str(_SYNTHETIC_OFFER_ID): {"z@example.com": "small"}},
     )
     original = [
         make_box(name="a@example.com", tier="small"),
         make_box(name="Z@Example.COM", tier="large"),
     ]
-    corrected = roster.correct_box_tiers(80, original)
+    corrected = roster.correct_box_tiers(_SYNTHETIC_OFFER_ID, original)
 
     assert original[1].tier == "large"
     assert [(box.name, box.tier) for box in corrected] == [
@@ -129,10 +134,15 @@ def test_correct_box_tiers_rejects_casefolded_override_collisions(make_box, monk
     import allocator.hard_negative_roster as roster
 
     monkeypatch.setattr(roster, "PER_OFFER_BOX_SIZE_OVERRIDES", {
-        "80": {"case@example.com": "small", "CASE@example.com": "large"},
+        str(_SYNTHETIC_OFFER_ID): {
+            "case@example.com": "small", "CASE@example.com": "large"
+        },
     })
     with pytest.raises(roster.AmbiguousRosterIdentityError, match="case-normalised"):
-        roster.correct_box_tiers(80, [make_box(name="case@example.com", tier="medium")])
+        roster.correct_box_tiers(
+            _SYNTHETIC_OFFER_ID,
+            [make_box(name="case@example.com", tier="medium")],
+        )
 
 
 def test_correct_box_tiers_rejects_invalid_applicable_override(make_box, monkeypatch):
@@ -140,11 +150,14 @@ def test_correct_box_tiers_rejects_invalid_applicable_override(make_box, monkeyp
     import allocator.hard_negative_roster as roster
 
     monkeypatch.setattr(
-        roster, "PER_OFFER_BOX_SIZE_OVERRIDES", {"80": {"box@example.com": "tiny"}}
+        roster,
+        "PER_OFFER_BOX_SIZE_OVERRIDES",
+        {str(_SYNTHETIC_OFFER_ID): {"box@example.com": "tiny"}},
     )
     with pytest.raises(ValueError, match="invalid tier override"):
         roster.correct_box_tiers(
-            80, [make_box(name="BOX@example.com", tier="medium")]
+            _SYNTHETIC_OFFER_ID,
+            [make_box(name="BOX@example.com", tier="medium")],
         )
 
 
@@ -153,7 +166,7 @@ def test_roster_hash_uses_shared_feature_digest(monkeypatch):
     from allocator.box_features import stable_hash
 
     mapping = {
-        "80": {"a@example.com": "small"},
+        str(_SYNTHETIC_OFFER_ID): {"a@example.com": "small"},
         "110": {"not-selected@example.com": "medium"},
     }
     monkeypatch.setattr(roster, "PER_OFFER_BOX_SIZE_OVERRIDES", mapping)
@@ -873,7 +886,7 @@ def test_process_offer_uses_only_the_selected_customer_roster(
 
     monkeypatch.setattr(allocator_module, "allocate", fake_allocate)
     monkeypatch.setattr(box_features, "extract_box_features", spy_extract)
-    outcome = hard_negatives.process_offer(80)
+    outcome = hard_negatives.process_offer(_SYNTHETIC_OFFER_ID)
 
     assert strategies == [
         "ilp-optimal",
@@ -886,7 +899,7 @@ def test_process_offer_uses_only_the_selected_customer_roster(
     assert outcome.exclusion is None
     assert outcome.error is None
     assert outcome.roster_entry == {
-        "offer_id": 80,
+        "offer_id": _SYNTHETIC_OFFER_ID,
         "csv_only": [],
         "db_only": [],
         "selected_count": 1,
