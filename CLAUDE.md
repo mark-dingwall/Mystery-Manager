@@ -106,6 +106,7 @@ python3 scripts/extract_features.py --only-offers 85-106          # post-85 only
 python3 scripts/extract_features.py --no-synthetics               # manual boxes only
 python3 scripts/generate_hard_negatives.py                       # Tier-A EBM input; needs DB
 python3 scripts/generate_hard_negatives.py --only-offers 85-86   # smoke test; writes failure report below gates
+PYTHONPATH=.venv-diagnostics/lib python3 -S scripts/ebm_diagnostic.py --no-plots    # DB-free EBM hypotheses
 python3 scripts/tune_scoring.py                                   # parameter tuning (needs features JSON)
 python3 scripts/tune_scoring.py --trials 200 --folds 3            # quick run
 python3 scripts/tune_scoring.py --trials 3000 --repeats 25        # overnight stability run
@@ -119,13 +120,22 @@ python3 scripts/process_survey_results.py responses.json          # analyze surv
 inspect `diagnostics/hard_negatives_report.json` after any non-zero generation
 run.
 
+`ebm_diagnostic.py` consumes only the validated hard-negative artifact and
+checks its feature-schema, feature-config, and roster hashes before fitting. It reports
+class-balanced, offer-held-out AUC separately from full-fit/maxT statistics, and
+never adjusts scoring or the ILP. A rung below 150 manual boxes or 20 offers is
+reported as underpowered with no findings. Findings are hypotheses only: value
+confounding is caveated through a drop-value refit, and tag-parent promotion,
+plots, interactions, multi-seed stability, parallel permutations, and
+leave-one-source-out ablations remain deliberately deferred.
+
 `compare.py` is the primary validation tool — it compares algorithm output against cleaned historical CSVs and prints per-box and aggregate metrics with a composite score. Default run uses Tier A offers only; use `--only-offers` for others.
 
 ## Project Direction
 
 The committed allocation direction is **Optuna → ILP** (parameter tuning feeds a
-single ILP optimiser), with an EBM diagnostic planned. Modules, scripts, and docs
-carry one of three states:
+single ILP optimiser), with a hypothesis-generating EBM diagnostic. Modules,
+scripts, and docs carry one of three states:
 
 - **canonical** — the committed direction: `ilp-optimal`, shared scoring/infra, and
   the tuning/diagnostic pipeline. Extend and maintain here.
@@ -231,6 +241,7 @@ Tests cover models/config, categorization/scoring, desirability/tuning/box featu
 - **`analyze_desirability.py`** — per-item desirability analysis from historical packing decisions. OLS regression + distribution stats. Writes `diagnostics/desirability_items.csv`.
 - **`extract_features.py`** — extracts precomputed box features from historical CSVs + DB, generates synthetic bad boxes, writes `diagnostics/tuning_features.json`. Requires DB connection.
 - **`tune_scoring.py`** — parameter tuning over precomputed features JSON (no DB needed). Writes `diagnostics/tuning_results.json`.
+- **`ebm_diagnostic.py`** — provenance-guarded, DB-free EBM diagnostic over hard negatives. Writes `diagnostics/ebm_findings.json`; results never change scoring automatically.
 - **`generate_survey_scenarios.py`** — constructs packer survey scenarios from historical boxes + overage. Tier 1 (random calibration) + Tier 2 (dimension-targeted). Writes `diagnostics/survey_scenarios.json`. Requires DB.
 - **`process_survey_results.py`** — analyses survey responses against the scoring function. Writes `diagnostics/survey_analysis.json`.
 
