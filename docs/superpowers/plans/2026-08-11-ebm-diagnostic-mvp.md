@@ -40,7 +40,7 @@ Deferred: plot generation, the three exploratory interaction models, multi-seed 
 - `load_artifact(path: Path) -> dict`
 - `basis_for_columns(columns: Sequence[str]) -> dict[str, str]`
 - `prepare_rung(records: Sequence[dict], rung: str) -> PreparedRung`
-- `build_design_matrix(records: Sequence[dict]) -> tuple[np.ndarray, list[str], np.ndarray, np.ndarray, list[tuple[str, str, str]]]`
+- `build_design_matrix(records: Sequence[dict]) -> tuple[np.ndarray, list[str], np.ndarray, np.ndarray, list[tuple[int, str, str]]]`
 
 - [ ] **Step 1: Write failing diagnostics tests**
 
@@ -53,7 +53,7 @@ Run:
 ```bash
 PYTHONPATH=.venv-diagnostics/lib PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
 python3 -S -m pytest tests/test_ebm_diagnostic.py -m diagnostics \
-  --strict-diagnostics-deps -k 'artifact or basis or cohort' -v
+  --strict-diagnostics-deps -k 'artifact or basis or prepare or design_matrix' -v
 ```
 
 Expected: collection/import failure because `scripts.ebm_diagnostic` does not exist.
@@ -97,7 +97,7 @@ Run:
 ```bash
 PYTHONPATH=.venv-diagnostics/lib PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
 python3 -S -m pytest tests/test_ebm_diagnostic.py -m diagnostics \
-  --strict-diagnostics-deps -k 'fit or auc or permutation or maxt' -v
+  --strict-diagnostics-deps -k 'weights or fit or auc or permutation or maxt or findings' -v
 ```
 
 Expected: import failure for `fit_full_ebm` or `run_maxt`.
@@ -139,7 +139,7 @@ Run:
 ```bash
 PYTHONPATH=.venv-diagnostics/lib PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
 python3 -S -m pytest tests/test_ebm_diagnostic.py -m diagnostics \
-  --strict-diagnostics-deps -k 'cli or output or underpowered' -v
+  --strict-diagnostics-deps -k 'cli or test_main_wires or test_run or seed or findings_json or documented_isolated' -v
 ```
 
 Expected: assertions fail because the result contract and CLI are incomplete.

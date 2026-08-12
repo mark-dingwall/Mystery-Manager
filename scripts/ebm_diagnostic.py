@@ -771,8 +771,11 @@ def run(
             "caveats": (
                 "Findings are hypothesis-generating only. value confounding is "
                 "reported through a drop-value ablation but is not resolved by it. "
-                "The tag-parent aggregate-preserving refit is deferred, so tag "
-                "parents are not promotable."
+                "Deferred from this MVP: plots, three exploratory interaction models, "
+                "multi-seed stability, process-parallel permutations, tag-parent refit permutations, "
+                "and leave-one-negative-source-out ablations. The tag-parent "
+                "aggregate-preserving refit is deferred, so tag parents are not "
+                "promotable."
             ),
         },
         "rungs": rung_results,
@@ -818,7 +821,7 @@ def run(
                     "maxT_family_columns": maxt.family_columns,
                     "maxt_null_quantiles": {
                         "p50": float(np.quantile(null, 0.5)),
-                        "p95": float(np.quantile(null, 0.95)),
+                        "p95": maxt.threshold,
                         "max": float(np.max(null)),
                     },
                     "findings": _build_findings(

@@ -661,6 +661,52 @@ def test_cli_defaults_reject_invalid_rungs_and_keeps_plot_flag_compatible():
         parser.parse_args(["--rungs", "not-a-rung"])
 
 
+def test_main_wires_parsed_arguments_to_run(monkeypatch, tmp_path):
+    """The CLI must pass every documented option through to the runner."""
+    from scripts import ebm_diagnostic
+
+    captured = {}
+
+    def fake_run(features, out, *, seed, permutations, rungs):
+        captured.update(
+            {
+                "features": features,
+                "out": out,
+                "seed": seed,
+                "permutations": permutations,
+                "rungs": rungs,
+            }
+        )
+        return {}
+
+    monkeypatch.setattr(ebm_diagnostic, "run", fake_run)
+
+    assert (
+        ebm_diagnostic.main(
+            [
+                "--features",
+                str(tmp_path / "input.json"),
+                "--out",
+                str(tmp_path / "output.json"),
+                "--seed",
+                "19",
+                "--permutations",
+                "200",
+                "--rungs",
+                "manual_vs_ilp",
+            ]
+        )
+        == 0
+    )
+    assert captured == {
+        "features": tmp_path / "input.json",
+        "out": tmp_path / "output.json",
+        "seed": 19,
+        "permutations": 200,
+        "rungs": ["manual_vs_ilp"],
+    }
+
+
 def test_run_serializes_provenance_and_empty_underpowered_rung_deterministically(
     tmp_path, monkeypatch
 ):
@@ -713,6 +759,15 @@ def test_run_serializes_provenance_and_empty_underpowered_rung_deterministically
     }
     assert "value confounding" in first["methodology"]["caveats"]
     assert "tag-parent" in first["methodology"]["caveats"]
+    for deferred_capability in (
+        "plots",
+        "interaction models",
+        "multi-seed stability",
+        "parallel permutations",
+        "tag-parent refit permutations",
+        "leave-one-negative-source-out ablations",
+    ):
+        assert deferred_capability in first["methodology"]["caveats"]
     assert rung == {
         "underpowered": True,
         "n_pos": 5,
@@ -811,9 +866,9 @@ def test_run_reuses_one_prepared_cohort_for_all_inference(monkeypatch, tmp_path)
             observed_fit,
         )
         return ebm_diagnostic.MaxTResult(
-            observed_importances={"n_unique_items": 1.0},
-            null_maxima=[0.5] * 200,
-            threshold=0.5,
+            observed_importances={"n_unique_items": 2.0},
+            null_maxima=[0.0] * 190 + [1.0] * 10,
+            threshold=1.0,
             family_columns=["n_unique_items"],
         )
 
@@ -850,6 +905,7 @@ def test_run_reuses_one_prepared_cohort_for_all_inference(monkeypatch, tmp_path)
     assert result["rungs"]["manual_vs_ilp"]["maxT_family_columns"] == [
         "n_unique_items"
     ]
+    assert result["rungs"]["manual_vs_ilp"]["maxt_null_quantiles"]["p95"] == 1.0
     assert result["rungs"]["manual_vs_ilp"]["findings"][0]["term"] == "n_unique_items"
     assert result["rungs"]["manual_vs_ilp"]["findings"][0][
         "ablation_drop_value_pct"
@@ -888,4 +944,23 @@ def test_findings_json_is_published_by_atomic_replace(monkeypatch, tmp_path):
     assert json.loads(output.read_text()) == {"complete": True}
     assert replace_calls[0][1] == output
     assert replace_calls[0][0].parent == output.parent
+    assert not list(output.parent.glob(".findings.json.*.tmp"))
+
+
+def test_findings_json_removes_temporary_file_when_replace_fails(monkeypatch, tmp_path):
+    """A failed publish preserves the prior report and leaves no temporary file."""
+    from scripts import ebm_diagnostic
+
+    output = tmp_path / "findings.json"
+    output.write_text('{"previous": true}\n')
+
+    def fail_replace(_source, _destination):
+        raise OSError("replace failed")
+
+    monkeypatch.setattr(ebm_diagnostic.os, "replace", fail_replace)
+
+    with pytest.raises(OSError, match="replace failed"):
+        ebm_diagnostic._write_json_atomically(output, {"complete": True})
+
+    assert json.loads(output.read_text()) == {"previous": True}
     assert not list(output.parent.glob(".findings.json.*.tmp"))
