@@ -314,6 +314,20 @@ def test_ebm_script_runs_the_documented_isolated_command():
     assert "EBM hard-negative diagnostic" in proc.stdout
 
 
+def test_diagnostic_versions_reports_a_missing_distribution_actionably(monkeypatch):
+    """A missing diagnostic package must not leak metadata's raw exception."""
+    from importlib.metadata import PackageNotFoundError
+    from scripts import ebm_diagnostic
+
+    def missing_version(distribution):
+        raise PackageNotFoundError(distribution)
+
+    monkeypatch.setattr(ebm_diagnostic, "version", missing_version)
+
+    with pytest.raises(RuntimeError, match="requirements-diagnostics.txt"):
+        ebm_diagnostic._diagnostic_versions()
+
+
 def _fit_data() -> tuple[np.ndarray, np.ndarray, np.ndarray, list[tuple[int, str, str]]]:
     """Return five offer groups with separable but non-constant class signal."""
     rows = []
@@ -358,6 +372,34 @@ def test_fit_full_ebm_uses_named_main_effects_and_returns_importances():
     assert fitted.model.term_names_ == ["signal", "noise", "offer_marker"]
     assert set(fitted.importances) == {"signal", "noise", "offer_marker"}
     assert fitted.auc_insample > 0.9
+
+
+def test_fit_without_value_pct_drops_all_value_columns_and_aligns_matrix(monkeypatch):
+    """The descriptive ablation must refit exactly the non-value design matrix."""
+    from scripts import ebm_diagnostic
+
+    X = np.asarray(
+        [[1.0, 10.0, 2.0, 30.0], [3.0, 20.0, 4.0, 40.0]], dtype=float
+    )
+    labels = np.asarray([1, 0], dtype=int)
+    columns = ["value_pct_small", "kept_one", "value_pct_large", "kept_two"]
+    captured = {}
+
+    def fake_fit(matrix, target, retained_columns, seed):
+        captured["matrix"] = matrix
+        captured["target"] = target
+        captured["columns"] = retained_columns
+        captured["seed"] = seed
+        return ebm_diagnostic.FittedRung(model=None, importances={}, auc_insample=0.5)
+
+    monkeypatch.setattr(ebm_diagnostic, "fit_full_ebm", fake_fit)
+
+    ebm_diagnostic.fit_without_value_pct(X, labels, columns, seed=23)
+
+    assert np.array_equal(captured["matrix"], X[:, [1, 3]])
+    assert np.array_equal(captured["target"], labels)
+    assert captured["columns"] == ["kept_one", "kept_two"]
+    assert captured["seed"] == 23
 
 
 def test_auc_group_kfold_holds_out_entire_offers(monkeypatch):
@@ -780,6 +822,13 @@ def test_run_serializes_provenance_and_empty_underpowered_rung_deterministically
             "missing_negative_clusters": 0,
             "retained_clusters": 5,
         },
+        "column_count": None,
+        "auc_oof": None,
+        "auc_insample": None,
+        "maxt_threshold": None,
+        "maxT_family_count": None,
+        "maxT_family_columns": None,
+        "maxt_null_quantiles": None,
         "findings": [],
     }
     assert first == second

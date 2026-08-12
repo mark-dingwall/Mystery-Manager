@@ -12,7 +12,7 @@ import argparse
 from collections import defaultdict
 from dataclasses import dataclass
 import hashlib
-from importlib.metadata import version
+from importlib.metadata import PackageNotFoundError, version
 import json
 import os
 from pathlib import Path
@@ -145,15 +145,22 @@ def basis_for_columns(columns: Sequence[str]) -> dict[str, str]:
             or column in {"max_value_share", "total_size_points", "pref_violations"}
         ):
             basis[column] = "scored"
-        elif column.startswith("raw_group_totals.") or column.startswith(
-            "raw_tag_counts."
-        ):
+        elif _parent_kind(column) is not None:
             basis[column] = "parent"
         elif column in _AGNOSTIC_COLUMNS:
             basis[column] = "agnostic"
         else:
             raise ValueError(f"unclassified flattened feature column: {column}")
     return basis
+
+
+def _parent_kind(column: str) -> str | None:
+    """Identify the two parent families with distinct promotion protocols."""
+    if column.startswith("raw_group_totals."):
+        return "group"
+    if column.startswith("raw_tag_counts."):
+        return "tag"
+    return None
 
 
 def _is_rung_negative(source: object, rung: str) -> bool:
@@ -467,9 +474,7 @@ def _is_promotable_column(column: str, basis: str) -> bool:
     # Tag parents require an aggregate-preserving refit that is intentionally
     # deferred in this MVP.  Keep them in the fitted model, but do not treat a
     # plain parent classification as permission to promote them.
-    return basis in {"parent", "agnostic"} and not column.startswith(
-        "raw_tag_counts."
-    )
+    return basis in {"parent", "agnostic"} and _parent_kind(column) != "tag"
 
 
 def _clears_maxt(importance: float, threshold: float) -> bool:
@@ -626,7 +631,7 @@ def _parent_metadata(
     X: np.ndarray, columns: Sequence[str], records: Sequence[dict], term: str
 ) -> dict[str, object]:
     """Add the affordable group check and state the deferred tag-parent check."""
-    if term.startswith("raw_group_totals."):
+    if _parent_kind(term) == "group":
         aggregate_term = (
             f"capped_group_totals.{term.removeprefix('raw_group_totals.')}"
         )
@@ -640,7 +645,7 @@ def _parent_metadata(
             ),
             "aggregate_check": "per-tier Pearson correlation",
         }
-    if term.startswith("raw_tag_counts."):
+    if _parent_kind(term) == "tag":
         return {
             "aggregate_term": None,
             "aggregate_r": None,
@@ -689,14 +694,19 @@ def _build_findings(
 
 def _diagnostic_versions() -> dict[str, str]:
     """Record installed library versions without importing their runtime modules."""
-    return {
-        distribution: version(distribution)
-        for distribution in (
-            "interpret",
-            "scikit-learn",
-            "numpy",
-        )
-    }
+    try:
+        return {
+            distribution: version(distribution)
+            for distribution in (
+                "interpret",
+                "scikit-learn",
+                "numpy",
+            )
+        }
+    except PackageNotFoundError as exc:
+        raise RuntimeError(
+            "EBM diagnostics require every package in requirements-diagnostics.txt"
+        ) from exc
 
 
 def _write_json_atomically(path: Path, payload: dict[str, object]) -> None:
@@ -792,6 +802,13 @@ def run(
             "n_offers": n_offers,
             "model_seed": rung_seed,
             "attrition": prepared.attrition,
+            "column_count": None,
+            "auc_oof": None,
+            "auc_insample": None,
+            "maxt_threshold": None,
+            "maxT_family_count": None,
+            "maxT_family_columns": None,
+            "maxt_null_quantiles": None,
             "findings": [],
         }
         if not rung_result["underpowered"]:
