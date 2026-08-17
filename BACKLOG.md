@@ -1,7 +1,9 @@
 # Backlog
 
-Deferred work items. Roadmap and phase history live in `docs/OPTIMISATION_PLAN.md`;
-the scoring model itself is documented in `docs/SCORING.md`.
+Deferred work items. The local, gitignored roadmap and phase history live in
+`docs/OPTIMISATION_PLAN.md`; the local scoring model is documented in
+`docs/SCORING.md`. Fresh clones do not contain those implementation-specific
+documents.
 
 ---
 
@@ -28,6 +30,8 @@ override — a per-item degree, falling back to the group's when unset. Sketch:
 
 **Why it's substantial:**
 
+- `allocator/config.py` currently normalises every group to a three-field tuple,
+  so the proposed fourth field also needs an explicit schema/parser migration.
 - `Item.fungible_degree` is populated once at build time in `allocator/allocator.py`,
   so the override has to resolve during item construction, not at scoring time.
 - The group penalty currently reads a single degree per group key
@@ -72,3 +76,56 @@ items hitting the classification fallback; items sharing a group's vocabulary
 but not assigned to it; config prefixes matching nothing live; and ungrouped
 clusters sharing a leading token. Seasonal absences (stone fruit in winter)
 produce expected noise and need filtering, not fixing.
+
+---
+
+## Repair legacy score-breakdown consumers
+
+**Priority:** high · **Size:** small
+
+The live seven-component composite returns same-item, group-concentration,
+max-value-share, and size-floor fields, but two retained report paths still read
+removed group-quantity and fairness keys:
+
+- `scripts/score_offer.py` fails while formatting its leaderboard.
+- The legacy Rich review used by argument-mode `run.py` has the same stale
+  breakdown in its strategy-comparison action.
+
+Use `compare.py --only-offers <id> --all-strategies` until both consumers are
+updated. Repair them together, remove the dropped fairness/desirability columns,
+show the current components, and add a regression test around report rendering.
+
+---
+
+## Preserve duplicate historical box headers and correct match-quality metadata
+
+**Priority:** high · **Size:** medium
+
+Historical cleaning currently keys parsed boxes by their raw column header. When
+a workbook repeats a header, the later column silently overwrites the earlier
+one. For example, an illustrative workbook with two columns both labelled
+`M Box 1` would retain only the latter column. Preserve column identity
+independently of display text and give duplicate output headers a deterministic
+unique form.
+
+The transposed-layout path also computes `name_match_quality` from every cached
+mapping entry instead of the names requested by the current workbook. Summary
+values can therefore exceed 100% when the cache contains a stale superset.
+Restrict the numerator to requested names, regenerate affected metadata/CSVs,
+and add direct cleaner tests for duplicate headers and stale supersets in
+mapping caches.
+
+---
+
+## Recenter the box target and value sweet spot together
+
+**Priority:** medium · **Size:** substantial
+
+Target-dependent scoring parameters need to be calibrated as a set. Changing the
+value sweet-spot band or `BOX_TARGET_PCT` independently can make benchmark scores
+reflect configuration drift rather than allocation quality.
+
+Choose the new target and sweet spot as one modelling decision, regenerate
+feature/tuning artifacts under the current schema, retune, and refresh the
+canonical-vs-baseline benchmark. Tuning only writes candidate parameters; live
+`.env` / `scoring_config.json` changes remain a reviewed manual step.

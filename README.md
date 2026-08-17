@@ -1,67 +1,86 @@
 # Mystery Manager
 
-Allocates bulk produce overage into customer "mystery boxes" for a fruit & veggie box business. Reads weekly shopping-list spreadsheets and item/buyer data from the Laravel DB, allocates overage to mystery boxes using an ILP optimiser, then outputs tab-delimited box assignments for import back into the app.
+Allocates bulk produce overage into customer "mystery boxes" for a fruit & veggie box business. It reads weekly shopping-list spreadsheets and item/buyer data from the Laravel database, allocates overage with the canonical ILP optimiser, then produces a tab-delimited item-ID/quantity matrix for import back into the app.
+
+## Setup
+
+Install the runtime dependencies and pytest:
+
+```bash
+python3 -m pip install -r requirements.txt
+python3 -m pip install pytest
+```
+
+For a new checkout, copy the tracked examples to their ignored runtime locations, then replace every placeholder with the real business values:
+
+```bash
+cp .env.example .env
+cp identifiers.json.example identifiers.json
+cp scoring_config.json.example scoring_config.json
+cp queries.json.example queries.json
+```
+
+Box prices must be positive integer cents. The example scoring values and SQL are synthetic placeholders, not production configuration. Copy `tuning_bounds.json.example` to `tuning_bounds.json` only when running Optuna tuning.
 
 ## Quick start
 
 ```bash
-python3 run.py 106 offer_106_shopping_list.xlsx                   # full run (TUI + LLM review)
-python3 run.py 106 offer_106_shopping_list.xlsx --no-tui --no-llm # quick run
-python3 compare.py                                                # validate against 45 Tier-A historical offers
-python3 compare.py --all-strategies                               # strategy benchmark
-python3 -m pytest                                                 # run test suite
+python3 run.py                                                   # Textual operations UI
+python3 run.py 123 offer_123_shopping_list.xlsx                 # weekly CLI (Rich review + LLM review)
+python3 run.py 123 offer_123_shopping_list.xlsx --no-tui --no-llm # non-interactive quick run
+python3 compare.py                                              # validate against the local Tier-A archive
+python3 compare.py --all-strategies                             # canonical-vs-baseline benchmark
+python3 web/app.py                                              # comparison UI on 127.0.0.1:5000
+python3 -m pytest                                               # standard test suite
 ```
+
+Offer `123` is a synthetic documentation example, not a real historical offer.
+The comparison UI also needs a cleaned mystery CSV, its source XLSX, and database
+access for the selected offer. Diagnostic tests use an isolated dependency stack;
+see `CLAUDE.md` for the enforced command.
 
 ## Project structure
 
-```
+```text
 Mystery-Manager/
-├── run.py                  # Weekly allocation entry point
-├── compare.py              # Algorithm validation against historical data
-├── pyproject.toml          # pytest config
-├── allocator/              # Core library
-│   ├── allocator.py        #   Pipeline: XLSX + DB → strategy → output
-│   ├── strategies/         #   Canonical ILP strategy + benchmark baselines
-│   ├── models.py           #   Item, MysteryBox, CharityBox, AllocationResult
-│   ├── config.py           #   Tiers, weights, scoring constants, identifiers
-│   ├── db.py               #   SSH tunnel + MySQL queries
-│   ├── excel_io.py         #   XLSX reader + tab-delimited writer
-│   ├── app.py              #   Textual TUI application
-│   ├── screens/            #   TUI screen modules (wizard, review, history, etc.)
-│   ├── services/           #   Service layer (allocation, comparison, history, DB)
-│   ├── tui.py              #   Legacy Rich interactive review UI
-│   ├── clean_history.py    #   Historical XLSX → CSV pipeline
-│   ├── fill_workbook.py    #   Write strategy results into XLSX
-│   └── benchmark_extraction.py  # LLM extraction benchmarks
-├── tests/                  # pytest suite (synthetic fixtures; no DB required)
-│   ├── conftest.py         #   Config bootstrap + factory fixtures
-│   ├── fixtures/           #   Synthetic identifiers + scoring config
-│   └── test_*.py           #   test modules
-├── scripts/                # Maintenance utilities
-│   ├── score_offer.py      #   Per-offer strategy benchmark
-│   ├── diagnose_scoring.py #   Penalty breakdown diagnostics
-│   ├── validate_cleaned.py #   Structural + DB checks on cleaned CSVs
-│   ├── validate_prices.py  #   XLSX vs DB price validation
-│   ├── standardize_filenames.py  # Canonical XLSX filenames
-│   ├── compare_llm_outputs.py   # Side-by-side LLM extraction comparison
-│   └── analyze_offer_values.py  # Per-offer value targets by size tier
-├── docs/                   # Design docs (gitignored)
-├── historical/             # Source XLSX files (gitignored)
-├── cleaned/                # Processed CSVs (gitignored)
-├── mappings/               # Cached LLM name maps (gitignored)
-├── CLAUDE.md               # Full architecture and conventions
-└── requirements.txt
+├── run.py                       # Textual entry point and argument-mode weekly CLI
+├── compare.py                   # Algorithm validation against historical allocations
+├── allocator/                   # Allocation, scoring, I/O, TUI, and service modules
+│   ├── allocator.py             # XLSX + DB → strategy → charity/stock result pipeline
+│   ├── strategies/              # Canonical ILP strategy and regression baselines
+│   ├── models.py                # Item, box, exclusion, and result models
+│   ├── config.py                # Runtime configuration loaders
+│   ├── db.py                    # Direct/SSH MySQL access and cached queries
+│   ├── excel_io.py              # XLSX reader and tab-delimited serializer
+│   ├── app.py                   # No-argument Textual application
+│   ├── tui.py                   # Rich review used by argument-mode run.py
+│   ├── screens/                 # Textual screens
+│   └── services/                # Textual service layer
+├── web/                         # Flask manual-vs-algorithm comparison UI
+├── scripts/                     # Tuning, diagnostics, and maintenance utilities
+├── tests/                       # pytest suite; no DB or network required
+├── docs/                        # Local implementation/operational docs (gitignored)
+├── historical/                 # Source workbooks (gitignored)
+├── cleaned/                    # Canonical processed CSVs (gitignored)
+├── cleaned_llm/                # Alternative LLM extraction outputs (gitignored)
+├── mappings/                   # Name maps and LLM extraction caches (gitignored)
+├── BACKLOG.md                  # Deferred work and known issues
+├── CLAUDE.md                   # Detailed architecture, commands, and conventions
+├── requirements.txt            # Runtime dependencies
+└── requirements-diagnostics.txt # Isolated diagnostics/test dependencies
 ```
 
-## Gitignored items a new user needs to provide
+## Local configuration and data
 
-**Secrets / config**
-- `.env` / `.env.local` — DB credentials, SSH tunnel config, pricing params (box target %, penalty weights)
-- `identifiers.json` — customer/donor/staff email lists (see `identifiers.json.example`)
+These ignored files are required for normal allocation work:
 
-**Business data**
-- `historical/` and `cleaned/` — historical shopping lists and processed CSVs used by `compare.py`
-- `offer_*.xlsx` — weekly input files (overage spreadsheets)
-- `mappings/` — cached item-name-to-DB-ID mappings for older offers without ID columns
+- `.env` — DB connection, box pricing/target, charity settings, value-band parameters, and optional SSH settings. Bare `load_dotenv()` loads `.env`; `.env.local` is not loaded automatically.
+- `identifiers.json` — donation/staff identifiers, standalone-name handling, charity keywords, and box-size overrides.
+- `scoring_config.json` — category IDs, classification data, composite weights, allowances, and thresholds.
+- `queries.json` — SQL adapted to the Laravel schema, using the aliases shown in the example.
 
-See `CLAUDE.md` for full architecture, commands, and conventions.
+Historical comparison work additionally needs `historical/`, `cleaned/`, and any required cached maps under `mappings/`. Weekly allocation needs the relevant `offer_*.xlsx` input. `tuning_bounds.json` is required only by the tuning script.
+
+Tests set synthetic environment defaults and provision synthetic JSON configuration on a clean checkout. If ignored root configuration already exists, pytest reuses it.
+
+See `CLAUDE.md` for the current command inventory, architecture, diagnostics contract, and project conventions.

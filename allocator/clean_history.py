@@ -4,11 +4,11 @@ Historical data cleanup script.
 Extracts the final allocation tab from each XLSX file, normalizes column
 formats, classifies columns, and produces clean CSVs for algorithm validation.
 
-Supports four tiers of data quality:
-  A (75-106): Standard 3-tab with IDs and emails — in historical/
-  B (55-74):  Standard 3-tab with IDs, all standalone — in historical/ or older/
-  C (45-54):  Item names only, no IDs — needs LLM matching
-  D (24-44):  Rough formats, per-offer overrides
+Supports four archive tiers of data quality:
+  A: Current standard layouts with IDs
+  B: Earlier standard layouts with IDs
+  C: Name-based layouts that need name matching
+  D: Sparse rough formats with per-layout overrides
 """
 
 import csv
